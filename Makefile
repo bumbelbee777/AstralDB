@@ -1,4 +1,3 @@
-
 # sources macro for windows, recursively interates thru any subdirs to find *.cxx source files
 SOURCES_WIN = \
 	$(shell find sources -type f -name "*.cxx")

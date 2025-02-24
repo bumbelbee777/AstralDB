@@ -38,18 +38,19 @@ constexpr Instruction MakeInstruction(Opcode Op, Args&&... Operands) {
     return Instruction{Op, {std::forward<Args>(Operands)...}};
 }
 
+
 inline void AppendInstruction(Bytecode &Code, const Instruction &Inst) {
     Code.push_back(Inst);
 }
 
 inline std::string Disassemble(const Bytecode &Code) {
     std::ostringstream Out;
-    for (size_t i = 0; i < Code.size(); ++i) {
+    for(size_t i = 0; i < Code.size(); ++i) {
         const Instruction &Inst = Code[i];
         Out << i << ": " << static_cast<int>(Inst.Opcode);
-        if (!Inst.Operands.empty()) {
+        if(!Inst.Operands.empty()) {
             Out << " [";
-            for (const auto &Operand : Inst.Operands) {
+            for(const auto &Operand : Inst.Operands) {
                 std::visit([&Out](auto &&arg) {
                     Out << arg << " ";
                 }, Operand);

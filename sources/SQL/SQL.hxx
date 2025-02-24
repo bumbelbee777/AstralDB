@@ -31,45 +31,45 @@ struct ExpressionAST {
     virtual Bytecode EmitBytecode() const = 0;
 };
 
-class LiteralAST : public ExpressionAST {
+struct LiteralAST : public ExpressionAST {
     std::string Value;
-public:
+
     explicit LiteralAST(std::string Value) : Value(std::move(Value)) {}
     Bytecode EmitBytecode() const override;
 };
 
-class TableAST : public ExpressionAST {
+struct TableAST : public ExpressionAST {
     std::string TableName;
-public:
+
     explicit TableAST(std::string Name) : TableName(std::move(Name)) {}
     Bytecode EmitBytecode() const override;
 };
 
-/*class ColumnAST : public ExpressionAST {
+/* ColumnAST : public ExpressionAST {
     std::string ColumnName;
 public:
     explicit ColumnAST(std::string ColumnName) : ColumnName(std::move(ColumnName)) {}
 };*/
 
-class CreateAST : public ExpressionAST {
+struct CreateAST : public ExpressionAST {
     std::string TableName;
     std::vector<ColumnDefinition> Columns;
-public:
+
     explicit CreateAST(std::string TableName, std::vector<ColumnDefinition> Columns) : TableName(std::move(TableName)),
                         Columns(std::move(Columns)) {}
     Bytecode EmitBytecode() const override;
 };
 
-class SelectAST : public ExpressionAST {
+struct SelectAST : public ExpressionAST {
     std::vector<std::string> Columns;
     std::unique_ptr<TableAST> Table;
-public:
+
     SelectAST(std::vector<std::string> Columns, std::unique_ptr<TableAST> Table)
         : Columns(std::move(Columns)), Table(std::move(Table)) {}
     Bytecode EmitBytecode() const override;
 };
 
-class InsertAST : public ExpressionAST {
+struct InsertAST : public ExpressionAST {
     std::unique_ptr<TableAST> Table;
     std::vector<std::string> Columns;
     std::vector<std::string> Values;
@@ -79,11 +79,11 @@ public:
     Bytecode EmitBytecode() const override;
 };
 
-class UpdateAST : public ExpressionAST {
+struct UpdateAST : public ExpressionAST {
     std::string TableName;
     std::vector<std::pair<std::string, std::string>> Assignments;
     std::unique_ptr<ExpressionAST> Condition;
-public:
+
     UpdateAST(std::string TableName, 
               std::vector<std::pair<std::string, std::string>> Assignments,
               std::unique_ptr<ExpressionAST> Condition)
@@ -92,19 +92,19 @@ public:
     Bytecode EmitBytecode() const override;
 };
 
-class DeleteAST : public ExpressionAST {
+struct DeleteAST : public ExpressionAST {
     std::string TableName;
     std::unique_ptr<ExpressionAST> Condition;
-public:
+
     DeleteAST(std::string TableName, std::unique_ptr<ExpressionAST> Condition)
         : TableName(std::move(TableName)), Condition(std::move(Condition)) {}
     Bytecode EmitBytecode() const override;
 };
 
-class BinaryOpAST : public ExpressionAST {
+struct BinaryOpAST : public ExpressionAST {
     std::unique_ptr<ExpressionAST> LHS, RHS;
     std::string Op;
-public:
+
     BinaryOpAST(std::unique_ptr<ExpressionAST> LHS, std::string Op, std::unique_ptr<ExpressionAST> RHS)
         : LHS(std::move(LHS)), Op(std::move(Op)), RHS(std::move(RHS)) {}
     Bytecode EmitBytecode() const override;
