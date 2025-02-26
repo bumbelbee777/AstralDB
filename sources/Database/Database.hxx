@@ -2,7 +2,7 @@
 
 #include <IO/Spinlock.hxx>
 #include <IO/Task.hxx>
-#include <Security/EncryptedString.hxx>
+#include <DS/EncryptedString.hxx>
 #include <string>
 #include <unordered_map>
 #include <vector>

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <SQL/Bytecode.hxx>
+#include <DS/Tree.hxx>
+#include <DS/BPlusTree.hxx>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -143,6 +145,8 @@ class Parser {
         }
         return false;
     }
+
+    Tree<std::vector<std::unique_ptr<ExpressionAST>>> BuildAST() const;
 
     std::unique_ptr<ExpressionAST> ParseExpression();
     std::unique_ptr<ExpressionAST> ParseCreateStatement();
