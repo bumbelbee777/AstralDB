@@ -15,6 +15,7 @@ int main(int argc, char **argv) {
                 std::string_view Query(QueryTemp);
                 if(Query.empty()) std::cout << "AstralDB: File " << argv[i] << " is empty\n";
                 AstralDB::SQL::Parser Parser(Query);
+                Parser.DumpAST();
                 return 0;
             }
         }

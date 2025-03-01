@@ -3,7 +3,6 @@
 #include <vector>
 #include <algorithm>
 #include <functional>
-#include <iterator>
 
 namespace AstralDB {
 
@@ -14,7 +13,6 @@ private:
 public:
     Tree() = default;
     Tree(const std::vector<T> &Nodes) : Nodes_(Nodes) {}
-
 
     void Add(const T &Node) {
         Nodes_.push_back(Node);
@@ -72,13 +70,25 @@ public:
         return std::upper_bound(Nodes_.begin(), Nodes_.end(), Value, Compare_);
     }
 
-    std::vector<T>& GetNodes() {
+    std::vector<T> &GetNodes() {
         return Nodes_;
     }
 
-    const std::vector<T>& GetNodes() const {
+    const std::vector<T> &GetNodes() const {
         return Nodes_;
     }
+
+    void SetNodes(const std::vector<T> &Nodes) {
+        Nodes_ = Nodes;
+    }
+
+    void SetNodes(std::vector<T> &&Nodes) {
+        Nodes_ = std::move(Nodes);
+    }
+
+    T &GetRoot() { return Nodes_.front(); }
+
+    const T &GetRoot() const { return Nodes_.front(); }
 
     Compare GetCompare() const {
         return Compare_;
@@ -106,10 +116,10 @@ public:
         return Nodes_.end();
     }
 
-    typename std::vector<T>::iterator Find(const T& Value) {
+    typename std::vector<T>::iterator Find(const T &Value) {
         return std::find(Nodes_.begin(), Nodes_.end(), Value);
     }
-    typename std::vector<T>::const_iterator Find(const T& Value) const {
+    typename std::vector<T>::const_iterator Find(const T &Value) const {
         return std::find(Nodes_.begin(), Nodes_.end(), Value);
     }
 };

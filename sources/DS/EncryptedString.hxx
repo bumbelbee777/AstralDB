@@ -27,6 +27,20 @@ public:
         EncryptInput(Input);
     }
 
+    EncryptedString(std::string_view Data, bool AlreadyEncrypted) {
+        if(AlreadyEncrypted) {
+            std::copy(Data.begin(), Data.end(), EncryptedData_.begin());
+        } else {
+            std::array<uint8_t, 24> Nonce{};
+            std::copy(Data.begin(), Data.begin() + 24, Nonce.begin());
+            std::vector<uint8_t> Ciphertext(Data.begin() + 24, Data.end());
+            XChaCha20 Cipher(EncryptionKey_, Nonce);
+            std::vector<uint8_t> Plaintext;
+            Cipher.Decrypt(Ciphertext, Plaintext);
+            std::copy(Plaintext.begin(), Plaintext.end(), EncryptedData_.begin());
+        }
+    }
+
     EncryptedString(const EncryptedString &) = delete;
     EncryptedString &operator=(const EncryptedString &) = delete;
 
@@ -34,7 +48,11 @@ public:
         return EncryptionKey_;
     }
 
-    std::string Decrypt() const {
+    std::string Encrypted() const {
+        return EncryptedData_;
+    }
+
+    std::string Decrypted() const {
         if(EncryptedData_.size() < 24) return "";
         std::array<uint8_t, 24> Nonce{};
         std::copy(EncryptedData_.begin(), EncryptedData_.begin() + 24, Nonce.begin());

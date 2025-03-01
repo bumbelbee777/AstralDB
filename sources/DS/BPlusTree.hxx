@@ -92,22 +92,18 @@ template <typename Key, typename Value, size_t Order = 4> class BPlusTree {
             while (ChildIndex < static_cast<int>(CurrentNode->Keys.size()) && KeyValue >= CurrentNode->Keys[ChildIndex])
                 ++ChildIndex;
             bool ChildUnderflow = DeleteHelper(CurrentNode->Children[ChildIndex], KeyValue, false, Deleted);
-            if (!Deleted)
-                return false; // Key not found in subtree.
-            // If the child is underfull, try rebalancing.
-            if (ChildUnderflow) {
-                // Try borrowing from left sibling.
-                if (ChildIndex > 0 && CurrentNode->Children[ChildIndex - 1]->Keys.size() > MinKeys) {
+            if(!Deleted)
+                return false;
+            if(ChildUnderflow) {
+                if(ChildIndex > 0 && CurrentNode->Children[ChildIndex - 1]->Keys.size() > MinKeys) {
                     BorrowFromLeft(CurrentNode, ChildIndex);
                     ChildUnderflow = false;
                 }
-                // Else, try borrowing from right sibling.
-                else if (ChildIndex < static_cast<int>(CurrentNode->Children.size()) - 1 &&
+                else if(ChildIndex < static_cast<int>(CurrentNode->Children.size()) - 1 &&
                          CurrentNode->Children[ChildIndex + 1]->Keys.size() > MinKeys) {
                     BorrowFromRight(CurrentNode, ChildIndex);
                     ChildUnderflow = false;
-                }
-                else {
+                } else {
                     if(ChildIndex > 0)
                         MergeNodes(CurrentNode, ChildIndex - 1, ChildIndex);
                     else
@@ -251,5 +247,7 @@ public:
         Value Dummy;
         return Search(KeyValue, Dummy);
     }
+
+    std::shared_ptr<Node> GetRoot() const { return Root; }
 };
 }

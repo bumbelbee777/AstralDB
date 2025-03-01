@@ -1,3 +1,4 @@
+#include "SQL/Bytecode.hxx"
 #include <SQL/SQL.hxx>
 #include <cctype>
 #include <iostream>
@@ -91,7 +92,7 @@ TokenStream Parser::Tokenize() {
 }
 
 Tree<std::vector<std::unique_ptr<ExpressionAST>>> Parser::BuildAST() const {
-    Tree<std::vector<std::unique_ptr<ExpressionAST>>> AST;
+    Tree<std::vector<std::unique_ptr<ExpressionAST>>> Result;
     std::vector<std::unique_ptr<ExpressionAST>> Statements;
     size_t Index = 0;
     while(Index < Tokens_.size()) {
@@ -108,8 +109,8 @@ Tree<std::vector<std::unique_ptr<ExpressionAST>>> Parser::BuildAST() const {
     }
     if(Statements.empty())
         throw std::runtime_error("No valid statements were parsed.");
-    AST.SetRoot(std::move(Statements));
-    return AST;
+    Result.SetRoot(std::move(Statements));
+    return Result;
 }
 
 void Parser::DumpTokens() const {
@@ -336,6 +337,13 @@ std::unique_ptr<ExpressionAST> Parser::ParseStatement() {
             throw std::runtime_error("Unrecognized statement type: " + FirstValue);
     }
     throw std::runtime_error("Empty query");
+}
+
+void Parser::DumpAST() {
+    for(auto &Node: AST) {
+        Bytecode Dummy = Node->EmitBytecode();
+        std::cout << Disassemble(Dummy);
+    }
 }
 }
 }

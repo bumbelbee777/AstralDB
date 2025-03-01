@@ -112,6 +112,11 @@ struct BinaryOpAST : public ExpressionAST {
     Bytecode EmitBytecode() const override;
 };
 
+using ASTNode = std::unique_ptr<ExpressionAST>;
+using ASTType = std::vector<ASTNode>;
+
+extern ASTType AST;
+
 class Parser {
     std::string_view Query_;
     TokenStream Tokens_;
@@ -164,14 +169,19 @@ public:
             ParseStatement(); 
         }
         catch(...) {
-            DumpTokens();
+            std::cout << "Something went wrong\n";
         }
+        auto NewAST = BuildAST();
+        AST.clear();
+        AST = std::move(NewAST.GetRoot());
         DumpTokens();
     }
 
     std::unique_ptr<ExpressionAST> ParseStatement();
 
     void DumpTokens() const;
+
+    void DumpAST();
 };
 }
 }

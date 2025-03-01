@@ -34,7 +34,6 @@ void Database::FlushWorker() noexcept {
 
 Database::Database(const std::filesystem::path &DBPath)
     : DBPath_(DBPath), Dirty_(false), StopFlushWorker_(false) {
-    // Start the background flush worker thread
     FlushWorkerThread_ = std::thread([this]() { this->FlushWorker(); });
 }
 

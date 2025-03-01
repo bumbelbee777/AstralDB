@@ -38,7 +38,6 @@ constexpr Instruction MakeInstruction(Opcode Op, Args&&... Operands) {
     return Instruction{Op, {std::forward<Args>(Operands)...}};
 }
 
-
 inline void AppendInstruction(Bytecode &Code, const Instruction &Inst) {
     Code.push_back(Inst);
 }
