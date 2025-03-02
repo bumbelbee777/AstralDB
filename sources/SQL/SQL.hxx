@@ -138,7 +138,13 @@ class Parser {
     }
 
     void AdvanceToken() {
-        if(CurrentIndex_ < Tokens_.size()) ++CurrentIndex_;
+        while(CurrentIndex_ < Tokens_.size() && 
+            (IsEOF() || 
+                std::all_of(Tokens_[CurrentIndex_].Value.begin(), Tokens_[CurrentIndex_].Value.end(), [](unsigned char c) {
+                    return std::isspace(c);
+                }))) {
+            ++CurrentIndex_;
+        }
     }
 
     bool MatchToken(const std::string &ExpectedType) {
@@ -161,6 +167,7 @@ class Parser {
     std::unique_ptr<ExpressionAST> ParseDeleteStatement();
     std::unique_ptr<ExpressionAST> ParseWhereClause();
     std::unique_ptr<ExpressionAST> ParseBinaryOperation();
+    std::unique_ptr<ExpressionAST> ParseBinaryOperation(int MinPrec, std::unique_ptr<ExpressionAST> LHS);
 public:
     explicit Parser(std::string_view Query) : Query_(Query) {
         Tokens_ = Tokenize();

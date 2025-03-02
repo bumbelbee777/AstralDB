@@ -112,19 +112,20 @@ Bytecode BinaryOpAST::EmitBytecode() const {
     return Code;
 }
 
+
 Bytecode BuildBytecode() {
     Bytecode Result;
     int Counter = 0;
     std::vector<Bytecode> BatchBytecodes;
     std::vector<ExpressionAST*> BatchAST;
-    for(auto &Statement : AST) {
+    for (auto &Statement : AST) {
         Bytecode Dummy = Statement->EmitBytecode();
         for(auto &Inst : Dummy)
             AppendInstruction(Result, Inst);
         BatchBytecodes.push_back(Dummy);
         BatchAST.push_back(Statement.get());
-        if(Counter >= 35) {
-            BPlusTree<Bytecode, ExpressionAST*> Tree;
+        if (Counter >= 35) {
+            BPlusTree<Bytecode, ExpressionAST*, 4, BytecodeComparator> Tree;
             for(size_t i = 0; i < BatchBytecodes.size(); i++)
                 Tree.Insert(BatchBytecodes[i], BatchAST[i]);
             std::vector<Bytecode> SortedBytecodes = Tree.GetAllKeys();
@@ -135,10 +136,12 @@ Bytecode BuildBytecode() {
             BatchBytecodes.clear();
             BatchAST.clear();
             Counter = 0;
-        } else Counter++;
+        } else {
+            Counter++;
+        }
     }
     if(!BatchBytecodes.empty()) {
-        BPlusTree<Bytecode, ExpressionAST*> Tree;
+        BPlusTree<Bytecode, ExpressionAST*, 4, BytecodeComparator> Tree;
         for(size_t i = 0; i < BatchBytecodes.size(); i++)
             Tree.Insert(BatchBytecodes[i], BatchAST[i]);
         std::vector<Bytecode> SortedBytecodes = Tree.GetAllKeys();

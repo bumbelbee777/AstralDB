@@ -243,7 +243,7 @@ std::unique_ptr<ExpressionAST> Parser::ParseInsertStatement() {
 }
 
 std::unique_ptr<ExpressionAST> Parser::ParseUpdateStatement() {
-    AdvanceToken(); // Consume "UPDATE"
+    AdvanceToken();
     auto TableToken = CurrentToken();
     if(!TableToken)
         throw std::runtime_error("Expected table name after UPDATE");
@@ -302,20 +302,7 @@ std::unique_ptr<ExpressionAST> Parser::ParseWhereClause() {
 
 std::unique_ptr<ExpressionAST> Parser::ParseBinaryOperation() {
     auto LHS = ParsePrimary();
-    while(CurrentToken()) {
-        int CurrentPrec = GetTokenPrecedence(*CurrentToken());
-        if(CurrentPrec < 0) break;
-        std::string BinOp = CurrentToken()->Value;
-        AdvanceToken();
-        auto RHS = ParsePrimary();
-        while(CurrentToken()) {
-            int NextPrec = GetTokenPrecedence(*CurrentToken());
-            if(NextPrec > CurrentPrec) RHS = ParseBinaryOperation();
-            else break;
-        }
-        LHS = std::make_unique<BinaryOpAST>(std::move(LHS), BinOp, std::move(RHS));
-    }
-    return LHS;
+    return ParseBinaryOperation(0, std::move(LHS));
 }
 
 std::unique_ptr<ExpressionAST> Parser::ParseStatement() {
@@ -337,6 +324,33 @@ std::unique_ptr<ExpressionAST> Parser::ParseStatement() {
             throw std::runtime_error("Unrecognized statement type: " + FirstValue);
     }
     throw std::runtime_error("Empty query");
+}
+
+std::unique_ptr<ExpressionAST> Parser::ParseBinaryOperation(int MinPrec, std::unique_ptr<ExpressionAST> LHS) {
+    while(true) {
+        if(!CurrentToken()) break;
+        int CurrentPrec = GetTokenPrecedence(*CurrentToken());
+        if(CurrentPrec < MinPrec) break;
+        std::string Op = CurrentToken()->Value;
+        AdvanceToken();
+        auto RHS = ParsePrimary();
+        if (!RHS) {
+            std::cerr << "Error: Expected expression after operator \"" << Op << "\"\n";
+            return nullptr;
+        }
+        while(CurrentToken()) {
+            int NextPrec = GetTokenPrecedence(*CurrentToken());
+            if(NextPrec > CurrentPrec)
+                RHS = ParseBinaryOperation(CurrentPrec + 1, std::move(RHS));
+            else break;
+        }
+        LHS = std::make_unique<BinaryOpAST>(std::move(LHS), Op, std::move(RHS));
+    }
+    return LHS;
+}
+
+std::unique_ptr<ExpressionAST> Parser::ParseExpression() {
+    return ParseBinaryOperation();
 }
 
 void Parser::DumpAST() {

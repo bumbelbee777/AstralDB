@@ -4,10 +4,13 @@
 #include <memory>
 #include <optional>
 #include <algorithm>
+#include <functional>
 
 namespace AstralDB {
-template <typename Key, typename Value, size_t Order = 4> class BPlusTree {
+template <typename Key, typename Value, size_t Order = 4, typename Compare = std::less<Key>>
+class BPlusTree {
     static constexpr size_t MinKeys = (Order + 1) / 2;
+    Compare Compare_;
 
     struct Node {
         bool IsLeaf;
@@ -76,8 +79,9 @@ template <typename Key, typename Value, size_t Order = 4> class BPlusTree {
 
     bool DeleteHelper(const std::shared_ptr<Node>& CurrentNode, const Key& KeyValue, bool IsRoot, bool& Deleted) {
         if (CurrentNode->IsLeaf) {
-            auto It = std::lower_bound(CurrentNode->Keys.begin(), CurrentNode->Keys.end(), KeyValue);
-            if(It == CurrentNode->Keys.end() || *It != KeyValue) {
+            auto It = std::lower_bound(CurrentNode->Keys.begin(), CurrentNode->Keys.end(), KeyValue, Compare_);
+            if(It == CurrentNode->Keys.end() || (*It != KeyValue))
+            {
                 Deleted = false;
                 return false;
             }
@@ -85,7 +89,8 @@ template <typename Key, typename Value, size_t Order = 4> class BPlusTree {
             CurrentNode->Keys.erase(It);
             CurrentNode->Values.erase(CurrentNode->Values.begin() + Index);
             Deleted = true;
-            if(!IsRoot && CurrentNode->Keys.size() < MinKeys) return true;
+            if(!IsRoot && CurrentNode->Keys.size() < MinKeys)
+                return true;
             return false;
         } else {
             int ChildIndex = 0;
@@ -110,7 +115,8 @@ template <typename Key, typename Value, size_t Order = 4> class BPlusTree {
                         MergeNodes(CurrentNode, ChildIndex, ChildIndex + 1);
                 }
             }
-            if(!IsRoot && CurrentNode->Keys.size() < MinKeys) return true;
+            if(!IsRoot && CurrentNode->Keys.size() < MinKeys)
+                return true;
             return false;
         }
     }
@@ -132,7 +138,7 @@ public:
     std::optional<std::pair<Key, std::shared_ptr<Node>>>
     InsertInternal(const std::shared_ptr<Node>& CurrentNode, const Key& KeyValue, const Value& Val) {
         if (CurrentNode->IsLeaf) {
-            auto It = std::lower_bound(CurrentNode->Keys.begin(), CurrentNode->Keys.end(), KeyValue);
+            auto It = std::lower_bound(CurrentNode->Keys.begin(), CurrentNode->Keys.end(), KeyValue, Compare_);
             size_t Index = It - CurrentNode->Keys.begin();
             CurrentNode->Keys.insert(It, KeyValue);
             CurrentNode->Values.insert(CurrentNode->Values.begin() + Index, Val);
@@ -149,13 +155,13 @@ public:
             }
             return std::nullopt;
         } else {
-            size_t Index = std::upper_bound(CurrentNode->Keys.begin(), CurrentNode->Keys.end(), KeyValue) - CurrentNode->Keys.begin();
+            size_t Index = std::upper_bound(CurrentNode->Keys.begin(), CurrentNode->Keys.end(), KeyValue, Compare_) - CurrentNode->Keys.begin();
             auto Child = CurrentNode->Children[Index];
             auto Result = InsertInternal(Child, KeyValue, Val);
             if (Result.has_value()) {
                 Key PromoteKey = Result->first;
                 auto NewChild = Result->second;
-                auto It = std::upper_bound(CurrentNode->Keys.begin(), CurrentNode->Keys.end(), PromoteKey);
+                auto It = std::upper_bound(CurrentNode->Keys.begin(), CurrentNode->Keys.end(), PromoteKey, Compare_);
                 size_t Pos = It - CurrentNode->Keys.begin();
                 CurrentNode->Keys.insert(It, PromoteKey);
                 CurrentNode->Children.insert(CurrentNode->Children.begin() + Pos + 1, NewChild);
@@ -177,10 +183,10 @@ public:
     bool Search(const Key& KeyValue, Value& OutValue) const {
         auto CurrentNode = Root;
         while(!CurrentNode->IsLeaf) {
-            size_t Index = std::upper_bound(CurrentNode->Keys.begin(), CurrentNode->Keys.end(), KeyValue) - CurrentNode->Keys.begin();
+            size_t Index = std::upper_bound(CurrentNode->Keys.begin(), CurrentNode->Keys.end(), KeyValue, Compare_) - CurrentNode->Keys.begin();
             CurrentNode = CurrentNode->Children[Index];
         }
-        auto It = std::lower_bound(CurrentNode->Keys.begin(), CurrentNode->Keys.end(), KeyValue);
+        auto It = std::lower_bound(CurrentNode->Keys.begin(), CurrentNode->Keys.end(), KeyValue, Compare_);
         if(It != CurrentNode->Keys.end() && *It == KeyValue) {
             size_t Index = It - CurrentNode->Keys.begin();
             OutValue = CurrentNode->Values[Index];
@@ -192,10 +198,10 @@ public:
     bool Update(const Key& KeyValue, const Value& NewValue) {
         auto CurrentNode = Root;
         while(!CurrentNode->IsLeaf) {
-            size_t Index = std::upper_bound(CurrentNode->Keys.begin(), CurrentNode->Keys.end(), KeyValue) - CurrentNode->Keys.begin();
+            size_t Index = std::upper_bound(CurrentNode->Keys.begin(), CurrentNode->Keys.end(), KeyValue, Compare_) - CurrentNode->Keys.begin();
             CurrentNode = CurrentNode->Children[Index];
         }
-        auto It = std::lower_bound(CurrentNode->Keys.begin(), CurrentNode->Keys.end(), KeyValue);
+        auto It = std::lower_bound(CurrentNode->Keys.begin(), CurrentNode->Keys.end(), KeyValue, Compare_);
         if(It != CurrentNode->Keys.end() && *It == KeyValue) {
             size_t Index = It - CurrentNode->Keys.begin();
             CurrentNode->Values[Index] = NewValue;
@@ -216,14 +222,14 @@ public:
         std::vector<Value> Results;
         auto CurrentNode = Root;
         while(!CurrentNode->IsLeaf) {
-            size_t Index = std::upper_bound(CurrentNode->Keys.begin(), CurrentNode->Keys.end(), LowerBound) - CurrentNode->Keys.begin();
+            size_t Index = std::upper_bound(CurrentNode->Keys.begin(), CurrentNode->Keys.end(), LowerBound, Compare_) - CurrentNode->Keys.begin();
             CurrentNode = CurrentNode->Children[Index];
         }
         while(CurrentNode) {
             for (size_t i = 0; i < CurrentNode->Keys.size(); ++i) {
-                if (CurrentNode->Keys[i] >= LowerBound && CurrentNode->Keys[i] <= UpperBound)
+                if (!Compare_(CurrentNode->Keys[i], LowerBound) && !Compare_(UpperBound, CurrentNode->Keys[i]))
                     Results.push_back(CurrentNode->Values[i]);
-                else if (CurrentNode->Keys[i] > UpperBound)
+                else if (Compare_(UpperBound, CurrentNode->Keys[i]))
                     return Results;
             }
             CurrentNode = CurrentNode->Next;
@@ -243,11 +249,11 @@ public:
         return KeysOut;
     }
 
-    bool Contains(const Key &KeyValue) const {
+    bool Contains(const Key& KeyValue) const {
         Value Dummy;
         return Search(KeyValue, Dummy);
     }
 
     std::shared_ptr<Node> GetRoot() const { return Root; }
 };
-}
+} // namespace AstralDB

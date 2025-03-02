@@ -28,10 +28,33 @@ struct Instruction {
     std::vector<Value> Operands;
 
     constexpr Instruction(enum Opcode Op, std::initializer_list<Value> Ops)
-        : Opcode(Op), Operands(Ops) { }
+        : Opcode(Op), Operands(Ops) {}
+
+    bool operator==(const Instruction &Other) const {
+        return Opcode == Other.Opcode && Operands == Other.Operands;
+    }
 };
 
 using Bytecode = std::vector<Instruction>;
+
+struct BytecodeComparator {
+    bool operator()(const Bytecode &A, const Bytecode &B) const {
+        if(A.size() != B.size())
+            return A.size() < B.size();
+        for (size_t i = 0; i < A.size(); ++i) {
+            // Compare Opcode.
+            if (A[i].Opcode != B[i].Opcode)
+                return A[i].Opcode < B[i].Opcode;
+            if (A[i].Operands.size() != B[i].Operands.size())
+                return A[i].Operands.size() < B[i].Operands.size();
+            for (size_t j = 0; j < A[i].Operands.size(); ++j) {
+                if (A[i].Operands[j] != B[i].Operands[j])
+                    return A[i].Operands[j] < B[i].Operands[j];
+            }
+        }
+        return false;
+    }
+};
 
 template<typename... Args> requires (std::convertible_to<Args, Value> && ...)
 constexpr Instruction MakeInstruction(Opcode Op, Args&&... Operands) {
