@@ -3,6 +3,7 @@
 #include <SQL/Bytecode.hxx>
 #include <DS/Tree.hxx>
 #include <DS/BPlusTree.hxx>
+#include <cstdio>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -12,8 +13,18 @@
 
 namespace AstralDB {
 namespace SQL {
+enum class TokenType {
+    IDENTIFIER,
+    KEYWORD,
+    PUNCTUATION,
+    LITERAL,
+    WHITESPACE,
+    EOF_,
+    SYMBOL // Added SYMBOL
+};
+
 struct Token {
-    std::string Type;
+    TokenType Type;
     std::string Value;
 };
 
@@ -147,9 +158,19 @@ class Parser {
         }
     }
 
-    bool MatchToken(const std::string &ExpectedType) {
+    bool MatchToken(TokenType ExpectedType) {
         if(auto Token = CurrentToken()) {
             if(Token->Type == ExpectedType) {
+                AdvanceToken();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool MatchKeyword(const std::string &ExpectedKeyword) {
+        if(auto Token = CurrentToken()) {
+            if(Token->Value == ExpectedKeyword) {
                 AdvanceToken();
                 return true;
             }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Database/Database.hxx>
 #include <SQL/Bytecode.hxx>
 #include <cstdint>
 #include <vector>
@@ -15,6 +16,8 @@ class BytecodeInterpreter {
     uint32_t Flags;
     std::vector<uint64_t> Registers_;
     std::vector<uint64_t> Stack_;
+
+    std::vector<Database> Databases_;
 public:
     BytecodeInterpreter() : Ic(0), Sp(0), Bp(0), Flags(0) {
         Registers_.resize(16, 0);

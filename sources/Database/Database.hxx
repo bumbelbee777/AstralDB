@@ -3,6 +3,7 @@
 #include <IO/Spinlock.hxx>
 #include <IO/Task.hxx>
 #include <DS/EncryptedString.hxx>
+#include <Database/User.hxx>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -33,6 +34,10 @@ class Database {
         bool IsNotNull = false;
         std::string DefaultValue;
     };
+
+    User Owner, CurrentUser_;
+
+    std::vector<User> Users_;
 
     using Schema = std::vector<Column>;
 

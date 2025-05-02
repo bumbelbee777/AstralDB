@@ -17,7 +17,7 @@ int Parser::GetTokenPrecedence(const Token &Token) {
         {"+", 5}, {"-", 5},
         {"*", 6}, {"/", 6}, {"%", 6}
     };
-    auto It = PrecedenceMap.find(Token.Type);
+    auto It = PrecedenceMap.find(Token.Value); // Use Token.Value instead of Token.Type
     return (It != PrecedenceMap.end()) ? It->second : -1;
 }
 
@@ -45,9 +45,9 @@ TokenStream Parser::Tokenize() {
                 while(Position < Query_.size() && std::isdigit(Query_[Position]))
                     Position++;
             }
-            Tokens.push_back(Token{"Number", std::string(Query_.substr(Start, Position - Start))});
+            Tokens.push_back(Token{TokenType::LITERAL, std::string(Query_.substr(Start, Position - Start))});
         }
-        else if(CurrentChar == '\'' || CurrentChar == '"') {
+        else if(CurrentChar == '\'' || CurrentChar == '\"') {
             char QuoteChar = CurrentChar;
             Position++;
             size_t Start = Position;
@@ -60,14 +60,14 @@ TokenStream Parser::Tokenize() {
             if(Position >= Query_.size())
                 throw std::runtime_error("Unterminated string literal");
             std::string Literal = std::string(Query_.substr(Start, Position - Start));
-            Tokens.push_back(Token{"String", Literal});
+            Tokens.push_back(Token{TokenType::LITERAL, Literal});
             Position++;
         }
         else if (std::isalnum(CurrentChar) || CurrentChar == '_') {
             size_t Start = Position;
             while(Position < Query_.size() && (std::isalnum(Query_[Position]) || Query_[Position] == '_'))
                 Position++;
-            Tokens.push_back(Token{"Word", std::string(Query_.substr(Start, Position - Start))});
+            Tokens.push_back(Token{TokenType::IDENTIFIER, std::string(Query_.substr(Start, Position - Start))});
         }
         else {
             std::string OperatorStr;
@@ -76,16 +76,16 @@ TokenStream Parser::Tokenize() {
                 if(TwoChars == "<=" || TwoChars == ">=" || TwoChars == "!=" || TwoChars == "==") {
                     OperatorStr = TwoChars;
                     Position += 2;
-                    Tokens.push_back(Token{"Operator", OperatorStr});
+                    Tokens.push_back(Token{TokenType::PUNCTUATION, OperatorStr});
                     continue;
                 }
             }
             OperatorStr = std::string(1, CurrentChar);
             Position++;
             if(std::ispunct(CurrentChar))
-                Tokens.push_back(Token{"Punctuation", OperatorStr});
+                Tokens.push_back(Token{TokenType::PUNCTUATION, OperatorStr});
             else
-                Tokens.push_back(Token{"Symbol", OperatorStr});
+                Tokens.push_back(Token{TokenType::SYMBOL, OperatorStr});
         }
     }
     return Tokens;
@@ -115,7 +115,7 @@ Tree<std::vector<std::unique_ptr<ExpressionAST>>> Parser::BuildAST() const {
 
 void Parser::DumpTokens() const {
     for(const auto &TokenItem : Tokens_)
-        std::cout << "[" << TokenItem.Type << ": " << TokenItem.Value << "] ";
+        std::cout << "[" << static_cast<int>(TokenItem.Type) << ": " << TokenItem.Value << "] ";
     std::cout << std::endl;
 }
 
@@ -125,7 +125,7 @@ std::unique_ptr<ExpressionAST> Parser::ParsePrimary() {
     if(CurrentToken()->Value == "(") {
         AdvanceToken();
         auto Expr = ParseExpression();
-        if(!MatchToken(")"))
+        if(!MatchToken(TokenType::PUNCTUATION))
             throw std::runtime_error("Expected ')' in primary expression");
         return Expr;
     }
@@ -136,14 +136,14 @@ std::unique_ptr<ExpressionAST> Parser::ParsePrimary() {
 
 std::unique_ptr<ExpressionAST> Parser::ParseCreateStatement() {
     AdvanceToken();
-    if(!MatchToken("TABLE"))
+    if(!MatchKeyword("TABLE"))
         throw std::runtime_error("Expected 'TABLE' after 'CREATE'.");
     auto TableToken = CurrentToken();
     if(!TableToken)
         throw std::runtime_error("Expected table name after 'CREATE TABLE'.");
     std::string TableName = TableToken->Value;
     AdvanceToken();
-    if(!MatchToken("("))
+    if(!MatchToken(TokenType::PUNCTUATION))
         throw std::runtime_error("Expected '(' after table name in 'CREATE TABLE'.");
     std::vector<ColumnDefinition> Columns;
     while(true) {
@@ -189,7 +189,7 @@ std::unique_ptr<ExpressionAST> Parser::ParseSelectStatement() {
         Columns.push_back(Col);
         AdvanceToken();
     }
-    if(!MatchToken("FROM"))
+    if(!MatchKeyword("FROM"))
         throw std::runtime_error("Expected FROM in SELECT statement");
     if(auto TableToken = CurrentToken()) {
         std::string TableName = TableToken->Value;
@@ -202,14 +202,14 @@ std::unique_ptr<ExpressionAST> Parser::ParseSelectStatement() {
 
 std::unique_ptr<ExpressionAST> Parser::ParseInsertStatement() {
     AdvanceToken();
-    if(!MatchToken("INTO"))
+    if(!MatchKeyword("INTO"))
         throw std::runtime_error("Expected INTO after INSERT");
     auto TableToken = CurrentToken();
     if(!TableToken)
         throw std::runtime_error("Expected table name after INSERT INTO");
     std::string TableName = TableToken->Value;
     AdvanceToken();
-    if(!MatchToken("("))
+    if(!MatchToken(TokenType::PUNCTUATION))
         throw std::runtime_error("Expected '(' after table name in INSERT");
     std::vector<std::string> Columns;
     while (auto TokenOpt = CurrentToken()) {
@@ -222,9 +222,9 @@ std::unique_ptr<ExpressionAST> Parser::ParseInsertStatement() {
         Columns.push_back(Col);
         AdvanceToken();
     }
-    if(!MatchToken("VALUES"))
+    if(!MatchKeyword("VALUES"))
         throw std::runtime_error("Expected VALUES in INSERT statement");
-    if(!MatchToken("("))
+    if(!MatchToken(TokenType::PUNCTUATION))
         throw std::runtime_error("Expected '(' before values in INSERT");
     std::vector<std::string> Values;
     while(auto TokenOpt = CurrentToken()) {
@@ -249,14 +249,14 @@ std::unique_ptr<ExpressionAST> Parser::ParseUpdateStatement() {
         throw std::runtime_error("Expected table name after UPDATE");
     std::string TableName = TableToken->Value;
     AdvanceToken();
-    if(!MatchToken("SET"))
+    if(!MatchKeyword("SET"))
         throw std::runtime_error("Expected SET in UPDATE statement");
     std::vector<std::pair<std::string, std::string>> Assignments;
     while(auto TokenOpt = CurrentToken()) {
         if(TokenOpt->Value == "WHERE") break;
         std::string ColumnName = TokenOpt->Value;
         AdvanceToken();
-        if(!MatchToken("="))
+        if(!MatchToken(TokenType::PUNCTUATION))
             throw std::runtime_error("Expected '=' in assignment of UPDATE statement");
         auto ValueToken = CurrentToken();
         if (!ValueToken)
@@ -277,7 +277,7 @@ std::unique_ptr<ExpressionAST> Parser::ParseUpdateStatement() {
 
 std::unique_ptr<ExpressionAST> Parser::ParseDeleteStatement() {
     AdvanceToken();
-    if(!MatchToken("FROM"))
+    if(!MatchKeyword("FROM"))
         throw std::runtime_error("Expected FROM in DELETE statement");
     auto TableToken = CurrentToken();
     if(!TableToken)
