@@ -18,7 +18,8 @@ enum class Opcode : uint8_t {
     AND, OR, NOT, EQ, NE, LT, LE, GT, GE,
     ADD, SUB, MUL, DIV, MOD,
     PUSH, POP, LOAD, STORE,
-    CALL, RET, JMP, NOP, HALT
+    CALL, RET, JMP, NOP, HALT,
+    GRANT, REVOKE // Permission management
 };
 
 using Value = std::variant<int64_t, double, std::string>;

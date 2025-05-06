@@ -1,5 +1,6 @@
 #include "SQL/Bytecode.hxx"
 #include <SQL/SQL.hxx>
+#include <Database/User.hxx> // Include User.hxx for permissions
 #include <cctype>
 #include <iostream>
 #include <stdexcept>
@@ -67,7 +68,9 @@ TokenStream Parser::Tokenize() {
             size_t Start = Position;
             while(Position < Query_.size() && (std::isalnum(Query_[Position]) || Query_[Position] == '_'))
                 Position++;
-            Tokens.push_back(Token{TokenType::IDENTIFIER, std::string(Query_.substr(Start, Position - Start))});
+            std::string value = std::string(Query_.substr(Start, Position - Start));
+            TokenType type = IsKeyword(value) ? TokenType::KEYWORD : TokenType::IDENTIFIER;
+            Tokens.push_back(Token{type, value});
         }
         else {
             std::string OperatorStr;
@@ -135,8 +138,8 @@ std::unique_ptr<ExpressionAST> Parser::ParsePrimary() {
 }
 
 std::unique_ptr<ExpressionAST> Parser::ParseCreateStatement() {
-    AdvanceToken();
-    if(!MatchKeyword("TABLE"))
+    AdvanceToken(); // consume CREATE
+    if (!MatchKeyword("TABLE"))
         throw std::runtime_error("Expected 'TABLE' after 'CREATE'.");
     auto TableToken = CurrentToken();
     if(!TableToken)
@@ -292,6 +295,64 @@ std::unique_ptr<ExpressionAST> Parser::ParseDeleteStatement() {
     return std::make_unique<DeleteAST>(TableName, std::move(Condition));
 }
 
+std::unique_ptr<ExpressionAST> Parser::ParseGrantStatement() {
+    AdvanceToken(); // consume GRANT
+    // Expect permission type (SELECT, INSERT, UPDATE, DELETE, etc.)
+    if (!CurrentToken()) throw std::runtime_error("Expected permission after GRANT");
+    std::string permStr = CurrentToken()->Value;
+    Permissions Perms;
+    if (permStr == "SELECT") Perms = Permissions::Select;
+    else if (permStr == "INSERT") Perms = Permissions::Insert;
+    else if (permStr == "UPDATE") Perms = Permissions::Update;
+    else if (permStr == "DELETE") Perms = Permissions::Delete;
+    else if (permStr == "TRUNCATE") Perms = Permissions::Truncate;
+    else if (permStr == "REFERENCES") Perms = Permissions::References;
+    else if (permStr == "TRIGGER") Perms = Permissions::Trigger;
+    else if (permStr == "ALL") Perms = Permissions::All;
+    else throw std::runtime_error("Unknown permission in GRANT: " + permStr);
+    AdvanceToken();
+    if (!MatchKeyword("ON")) throw std::runtime_error("Expected ON after permission in GRANT");
+    std::string tableName;
+    if (CurrentToken() && CurrentToken()->Type == TokenType::IDENTIFIER) {
+        tableName = CurrentToken()->Value;
+        AdvanceToken();
+    }
+    if (!MatchKeyword("TO")) throw std::runtime_error("Expected TO after table in GRANT");
+    if (!CurrentToken()) throw std::runtime_error("Expected user after TO in GRANT");
+    std::string Username = CurrentToken()->Value;
+    AdvanceToken();
+    return std::make_unique<GrantAST>(Username, Perms, tableName);
+}
+
+std::unique_ptr<ExpressionAST> Parser::ParseRevokeStatement() {
+    AdvanceToken(); // consume REVOKE
+    // Expect permission type (SELECT, INSERT, UPDATE, DELETE, etc.)
+    if (!CurrentToken()) throw std::runtime_error("Expected permission after REVOKE");
+    std::string permStr = CurrentToken()->Value;
+    Permissions Perms;
+    if (permStr == "SELECT") Perms = Permissions::Select;
+    else if (permStr == "INSERT") Perms = Permissions::Insert;
+    else if (permStr == "UPDATE") Perms = Permissions::Update;
+    else if (permStr == "DELETE") Perms = Permissions::Delete;
+    else if (permStr == "TRUNCATE") Perms = Permissions::Truncate;
+    else if (permStr == "REFERENCES") Perms = Permissions::References;
+    else if (permStr == "TRIGGER") Perms = Permissions::Trigger;
+    else if (permStr == "ALL") Perms = Permissions::All;
+    else throw std::runtime_error("Unknown permission in REVOKE: " + permStr);
+    AdvanceToken();
+    if (!MatchKeyword("ON")) throw std::runtime_error("Expected ON after permission in REVOKE");
+    std::string tableName;
+    if (CurrentToken() && CurrentToken()->Type == TokenType::IDENTIFIER) {
+        tableName = CurrentToken()->Value;
+        AdvanceToken();
+    }
+    if (!MatchKeyword("FROM")) throw std::runtime_error("Expected FROM after table in REVOKE");
+    if (!CurrentToken()) throw std::runtime_error("Expected user after FROM in REVOKE");
+    std::string Username = CurrentToken()->Value;
+    AdvanceToken();
+    return std::make_unique<RevokeAST>(Username, Perms, tableName);
+}
+
 std::unique_ptr<ExpressionAST> Parser::ParseWhereClause() {
     if(CurrentToken() && CurrentToken()->Value == "WHERE") {
         AdvanceToken();
@@ -320,6 +381,10 @@ std::unique_ptr<ExpressionAST> Parser::ParseStatement() {
             return ParseDeleteStatement();
         else if(FirstValue == "CREATE")
             return ParseCreateStatement();
+        else if(FirstValue == "GRANT")
+            return ParseGrantStatement();
+        else if(FirstValue == "REVOKE")
+            return ParseRevokeStatement();
         else
             throw std::runtime_error("Unrecognized statement type: " + FirstValue);
     }
@@ -358,6 +423,14 @@ void Parser::DumpAST() {
         Bytecode Dummy = Node->EmitBytecode();
         std::cout << Disassemble(Dummy);
     }
+}
+
+bool Parser::IsKeyword(const std::string &Token) {
+    static const std::unordered_set<std::string> Keywords = {
+        "CREATE", "INSERT", "INTO", "VALUES", "UPDATE", "SET",
+        "WHERE", "DELETE", "FROM", "TABLE"
+    };
+    return Keywords.find(Token) != Keywords.end();
 }
 }
 }

@@ -1,5 +1,6 @@
 #include <Database/Database.hxx>
 #include <IO/Task.hxx>
+#include <optional>
 #include <sstream>
 #include <fstream>
 #include <stdexcept>
@@ -8,6 +9,7 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <Database/IndexManagement.hxx>
 
 namespace AstralDB {
 void Database::FlushWorker() noexcept {
@@ -32,8 +34,8 @@ void Database::FlushWorker() noexcept {
     }
 }
 
-Database::Database(const std::filesystem::path &DBPath)
-    : DBPath_(DBPath), Dirty_(false), StopFlushWorker_(false) {
+Database::Database(const std::filesystem::path &DbPath)
+    : Owner_("Admin0", "admin", Permissions::All), CurrentUser_(std::nullopt), DbPath_(DbPath), Dirty_(false), StopFlushWorker_(false) {
     FlushWorkerThread_ = std::thread([this]() { this->FlushWorker(); });
 }
 
@@ -109,7 +111,7 @@ void Database::SyncToFile() {
     std::string RawData = OutputStream.str();
     std::string CompressedData = CompressData(RawData);
     std::string EncryptedData = EncryptData(CompressedData);
-    std::ofstream File(DBPath_, std::ios::binary);
+    std::ofstream File(DbPath_, std::ios::binary);
     if(!File)
         throw std::runtime_error("Failed to open file for writing.");
     File.write(EncryptedData.data(), EncryptedData.size());
@@ -151,6 +153,12 @@ std::future<void> Database::Insert(const std::string &TableName, const Item &Row
             if(!TableRef.empty())
                 PREFETCH(TableRef.data());
             TableRef.push_back(Row);
+            for (const auto& [ColumnName, Value] : Row) {
+                if (Indexes_[TableName].find(ColumnName) != Indexes_[TableName].end()) {
+                    auto& Index = Indexes_[TableName][ColumnName];
+                    std::get<BPlusTree<std::string, size_t>>(Index.Index()).Insert(Value, TableRef.size() - 1);
+                }
+            }
         }
         Dirty_.store(true, std::memory_order_release);
     });
@@ -161,6 +169,16 @@ std::future<void> Database::Delete(const std::string &TableName, const std::func
         {
             SpinlockGuard Guard(Lock_);
             auto &TableRef = Tables_.at(TableName);
+            for (size_t i = 0; i < TableRef.size(); ++i) {
+                if (Condition(TableRef[i])) {
+                    for (const auto& [ColumnName, Value] : TableRef[i]) {
+                        if (Indexes_[TableName].find(ColumnName) != Indexes_[TableName].end()) {
+                            auto& Index = Indexes_[TableName][ColumnName];
+                            std::get<BPlusTree<std::string, size_t>>(Index.Index()).Remove(Value);
+                        }
+                    }
+                }
+            }
             TableRef.erase(std::remove_if(TableRef.begin(), TableRef.end(), Condition), TableRef.end());
         }
         Dirty_.store(true, std::memory_order_release);
@@ -178,27 +196,18 @@ std::future<void> Database::Update(const std::string &TableName,
             if(TableIt == Tables_.end())
                 throw std::runtime_error("Table not found");
             auto &TableRef = TableIt->second;
-            if(Indexes_.find(TableName) != Indexes_.end()) {
-                for(auto &ColumnPair : Indexes_[TableName]) {
-                    for(auto &ValueIndexPair : ColumnPair.second) {
-                        size_t RowIndex = ValueIndexPair.second;
-                        if (RowIndex < TableRef.size()) {
-                            auto &Row = TableRef[RowIndex];
-                            if (Condition(Row)) {
-                                for (const auto &UpdatePair : NewValues)
-                                    Row[UpdatePair.first] = UpdatePair.second;
-                                Modified = true;
-                            }
+            for (size_t i = 0; i < TableRef.size(); ++i) {
+                auto& Row = TableRef[i];
+                if (Condition(Row)) {
+                    for (const auto& [ColumnName, NewValue] : NewValues) {
+                        if (Indexes_[TableName].find(ColumnName) != Indexes_[TableName].end()) {
+                            auto& Index = Indexes_[TableName][ColumnName];
+                            std::get<BPlusTree<std::string, size_t>>(Index.Index()).Remove(Row[ColumnName]);
+                            std::get<BPlusTree<std::string, size_t>>(Index.Index()).Insert(NewValue, i);
                         }
+                        Row[ColumnName] = NewValue;
                     }
-                }
-            } else {
-                for(auto &Row : TableRef) {
-                    if(Condition(Row)) {
-                        for(const auto &UpdatePair : NewValues)
-                            Row[UpdatePair.first] = UpdatePair.second;
-                        Modified = true;
-                    }
+                    Modified = true;
                 }
             }
         }
@@ -218,12 +227,17 @@ std::future<Database::Table> Database::Select(const std::string &TableName, cons
             if(!TableRef.empty()) PREFETCH(TableRef.data());
             if(Indexes_.find(TableName) != Indexes_.end()) {
                 for (const auto &ColumnIndexes : Indexes_.at(TableName)) {
-                    for (const auto &ValueIndexPair : ColumnIndexes.second) {
-                        size_t RowIndex = ValueIndexPair.second;
-                        if (RowIndex < TableRef.size()) {
-                            const auto &Row = TableRef[RowIndex];
-                            if (Condition(Row))
-                                Result.push_back(Row);
+                    // Instead of iterating ColumnIndexes.second, get the BPlusTree and iterate its keys
+                    const auto& indexVariant = ColumnIndexes.second.Index();
+                    if (std::holds_alternative<BPlusTree<std::string, size_t>>(indexVariant)) {
+                        const auto& bptree = std::get<BPlusTree<std::string, size_t>>(indexVariant);
+                        for (const auto& key : bptree.GetAllKeys()) {
+                            size_t RowIndex;
+                            if (bptree.Search(key, RowIndex) && RowIndex < TableRef.size()) {
+                                const auto &Row = TableRef[RowIndex];
+                                if (Condition(Row))
+                                    Result.push_back(Row);
+                            }
                         }
                     }
                 }
@@ -253,7 +267,7 @@ std::future<bool> Database::ValidateRow(const std::string &TableName, const Item
                 if(Column.IsUnique && Indexes_.find(TableName) != Indexes_.end()) {
                     auto ItCol = Indexes_.at(TableName).find(Column.Name);
                     if (ItCol != Indexes_.at(TableName).end() && Row.find(Column.Name) != Row.end()) {
-                        if (ItCol->second.find(Row.at(Column.Name)) != ItCol->second.end()) {
+                        if (std::get<BPlusTree<std::string, size_t>>(ItCol->second.Index()).Contains(Row.at(Column.Name))) {
                             Valid = false;
                             break;
                         }
@@ -353,6 +367,112 @@ std::future<void> Database::AddForeignKey(const std::string &TableName, const Fo
     return RunAsync([this, TableName, Key]() {
         SpinlockGuard Guard(Lock_);
         ForeignKeys_[TableName].push_back(Key);
+    });
+}
+
+bool Database::HasPermission(const User &user, Permissions Perms, const std::string &Table) const {
+    SpinlockGuard Guard(Lock_);
+    auto userIt = Acls_.find(user.Name);
+    if (userIt == Acls_.end()) return false;
+    // Table-specific permissions
+    if (!Table.empty()) {
+        auto tableIt = userIt->second.find(Table);
+        if (tableIt != userIt->second.end()) {
+            return (static_cast<int>(tableIt->second) & static_cast<int>(Perms)) == static_cast<int>(Perms);
+        }
+    }
+    // Global permissions
+    auto globalIt = userIt->second.find("");
+    if (globalIt != userIt->second.end()) {
+        return (static_cast<int>(globalIt->second) & static_cast<int>(Perms)) == static_cast<int>(Perms);
+    }
+    return false;
+}
+
+std::future<void> Database::GrantPermission(const std::string &Username, Permissions Perms, const std::string &Table) {
+    return RunAsync([this, Username, Perms, Table]() {
+        SpinlockGuard Guard(Lock_);
+        Acls_[Username][Table] = static_cast<Permissions>(static_cast<int>(Acls_[Username][Table]) | static_cast<int>(Perms));
+        Dirty_.store(true, std::memory_order_release);
+    });
+}
+
+std::future<void> Database::RevokePermission(const std::string &Username, Permissions Perms, const std::string &Table) {
+    return RunAsync([this, Username, Perms, Table]() {
+        SpinlockGuard Guard(Lock_);
+        Acls_[Username][Table] = static_cast<Permissions>(static_cast<int>(Acls_[Username][Table]) & ~static_cast<int>(Perms));
+        Dirty_.store(true, std::memory_order_release);
+    });
+}
+
+std::future<Permissions> Database::UserPermissions(const std::string &Username, const std::string &Table) const {
+    return RunAsync([this, Username, Table]() -> Permissions {
+        SpinlockGuard Guard(Lock_);
+        auto UserIt = Acls_.find(Username);
+        if (UserIt == Acls_.end()) return static_cast<Permissions>(0);
+        if (!Table.empty()) {
+            auto tableIt = UserIt->second.find(Table);
+            if (tableIt != UserIt->second.end()) return tableIt->second;
+        }
+        auto globalIt = UserIt->second.find("");
+        if (globalIt != UserIt->second.end()) return globalIt->second;
+        return static_cast<Permissions>(0);
+    });
+}
+
+bool Database::AuthenticateUser(const std::string& Username, const std::string& Password) {
+    SpinlockGuard Guard(Lock_);
+    for (auto& User : Users_) {
+        if (User.Name == Username && User.VerifyPassword(Password)) {
+            CurrentUser_.emplace(std::move(User));
+            return true;
+        }
+    }
+    return false;
+}
+
+void Database::Logout() {
+    SpinlockGuard Guard(Lock_);
+    CurrentUser_.reset();
+}
+
+bool Database::IsAuthenticated() const {
+    SpinlockGuard Guard(Lock_);
+    return CurrentUser_.has_value() && !CurrentUser_->Name.empty();
+}
+
+const std::optional<User>& Database::CurrentUser() const {
+    return CurrentUser_;
+}
+
+// Helper: get or create index for a table/column
+IndexManagement<std::string, size_t>& Database::GetOrCreateIndex(const std::string& table, const std::string& column) {
+    if (Indexes_[table].find(column) == Indexes_[table].end()) {
+        Indexes_[table][column] = IndexManagement<std::string, size_t>();
+    }
+    return Indexes_[table][column];
+}
+
+std::future<void> Database::AddIndex(const std::string &TableName, const std::string &ColumnName) {
+    return RunAsync([this, TableName, ColumnName]() {
+        SpinlockGuard Guard(Lock_);
+        auto& table = Tables_[TableName];
+        auto& index = GetOrCreateIndex(TableName, ColumnName);
+        for (size_t i = 0; i < table.size(); ++i) {
+            const auto& row = table[i];
+            auto it = row.find(ColumnName);
+            if (it != row.end()) {
+                // For now, always use BPlusTree
+                std::get<BPlusTree<std::string, size_t>>(index.Index()).Insert(it->second, i);
+            }
+        }
+    });
+}
+
+std::future<void> Database::RemoveIndex(const std::string &TableName, const std::string &ColumnName) {
+    return RunAsync([this, TableName, ColumnName]() {
+        SpinlockGuard Guard(Lock_);
+        Indexes_[TableName].erase(ColumnName);
     });
 }
 }

@@ -1,0 +1,33 @@
+[
+    {
+        "directory": "D:\\AstralDB",
+        "command": "clang++ -std=c++23 -Isources/ -O3 -Wall -Wextra -c sources/Program.cxx -o obj/Program.obj",
+        "file": "sources/Program.cxx"
+    },
+    {
+        "directory": "D:\\AstralDB",
+        "command": "clang++ -std=c++23 -Isources/ -O3 -Wall -Wextra -c sources/Database/Database.cxx -o obj/Database/Database.obj",
+        "file": "sources/Database/Database.cxx"
+    },
+    {
+        "directory": "D:\\AstralDB",
+        "command": "clang++ -std=c++23 -Isources/ -O3 -Wall -Wextra -c sources/SQL/AST.cxx -o obj/SQL/AST.obj",
+        "file": "sources/SQL/AST.cxx"
+    },
+    {
+        "directory": "D:\\AstralDB",
+        "command": "clang++ -std=c++23 -Isources/ -O3 -Wall -Wextra -c sources/SQL/Bytecode.cxx -o obj/SQL/Bytecode.obj",
+        "file": "sources/SQL/Bytecode.cxx"
+    },
+    {
+        "directory": "D:\\AstralDB",
+        "command": "clang++ -std=c++23 -Isources/ -O3 -Wall -Wextra -c sources/SQL/Codegen.cxx -o obj/SQL/Codegen.obj",
+        "file": "sources/SQL/Codegen.cxx"
+    },
+    {
+        "directory": "D:\\AstralDB",
+        "command": "clang++ -std=c++23 -Isources/ -O3 -Wall -Wextra -c sources/SQL/Parser.cxx -o obj/SQL/Parser.obj",
+        "file": "sources/SQL/Parser.cxx"
+    }
+]
+

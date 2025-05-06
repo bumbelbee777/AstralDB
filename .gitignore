@@ -1,3 +1,8 @@
 AstralDB
 AstralDB.exe
 debug.log
+*.o
+*.obj
+.cache/
+obj/
+.vscode/

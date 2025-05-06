@@ -6,6 +6,7 @@
 #include <vector>
 #include <iostream>
 #include <stdexcept>
+#include <memory>
 
 namespace AstralDB {
 namespace SQL {
@@ -17,7 +18,7 @@ class BytecodeInterpreter {
     std::vector<uint64_t> Registers_;
     std::vector<uint64_t> Stack_;
 
-    std::vector<Database> Databases_;
+    std::vector<std::unique_ptr<Database>> Databases_;
 public:
     BytecodeInterpreter() : Ic(0), Sp(0), Bp(0), Flags(0) {
         Registers_.resize(16, 0);

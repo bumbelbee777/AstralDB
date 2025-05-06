@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Database/User.hxx>
 #include <SQL/Bytecode.hxx>
 #include <DS/Tree.hxx>
 #include <DS/BPlusTree.hxx>
@@ -119,7 +120,25 @@ struct BinaryOpAST : public ExpressionAST {
     std::string Op;
 
     BinaryOpAST(std::unique_ptr<ExpressionAST> LHS, std::string Op, std::unique_ptr<ExpressionAST> RHS)
-        : LHS(std::move(LHS)), Op(std::move(Op)), RHS(std::move(RHS)) {}
+        : LHS(std::move(LHS)), RHS(std::move(RHS)), Op(std::move(Op)) {}
+    Bytecode EmitBytecode() const override;
+};
+
+struct GrantAST : public ExpressionAST {
+    std::string Username;
+    Permissions Perms;
+    std::string TableName;
+    GrantAST(std::string User, Permissions Perms, std::string Table = "")
+        : Username(std::move(User)), Perms(Perms), TableName(std::move(Table)) {}
+    Bytecode EmitBytecode() const override;
+};
+
+struct RevokeAST : public ExpressionAST {
+    std::string UserName;
+    Permissions Perms;
+    std::string TableName;
+    RevokeAST(std::string User, Permissions Permissions, std::string Table = "")
+        : UserName(std::move(User)), Perms(Permissions), TableName(std::move(Table)) {}
     Bytecode EmitBytecode() const override;
 };
 
@@ -142,25 +161,35 @@ class Parser {
     std::unique_ptr<ExpressionAST> ParsePrimary();
 
     bool IsConstraint(const std::string &TokenValue);
-
+    
+    bool IsKeyword(const std::string &TokenValue);
+    
     std::optional<Token> CurrentToken() const {
         if(CurrentIndex_ < Tokens_.size()) return Tokens_[CurrentIndex_];
         return std::nullopt;
     }
 
     void AdvanceToken() {
-        while(CurrentIndex_ < Tokens_.size() && 
-            (IsEOF() || 
-                std::all_of(Tokens_[CurrentIndex_].Value.begin(), Tokens_[CurrentIndex_].Value.end(), [](unsigned char c) {
-                    return std::isspace(c);
-                }))) {
-            ++CurrentIndex_;
-        }
+        if (!IsEOF()) ++CurrentIndex_;
     }
 
     bool MatchToken(TokenType ExpectedType) {
-        if(auto Token = CurrentToken()) {
-            if(Token->Type == ExpectedType) {
+        if(auto Token = CurrentToken(); Token && Token->Type == ExpectedType) {
+            AdvanceToken();
+            return true;
+        }
+        return false;
+    }
+
+    bool MatchToken(const Token &Other) {
+        if(auto Token = CurrentToken(); MatchToken(Other.Type) && MatchKeyword(Other.Value))
+            return true;
+        return false;
+    }
+
+    bool MatchKeyword(const std::string &ExpectedKeyword) {
+        if (auto Token = CurrentToken()) {
+            if (Token->Type == TokenType::KEYWORD && Token->Value == ExpectedKeyword) {
                 AdvanceToken();
                 return true;
             }
@@ -168,9 +197,9 @@ class Parser {
         return false;
     }
 
-    bool MatchKeyword(const std::string &ExpectedKeyword) {
-        if(auto Token = CurrentToken()) {
-            if(Token->Value == ExpectedKeyword) {
+    bool MatchToken(TokenType ExpectedType, const std::string& ExpectedValue) {
+        if (auto Token = CurrentToken()) {
+            if (Token->Type == ExpectedType && Token->Value == ExpectedValue) {
                 AdvanceToken();
                 return true;
             }
@@ -189,20 +218,42 @@ class Parser {
     std::unique_ptr<ExpressionAST> ParseWhereClause();
     std::unique_ptr<ExpressionAST> ParseBinaryOperation();
     std::unique_ptr<ExpressionAST> ParseBinaryOperation(int MinPrec, std::unique_ptr<ExpressionAST> LHS);
+    std::unique_ptr<ExpressionAST> ParseGrantStatement();
+    std::unique_ptr<ExpressionAST> ParseRevokeStatement();
 public:
     explicit Parser(std::string_view Query) : Query_(Query) {
+        std::cout << "[Parser] Initializing with query:\n\"" << Query << "\"\n";
+        
+        // Tokenization phase
+        std::cout << "[Tokenizer] Starting tokenization...\n";
         Tokens_ = Tokenize();
+        std::cout << "[Tokenizer] Produced " << Tokens_.size() << " tokens:\n";
+        for (const auto& token : Tokens_)
+            std::cout << "[" << static_cast<int>(token.Type) << ": " << token.Value << "] ";
+        std::cout << "\n";
+        
         CurrentIndex_ = 0;
-        try { 
-            ParseStatement(); 
+        
+        // Parsing phase
+        try {
+            std::cout << "[Parser] Starting AST construction...\n";
+            ParseStatement();
+            std::cout << "[Parser] Successfully parsed initial statement\n";
         }
-        catch(...) {
-            std::cout << "Something went wrong\n";
+        catch(const std::exception& e) {
+            std::cerr << "[ERROR] Parsing failed: " << e.what() << "\n";
+            throw;
         }
+        
+        // AST finalization
+        std::cout << "[AST] Building final abstract syntax tree...\n";
         auto NewAST = BuildAST();
-        AST.clear();
         AST = std::move(NewAST.GetRoot());
-        DumpTokens();
+        
+        // AST diagnostics
+        std::cout << "[AST] Final AST structure:\n";
+        DumpAST();  // Replace DumpTokens() with AST visualization
+        std::cout << "[AST] Construction completed successfully\n";
     }
 
     std::unique_ptr<ExpressionAST> ParseStatement();

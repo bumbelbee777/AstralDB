@@ -215,6 +215,9 @@ public:
         bool Underflow = DeleteHelper(Root, KeyValue, true, Deleted);
         if(!Root->IsLeaf && Root->Children.size() == 1)
             Root = Root->Children.front();
+        // Use Underflow to indicate if the root became empty (after deletion)
+        if(Underflow && Root->IsLeaf && Root->Keys.empty())
+            Root = std::make_shared<Node>(true);
         return Deleted;
     }
 
@@ -255,5 +258,7 @@ public:
     }
 
     std::shared_ptr<Node> GetRoot() const { return Root; }
+
+    void Remove(const Key& KeyValue) { Delete(KeyValue); }
 };
 } // namespace AstralDB

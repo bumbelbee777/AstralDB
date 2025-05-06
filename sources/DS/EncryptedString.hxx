@@ -14,6 +14,8 @@ class EncryptedString final {
     std::string EncryptedData_;
     std::array<uint8_t, 32> EncryptionKey_;
 public:
+    EncryptedString() : EncryptedData_(""), EncryptionKey_({}) {}
+
     EncryptedString(std::string_view Input, std::string_view Key) {
         if(Key.size() != 32) throw std::invalid_argument("Key must be exactly 32 bytes");
         std::copy(Key.begin(), Key.end(), EncryptionKey_.begin());
@@ -43,6 +45,9 @@ public:
 
     EncryptedString(const EncryptedString &) = delete;
     EncryptedString &operator=(const EncryptedString &) = delete;
+
+    EncryptedString(EncryptedString&& other) noexcept = default;
+    EncryptedString& operator=(EncryptedString&& other) noexcept = default;
 
     const std::array<uint8_t, 32> &EncryptionKey() const {
         return EncryptionKey_;

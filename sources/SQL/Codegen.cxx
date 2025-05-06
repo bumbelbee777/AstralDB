@@ -112,6 +112,17 @@ Bytecode BinaryOpAST::EmitBytecode() const {
     return Code;
 }
 
+Bytecode GrantAST::EmitBytecode() const {
+    Bytecode Code;
+    AppendInstruction(Code, MakeInstruction(Opcode::GRANT, Username, static_cast<int64_t>(Perms), TableName));
+    return Code;
+}
+
+Bytecode RevokeAST::EmitBytecode() const {
+    Bytecode Code;
+    AppendInstruction(Code, MakeInstruction(Opcode::REVOKE, UserName, static_cast<int64_t>(Perms), TableName));
+    return Code;
+}
 
 Bytecode BuildBytecode() {
     Bytecode Result;
