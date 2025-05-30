@@ -145,7 +145,7 @@ struct RevokeAST : public ExpressionAST {
 using ASTNode = std::unique_ptr<ExpressionAST>;
 using ASTType = std::vector<ASTNode>;
 
-extern ASTType AST;
+extern Tree<ASTNode> AST;
 
 class Parser {
     std::string_view Query_;
@@ -158,7 +158,7 @@ class Parser {
 
     TokenStream Tokenize();
 
-    std::unique_ptr<ExpressionAST> ParsePrimary();
+    ASTNode ParsePrimary();
 
     bool IsConstraint(const std::string &TokenValue);
     
@@ -207,19 +207,19 @@ class Parser {
         return false;
     }
 
-    Tree<std::vector<std::unique_ptr<ExpressionAST>>> BuildAST() const;
+    Tree<ASTNode> BuildAST() const;
 
-    std::unique_ptr<ExpressionAST> ParseExpression();
-    std::unique_ptr<ExpressionAST> ParseCreateStatement();
-    std::unique_ptr<ExpressionAST> ParseSelectStatement();
-    std::unique_ptr<ExpressionAST> ParseInsertStatement();
-    std::unique_ptr<ExpressionAST> ParseUpdateStatement();
-    std::unique_ptr<ExpressionAST> ParseDeleteStatement();
-    std::unique_ptr<ExpressionAST> ParseWhereClause();
-    std::unique_ptr<ExpressionAST> ParseBinaryOperation();
-    std::unique_ptr<ExpressionAST> ParseBinaryOperation(int MinPrec, std::unique_ptr<ExpressionAST> LHS);
-    std::unique_ptr<ExpressionAST> ParseGrantStatement();
-    std::unique_ptr<ExpressionAST> ParseRevokeStatement();
+    ASTNode ParseExpression();
+    ASTNode ParseCreateStatement();
+    ASTNode ParseSelectStatement();
+    ASTNode ParseInsertStatement();
+    ASTNode ParseUpdateStatement();
+    ASTNode ParseDeleteStatement();
+    ASTNode ParseWhereClause();
+    ASTNode ParseBinaryOperation();
+    ASTNode ParseBinaryOperation(int MinPrec, ASTNode LHS);
+    ASTNode ParseGrantStatement();
+    ASTNode ParseRevokeStatement();
 public:
     explicit Parser(std::string_view Query) : Query_(Query) {
         std::cout << "[Parser] Initializing with query:\n\"" << Query << "\"\n";
@@ -248,7 +248,7 @@ public:
         // AST finalization
         std::cout << "[AST] Building final abstract syntax tree...\n";
         auto NewAST = BuildAST();
-        AST = std::move(NewAST.GetRoot());
+        AST = std::move(NewAST);
         
         // AST diagnostics
         std::cout << "[AST] Final AST structure:\n";
@@ -260,7 +260,16 @@ public:
 
     void DumpTokens() const;
 
-    void DumpAST();
+    void DumpAST() {
+        std::function<void(const Tree<ASTNode>::Node&, int)> DumpNode = [&](const Tree<ASTNode>::Node& Node, int Depth) {
+            std::cout << std::string(Depth * 2, ' ') << Node.Value->EmitBytecode() << '\n';
+            for (const auto& Child : Node.Children)
+                DumpNode(*Child, Depth + 1);
+        };
+        
+        for (const auto& Root : AST.GetNodes())
+            DumpNode(*Root, 0);
+    }
 };
 }
 }

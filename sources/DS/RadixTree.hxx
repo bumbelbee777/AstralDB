@@ -6,26 +6,74 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <atomic>
+#include <mutex>
 
 namespace AstralDB {
 namespace DS {
+// Platform-agnostic RCU tracker
+class RCUTracker {
+	std::atomic<size_t> GlobalEpoch_ {0};
+	std::mutex RetireMutex_;
+	std::vector<std::pair<size_t, std::function<void()>>> Retired_;
+public:
+	static thread_local size_t LocalEpoch_;
+	void Enter() { LocalEpoch_ = GlobalEpoch_.load(std::memory_order_acquire); }
+	void Exit() { LocalEpoch_ = 0; }
+	void Synchronize() {
+		std::lock_guard<std::mutex> Lock(RetireMutex_);
+		// NOTE: This is a minimal, header-only, single-threaded-safe version.
+		for(auto It = Retired_.begin(); It != Retired_.end();) {
+			if(It->first <= LocalEpoch_) {
+				It->second();
+				It = Retired_.erase(It);
+			} else ++It;
+		}
+	}
+	void Retire(std::function<void()> Deleter) {
+		std::lock_guard<std::mutex> Lock(RetireMutex_);
+		Retired_.emplace_back(GlobalEpoch_.fetch_add(1, std::memory_order_acq_rel), std::move(Deleter));
+	}
+};
+// Header-only: thread_local variable must be inline
+inline thread_local size_t RCUTracker::LocalEpoch_ = 0;
+
 template<class KeyType, class ValueType> class RadixTree {
 public:
 	using NodePointer = std::shared_ptr<RadixTree<KeyType, ValueType>>;
-
 private:
-	// Edge compression: store strings instead of single chars for edges
 	std::vector<std::string> Edges_;
 	std::vector<NodePointer> Children_;
 	std::optional<ValueType> Value_;
 	mutable Spinlock Mutex_;
-	// Placeholder for RCU mechanism (platform-specific, not implemented here)
-
+	static inline RCUTracker RCU_{};
 public:
 	RadixTree() = default;
 	virtual ~RadixTree() = default;
 
-	// Async Insert
+	class RCUReadGuard {
+	public:
+		RCUReadGuard() { RCU_.Enter(); }
+		~RCUReadGuard() { RCU_.Exit(); }
+	};
+
+	NodePointer InsertRCU(const KeyType& Key, const ValueType& Value, size_t Depth = 0) const {
+		NodePointer NewNode = std::make_shared<RadixTree>(*this);
+		NewNode->Insert(Key, Value, Depth);
+		return NewNode;
+	}
+
+	NodePointer RemoveRCU(const KeyType& Key, size_t Depth = 0) const {
+		NodePointer NewNode = std::make_shared<RadixTree>(*this);
+		NewNode->Remove(Key, Depth);
+		return NewNode;
+	}
+
+	std::optional<ValueType> FindRCU(const KeyType& Key, size_t Depth = 0) const {
+		RCUReadGuard Guard;
+		return Find(Key, Depth);
+	}
+
 	auto InsertAsync(const KeyType& Key, const ValueType& Value, size_t Depth = 0) {
 		return RunAsync([this, Key, Value, Depth]() {
 			Insert(Key, Value, Depth);
@@ -56,29 +104,29 @@ public:
 				return;
 			} else if (j == RemainingKey.size()) {
 				// RemainingKey is a prefix of Edge, need to split edge
-				NodePointer newChild = std::make_shared<RadixTree<KeyType, ValueType>>();
-				newChild->Value_ = Value;
+				NodePointer NewChild = std::make_shared<RadixTree<KeyType, ValueType>>();
+				NewChild->Value_ = Value;
 				// Move the existing child under the new child
-				newChild->Edges_.push_back(Edge.substr(j));
-				newChild->Children_.push_back(Children_[i]);
+				NewChild->Edges_.push_back(Edge.substr(j));
+				NewChild->Children_.push_back(Children_[i]);
 				// Update current edge and child
 				Edges_[i] = std::string(RemainingKey);
-				Children_[i] = newChild;
+				Children_[i] = NewChild;
 				return;
 			} else {
 				// Split edge at position j
-				NodePointer splitNode = std::make_shared<RadixTree<KeyType, ValueType>>();
+				NodePointer SplitNode = std::make_shared<RadixTree<KeyType, ValueType>>();
 				// Existing child becomes a child of splitNode
-				splitNode->Edges_.push_back(Edge.substr(j));
-				splitNode->Children_.push_back(Children_[i]);
+				SplitNode->Edges_.push_back(Edge.substr(j));
+				SplitNode->Children_.push_back(Children_[i]);
 				// New child for the new key
-				NodePointer newChild = std::make_shared<RadixTree<KeyType, ValueType>>();
-				newChild->Insert(Key, Value, Depth + j);
-				splitNode->Edges_.push_back(std::string(RemainingKey.substr(j)));
-				splitNode->Children_.push_back(newChild);
+				NodePointer NewChild = std::make_shared<RadixTree<KeyType, ValueType>>();
+				NewChild->Insert(Key, Value, Depth + j);
+				SplitNode->Edges_.push_back(std::string(RemainingKey.substr(j)));
+				SplitNode->Children_.push_back(NewChild);
 				// Update edge and child
 				Edges_[i] = Edge.substr(0, j);
-				Children_[i] = splitNode;
+				Children_[i] = SplitNode;
 				return;
 			}
 		}
@@ -89,7 +137,6 @@ public:
 		Children_.push_back(Child);
 	}
 
-	// Async Find
 	auto FindAsync(const KeyType& Key, size_t Depth = 0) const {
 		return RunAsync([this, Key, Depth]() {
 			return Find(Key, Depth);
@@ -109,7 +156,6 @@ public:
 		return std::nullopt;
 	}
 
-	// Async Remove
 	auto RemoveAsync(const KeyType& Key, size_t Depth = 0) {
 		return RunAsync([this, Key, Depth]() {
 			return Remove(Key, Depth);
@@ -147,9 +193,13 @@ public:
 		return false;
 	}
 
-	bool IsEmpty() const {
+	bool Empty() const {
 		SpinlockGuard lock(Mutex_);
 		return !Value_.has_value() && Children_.empty();
+	}
+
+	void Add(const NodePointer & /*Node*/) {
+		
 	}
 };
 } // namespace DS

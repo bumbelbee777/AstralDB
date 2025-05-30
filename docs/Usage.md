@@ -11,3 +11,5 @@
 - `-fb FILE`/`--from-bytecode FILE`: Runs input bytecode.
 - `-cc FILE`/`--compile FILE`: Compiles query to bytecode (default output is `out.abc` unless specified with `-o OUT`).
 - `-l FILE`/`--log-file FILE`: Save logs/audits to specified file.
+- `-s FILE`: Evaluates, compiles, and run given query file.
+- `-m`/`--mmap`: Only store database in memory and not on the disk.

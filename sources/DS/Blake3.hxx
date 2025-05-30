@@ -19,9 +19,9 @@ static constexpr std::array<uint32_t, 8> IV = {
 	0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
 };
 
-inline void Prefetch(const void* Ptr) {
+inline void Prefetch(const void* Pointer) {
 #if defined(__GNUC__)
-	__builtin_prefetch(Ptr);
+	__builtin_prefetch(Pointer);
 #endif
     return;
 }

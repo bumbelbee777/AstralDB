@@ -1,6 +1,5 @@
-#include "SQL/Bytecode.hxx"
 #include <SQL/SQL.hxx>
-#include <Database/User.hxx> // Include User.hxx for permissions
+#include <Database/User.hxx>
 #include <cctype>
 #include <iostream>
 #include <stdexcept>
@@ -18,7 +17,7 @@ int Parser::GetTokenPrecedence(const Token &Token) {
         {"+", 5}, {"-", 5},
         {"*", 6}, {"/", 6}, {"%", 6}
     };
-    auto It = PrecedenceMap.find(Token.Value); // Use Token.Value instead of Token.Type
+    auto It = PrecedenceMap.find(Token.Value);
     return (It != PrecedenceMap.end()) ? It->second : -1;
 }
 
@@ -94,26 +93,29 @@ TokenStream Parser::Tokenize() {
     return Tokens;
 }
 
-Tree<std::vector<std::unique_ptr<ExpressionAST>>> Parser::BuildAST() const {
-    Tree<std::vector<std::unique_ptr<ExpressionAST>>> Result;
-    std::vector<std::unique_ptr<ExpressionAST>> Statements;
-    size_t Index = 0;
-    while(Index < Tokens_.size()) {
-        try {
-            auto Statement = const_cast<Parser*>(this)->ParseStatement();
-            if(Statement)
-                Statements.push_back(std::move(Statement));
-            else
-                throw std::runtime_error("Failed to parse statement.");
-        } catch(const std::exception &e) {
-            std::cerr << "Error parsing statement: " << e.what() << '\n';
-            break;
-        }
-    }
-    if(Statements.empty())
-        throw std::runtime_error("No valid statements were parsed.");
-    Result.SetRoot(std::move(Statements));
-    return Result;
+Tree<ASTNode> Parser::BuildAST() const {
+	Tree<ASTNode> Result;
+	ASTType Statements;
+	size_t Index = 0;
+	while(Index < Tokens_.size()) {
+		try {
+			auto Statement = const_cast<Parser*>(this)->ParseStatement();
+			if(Statement)
+				Statements.push_back(std::move(Statement));
+			else
+				throw std::runtime_error("Failed to parse statement.");
+		} catch (const std::exception& e) {
+			std::cerr << "Error parsing statement at token " << Index << ": " << e.what() << '\n';
+			const_cast<Parser*>(this)->AdvanceToken();
+			continue;
+		}
+	}
+	if(Statements.empty())
+		throw std::runtime_error("No valid statements were parsed.");
+	for(auto&& Stmt : Statements) {
+		Result.Add(std::move(Stmt));
+	}
+	return Result;
 }
 
 void Parser::DumpTokens() const {
@@ -122,7 +124,7 @@ void Parser::DumpTokens() const {
     std::cout << std::endl;
 }
 
-std::unique_ptr<ExpressionAST> Parser::ParsePrimary() {
+ASTNode Parser::ParsePrimary() {
     if(!CurrentToken())
         throw std::runtime_error("Unexpected end of input in primary expression");
     if(CurrentToken()->Value == "(") {
@@ -137,7 +139,7 @@ std::unique_ptr<ExpressionAST> Parser::ParsePrimary() {
     return Literal;
 }
 
-std::unique_ptr<ExpressionAST> Parser::ParseCreateStatement() {
+ASTNode Parser::ParseCreateStatement() {
     AdvanceToken(); // consume CREATE
     if (!MatchKeyword("TABLE"))
         throw std::runtime_error("Expected 'TABLE' after 'CREATE'.");
@@ -182,7 +184,7 @@ std::unique_ptr<ExpressionAST> Parser::ParseCreateStatement() {
     return std::make_unique<CreateAST>(TableName, Columns);
 }
 
-std::unique_ptr<ExpressionAST> Parser::ParseSelectStatement() {
+ASTNode Parser::ParseSelectStatement() {
     AdvanceToken();
     std::vector<std::string> Columns;
     while(auto TokenOpt = CurrentToken()) {
@@ -203,7 +205,7 @@ std::unique_ptr<ExpressionAST> Parser::ParseSelectStatement() {
     throw std::runtime_error("Expected table name after FROM in SELECT statement");
 }
 
-std::unique_ptr<ExpressionAST> Parser::ParseInsertStatement() {
+ASTNode Parser::ParseInsertStatement() {
     AdvanceToken();
     if(!MatchKeyword("INTO"))
         throw std::runtime_error("Expected INTO after INSERT");
@@ -245,7 +247,7 @@ std::unique_ptr<ExpressionAST> Parser::ParseInsertStatement() {
     return std::make_unique<InsertAST>(std::move(TableAst), Columns, Values);
 }
 
-std::unique_ptr<ExpressionAST> Parser::ParseUpdateStatement() {
+ASTNode Parser::ParseUpdateStatement() {
     AdvanceToken();
     auto TableToken = CurrentToken();
     if(!TableToken)
@@ -278,7 +280,7 @@ std::unique_ptr<ExpressionAST> Parser::ParseUpdateStatement() {
     return std::make_unique<UpdateAST>(TableName, std::move(Assignments), std::move(Condition));
 }
 
-std::unique_ptr<ExpressionAST> Parser::ParseDeleteStatement() {
+ASTNode Parser::ParseDeleteStatement() {
     AdvanceToken();
     if(!MatchKeyword("FROM"))
         throw std::runtime_error("Expected FROM in DELETE statement");
@@ -295,21 +297,21 @@ std::unique_ptr<ExpressionAST> Parser::ParseDeleteStatement() {
     return std::make_unique<DeleteAST>(TableName, std::move(Condition));
 }
 
-std::unique_ptr<ExpressionAST> Parser::ParseGrantStatement() {
+ASTNode Parser::ParseGrantStatement() {
     AdvanceToken(); // consume GRANT
     // Expect permission type (SELECT, INSERT, UPDATE, DELETE, etc.)
     if (!CurrentToken()) throw std::runtime_error("Expected permission after GRANT");
-    std::string permStr = CurrentToken()->Value;
+    std::string PermissionString = CurrentToken()->Value;
     Permissions Perms;
-    if (permStr == "SELECT") Perms = Permissions::Select;
-    else if (permStr == "INSERT") Perms = Permissions::Insert;
-    else if (permStr == "UPDATE") Perms = Permissions::Update;
-    else if (permStr == "DELETE") Perms = Permissions::Delete;
-    else if (permStr == "TRUNCATE") Perms = Permissions::Truncate;
-    else if (permStr == "REFERENCES") Perms = Permissions::References;
-    else if (permStr == "TRIGGER") Perms = Permissions::Trigger;
-    else if (permStr == "ALL") Perms = Permissions::All;
-    else throw std::runtime_error("Unknown permission in GRANT: " + permStr);
+    if (PermissionString == "SELECT") Perms = Permissions::Select;
+    else if (PermissionString == "INSERT") Perms = Permissions::Insert;
+    else if (PermissionString == "UPDATE") Perms = Permissions::Update;
+    else if (PermissionString == "DELETE") Perms = Permissions::Delete;
+    else if (PermissionString == "TRUNCATE") Perms = Permissions::Truncate;
+    else if (PermissionString == "REFERENCES") Perms = Permissions::References;
+    else if (PermissionString == "TRIGGER") Perms = Permissions::Trigger;
+    else if (PermissionString == "ALL") Perms = Permissions::All;
+    else throw std::runtime_error("Unknown permission in GRANT: " + PermissionString);
     AdvanceToken();
     if (!MatchKeyword("ON")) throw std::runtime_error("Expected ON after permission in GRANT");
     std::string tableName;
@@ -416,13 +418,6 @@ std::unique_ptr<ExpressionAST> Parser::ParseBinaryOperation(int MinPrec, std::un
 
 std::unique_ptr<ExpressionAST> Parser::ParseExpression() {
     return ParseBinaryOperation();
-}
-
-void Parser::DumpAST() {
-    for(auto &Node: AST) {
-        Bytecode Dummy = Node->EmitBytecode();
-        std::cout << Disassemble(Dummy);
-    }
 }
 
 bool Parser::IsKeyword(const std::string &Token) {

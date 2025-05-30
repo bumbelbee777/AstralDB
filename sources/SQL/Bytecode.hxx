@@ -84,5 +84,21 @@ inline std::string Disassemble(const Bytecode &Code) {
     }
     return Out.str();
 }
+
+inline std::ostream& operator<<(std::ostream& os, const Bytecode& bc);
+
+inline std::ostream& operator<<(std::ostream& os, const Bytecode& bc) {
+    for (const auto& instr : bc) {
+        os << "[" << static_cast<int>(instr.Opcode) << " ";
+        for (const auto& operand : instr.Operands) {
+            std::visit([&os](auto &&arg) {
+                os << arg << " ";
+            }, operand);
+        }
+        os << "] ";
+    }
+    return os;
+}
+
 } 
 }

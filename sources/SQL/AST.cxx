@@ -2,6 +2,6 @@
 
 namespace AstralDB {
 namespace SQL {
-ASTType AST{};
+Tree<ASTNode> AST{};
 }
 }

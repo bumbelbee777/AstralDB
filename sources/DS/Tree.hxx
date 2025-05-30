@@ -1,33 +1,83 @@
 #pragma once
 
+#include <memory>
 #include <vector>
 #include <algorithm>
 #include <functional>
+#include <ostream>
+#include <string>
 
 namespace AstralDB {
 
-template <class T, class Compare = std::less<T>> class Tree {
-private:
-    std::vector<T> Nodes_;
+template <class T, class Compare = std::less<T>>
+class Tree {
+public:
+    struct Node {
+        T Value;
+        std::vector<std::unique_ptr<Node>> Children;
+
+        Node(const T& v)    : Value(v) {}
+        Node(T&& v)         : Value(std::move(v)) {}
+    };
+
+    std::vector<std::unique_ptr<Node>> Nodes_;
     Compare Compare_;
+
+    // Recursive printer helper
+    static void PrintNode(std::ostream& os, const Node* node, int indent) {
+        os << std::string(indent * 2, ' ') << node->Value << "\n";
+        for (const auto& child : node->Children) {
+            PrintNode(os, child.get(), indent + 1);
+        }
+    }
+
 public:
     Tree() = default;
-    Tree(const std::vector<T> &Nodes) : Nodes_(Nodes) {}
+    Tree(std::vector<std::unique_ptr<Node>>&& nodes)
+      : Nodes_(std::move(nodes)) {}
 
-    void Add(const T &Node) {
-        Nodes_.push_back(Node);
+    Tree(Tree&& Other) noexcept {
+		Nodes_ = std::move(Other.Nodes_);
+		Compare_ = std::move(Other.Compare_);
+	}
+
+    // Friend operator<< for pretty-print
+    friend std::ostream& operator<<(std::ostream& os, const Tree<T,Compare>& tree) {
+        for (const auto& root : tree.Nodes_) {
+            PrintNode(os, root.get(), 0);
+        }
+        return os;
     }
 
-    void Add(T &&Node) {
-        Nodes_.push_back(std::move(Node));
+    // Add a new root node
+    void Add(const T& Value) {
+        Nodes_.push_back(std::make_unique<Node>(Value));
+    }
+    void Add(T&& Value) {
+        Nodes_.push_back(std::make_unique<Node>(std::move(Value)));
     }
 
-    void Remove(const T &Value) {
-        Nodes_.erase(std::remove(Nodes_.begin(), Nodes_.end(), Value), Nodes_.end());
+    // Add a child under a given parent node
+    void AddChild(Node* parent, const T& value) {
+        parent->Children.push_back(std::make_unique<Node>(value));
+    }
+    void AddChild(Node* parent, T&& value) {
+        parent->Children.push_back(std::make_unique<Node>(std::move(value)));
     }
 
-    void RemoveAt(size_t Index) {
-        if(Index < Nodes_.size()) Nodes_.erase(Nodes_.begin() + Index);
+    void Remove(const T& value) {
+        Nodes_.erase(
+            std::remove_if(
+                Nodes_.begin(), Nodes_.end(),
+                [&](const std::unique_ptr<Node>& n){ return n->Value == value; }
+            ),
+            Nodes_.end()
+        );
+    }
+
+    void RemoveAt(size_t index) {
+        if (index < Nodes_.size())
+            Nodes_.erase(Nodes_.begin() + index);
     }
 
     void Clear() {
@@ -42,85 +92,127 @@ public:
         return Nodes_.empty();
     }
 
-    bool Search(const T &Value) const {
-        return std::find(Nodes_.begin(), Nodes_.end(), Value) != Nodes_.end();
+    bool Search(const T& value) const {
+        return std::any_of(
+            Nodes_.begin(), Nodes_.end(),
+            [&](const std::unique_ptr<Node>& n){ return n->Value == value; }
+        );
     }
 
-    bool BinarySearch(const T &Value) const {
-        return std::binary_search(Nodes_.begin(), Nodes_.end(), Value, Compare_);
+    bool BinarySearch(const T& value) const {
+        return std::binary_search(
+            Nodes_.begin(), Nodes_.end(), value,
+            [&](const std::unique_ptr<Node>& a, const T& v){
+                return Compare_(a->Value, v);
+            }
+        );
     }
 
     void Sort() {
-        std::sort(Nodes_.begin(), Nodes_.end(), Compare_);
+        std::sort(
+            Nodes_.begin(), Nodes_.end(),
+            [&](const std::unique_ptr<Node>& a, const std::unique_ptr<Node>& b){
+                return Compare_(a->Value, b->Value);
+            }
+        );
     }
 
-    typename std::vector<T>::iterator LowerBound(const T& Value) {
-        return std::lower_bound(Nodes_.begin(), Nodes_.end(), Value, Compare_);
+    auto LowerBound(const T& value) {
+        return std::lower_bound(
+            Nodes_.begin(), Nodes_.end(), value,
+            [&](const std::unique_ptr<Node>& a, const T& v){
+                return Compare_(a->Value, v);
+            }
+        );
+    }
+    auto LowerBound(const T& value) const {
+        return std::lower_bound(
+            Nodes_.begin(), Nodes_.end(), value,
+            [&](const std::unique_ptr<Node>& a, const T& v){
+                return Compare_(a->Value, v);
+            }
+        );
     }
 
-    typename std::vector<T>::const_iterator LowerBound(const T& Value) const {
-        return std::lower_bound(Nodes_.begin(), Nodes_.end(), Value, Compare_);
+    auto UpperBound(const T& value) {
+        return std::upper_bound(
+            Nodes_.begin(), Nodes_.end(), value,
+            [&](const T& v, const std::unique_ptr<Node>& a){
+                return Compare_(v, a->Value);
+            }
+        );
+    }
+    auto UpperBound(const T& value) const {
+        return std::upper_bound(
+            Nodes_.begin(), Nodes_.end(), value,
+            [&](const T& v, const std::unique_ptr<Node>& a){
+                return Compare_(v, a->Value);
+            }
+        );
     }
 
-    typename std::vector<T>::iterator UpperBound(const T& Value) {
-        return std::upper_bound(Nodes_.begin(), Nodes_.end(), Value, Compare_);
+    std::vector<std::unique_ptr<Node>>& GetNodes() {
+        return Nodes_;
     }
-
-    typename std::vector<T>::const_iterator UpperBound(const T& Value) const {
-        return std::upper_bound(Nodes_.begin(), Nodes_.end(), Value, Compare_);
-    }
-
-    std::vector<T> &GetNodes() {
+    const std::vector<std::unique_ptr<Node>>& GetNodes() const {
         return Nodes_;
     }
 
-    const std::vector<T> &GetNodes() const {
-        return Nodes_;
+    T& GetRoot() {
+        return Nodes_.front()->Value;
     }
-
-    void SetNodes(const std::vector<T> &Nodes) {
-        Nodes_ = Nodes;
+    const T& GetRoot() const {
+        return Nodes_.front()->Value;
     }
-
-    void SetNodes(std::vector<T> &&Nodes) {
-        Nodes_ = std::move(Nodes);
-    }
-
-    T &GetRoot() { return Nodes_.front(); }
-
-    const T &GetRoot() const { return Nodes_.front(); }
 
     Compare GetCompare() const {
         return Compare_;
     }
-
-    void SetCompare(Compare NewCompare) {
-        Compare_ = NewCompare;
+    void SetCompare(Compare newCompare) {
+        Compare_ = newCompare;
     }
 
-    void SetRoot(T NewRoot) {
+    void SetRoot(const T& value) {
         Nodes_.clear();
-        Nodes_.push_back(std::move(NewRoot));
+        Nodes_.push_back(std::make_unique<Node>(value));
+    }
+    void SetRoot(T&& value) {
+        Nodes_.clear();
+        Nodes_.push_back(std::make_unique<Node>(std::move(value)));
     }
 
-    typename std::vector<T>::iterator begin() {
-        return Nodes_.begin();
+    auto begin() { return Nodes_.begin(); }
+    auto end()   { return Nodes_.end(); }
+    auto begin() const { return Nodes_.begin(); }
+    auto end()   const { return Nodes_.end(); }
+
+    auto Find(const T& value) {
+        return std::find_if(
+            Nodes_.begin(), Nodes_.end(),
+            [&](const std::unique_ptr<Node>& n){ return n->Value == value; }
+        );
     }
-    typename std::vector<T>::iterator end() {
-        return Nodes_.end();
-    }
-    typename std::vector<T>::const_iterator begin() const {
-        return Nodes_.begin();
-    }
-    typename std::vector<T>::const_iterator end() const {
-        return Nodes_.end();
+    auto Find(const T& value) const {
+        return std::find_if(
+            Nodes_.begin(), Nodes_.end(),
+            [&](const std::unique_ptr<Node>& n){ return n->Value == value; }
+        );
     }
 
-    typename std::vector<T>::iterator Find(const T &Value) {
-        return std::find(Nodes_.begin(), Nodes_.end(), Value);
+    void Insert(const T& value) {
+        Nodes_.push_back(std::make_unique<Node>(value));
     }
-    typename std::vector<T>::const_iterator Find(const T &Value) const {
-        return std::find(Nodes_.begin(), Nodes_.end(), Value);
+
+    Tree<T>& operator=(const Tree<T>& Other) {
+        std::swap(*this, Other);
+        return *this;
+    }
+
+    Tree<T>& operator=(Tree<T>&& Other) noexcept {
+        Nodes_ = std::move(Other.Nodes_);
+        Compare_ = std::move(Other.Compare_);
+        return *this;
     }
 };
-}
+
+} // namespace AstralDB

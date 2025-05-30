@@ -1,5 +1,4 @@
 #include <SQL/SQL.hxx>
-#include <SQL/Bytecode.hxx>
 
 namespace AstralDB {
 namespace SQL {
@@ -14,12 +13,6 @@ Bytecode TableAST::EmitBytecode() const {
     AppendInstruction(Code, MakeInstruction(Opcode::PUSH, TableName));
     return Code;
 }
-
-/*Bytecode ColumnAST::EmitBytecode() const {
-    Bytecode Code;
-    AppendInstruction(MakeInstruction(Opcode::PUSH, ColumnName));
-    return Code;
-}*/
 
 Bytecode CreateAST::EmitBytecode() const {
     Bytecode Code;
@@ -78,38 +71,38 @@ Bytecode DeleteAST::EmitBytecode() const {
 }
 
 Bytecode BinaryOpAST::EmitBytecode() const {
-    Bytecode Code;
-    Bytecode LHSCode = LHS->EmitBytecode();
-    Code.insert(Code.end(), LHSCode.begin(), LHSCode.end());
-    Bytecode RHSCode = RHS->EmitBytecode();
-    Code.insert(Code.end(), RHSCode.begin(), RHSCode.end());
-    Opcode OpCode;
-    if(Op == "+")
-        OpCode = Opcode::ADD;
-    else if(Op == "-")
-        OpCode = Opcode::SUB;
-    else if(Op == "*")
-        OpCode = Opcode::MUL;
-    else if(Op == "/")
-        OpCode = Opcode::DIV;
-    else if(Op == "%")
-        OpCode = Opcode::MOD;
-    else if(Op == "==")
-        OpCode = Opcode::EQ;
-    else if(Op == "!=")
-        OpCode = Opcode::NE;
-    else if(Op == "<")
-        OpCode = Opcode::LT;
-    else if(Op == "<=")
-        OpCode = Opcode::LE;
-    else if(Op == ">")
-        OpCode = Opcode::GT;
-    else if(Op == ">=")
-        OpCode = Opcode::GE;
-    else
-        throw std::runtime_error("Unsupported binary operator: " + Op);
-    AppendInstruction(Code, MakeInstruction(OpCode));
-    return Code;
+	Bytecode Code;
+	Bytecode LHSCode = LHS->EmitBytecode();
+	Code.insert(Code.end(), LHSCode.begin(), LHSCode.end());
+	Bytecode RHSCode = RHS->EmitBytecode();
+	Code.insert(Code.end(), RHSCode.begin(), RHSCode.end());
+	Opcode OpCode;
+	if(Op == "+")
+		OpCode = Opcode::ADD;
+	else if(Op == "-")
+		OpCode = Opcode::SUB;
+	else if(Op == "*")
+		OpCode = Opcode::MUL;
+	else if(Op == "/")
+		OpCode = Opcode::DIV;
+	else if(Op == "%")
+		OpCode = Opcode::MOD;
+	else if(Op == "==")
+		OpCode = Opcode::EQ;
+	else if(Op == "!=")
+		OpCode = Opcode::NE;
+	else if(Op == "<")
+		OpCode = Opcode::LT;
+	else if(Op == "<=")
+		OpCode = Opcode::LE;
+	else if(Op == ">")
+		OpCode = Opcode::GT;
+	else if(Op == ">=")
+		OpCode = Opcode::GE;
+	else
+		throw std::runtime_error("Unsupported binary operator: " + Op);
+	AppendInstruction(Code, MakeInstruction(OpCode));
+	return Code;
 }
 
 Bytecode GrantAST::EmitBytecode() const {
@@ -130,11 +123,13 @@ Bytecode BuildBytecode() {
     std::vector<Bytecode> BatchBytecodes;
     std::vector<ExpressionAST*> BatchAST;
     for (auto &Statement : AST) {
-        Bytecode Dummy = Statement->EmitBytecode();
-        for(auto &Inst : Dummy)
-            AppendInstruction(Result, Inst);
-        BatchBytecodes.push_back(Dummy);
-        BatchAST.push_back(Statement.get());
+        if (Statement && Statement->Value) {
+            Bytecode Dummy = Statement->Value->EmitBytecode();
+            for(auto &Inst : Dummy)
+                AppendInstruction(Result, Inst);
+            BatchBytecodes.push_back(Dummy);
+            BatchAST.push_back(Statement->Value.get());
+        }
         if (Counter >= 35) {
             BPlusTree<Bytecode, ExpressionAST*, 4, BytecodeComparator> Tree;
             for(size_t i = 0; i < BatchBytecodes.size(); i++)
