@@ -1,4 +1,5 @@
-# AstralDB - A blazingly fast, lightweight, relational DB in modern C++
+# AstralDB - A blazingly fast and lightweight RDBMS written in bleeding-edge C++
+> **NOTE:** Still under heavy work. DO NOT USE IN PRODUCTION YET!!!
 
 AstralDB is a high-performant yet lightweight and relatively secure relational SQL database implemented in modern C++.
 

@@ -6,3 +6,7 @@ debug.log
 .cache/
 obj/
 .vscode/
+build.log
+build.log.old
+astraldb.log
+astral.db

@@ -1,12 +1,26 @@
 #include <SQL/SQL.hxx>
-#include <iostream>
+#include <SQL/BytecodeInterpreter.hxx>
+#include <SQL/Bytecode.hxx>
+#include <IO/Logger.hxx>
 #include <fstream>
+#include <sstream>
+#include <iostream>
 
 int main(int Argc, char **Argv) {
-	if(Argc == 1 || Argv == nullptr) {
-		std::cout << "AstralDB: No query file(s) provided. Use -h or --help for usage.\n";
-		return -1;
+	bool Verbose = false;
+	std::string LogFile = "astraldb.log";
+	for(int I = 1; I < Argc; ++I) {
+		std::string Arg(Argv[I]);
+		if(Arg == "-V" || Arg == "--verbose") {
+			Verbose = true;
+		} else if(Arg == "-l" || Arg == "--log-file") {
+			if(I + 1 < Argc) {
+				LogFile = Argv[++I];
+			}
+		}
 	}
+	AstralDB::Logger Logger(LogFile, Verbose);
+
 	for(int I = 1; I < Argc; ++I) {
 		std::string Arg(Argv[I]);
 		if(Arg == "-h" || Arg == "--help") {
@@ -24,7 +38,7 @@ int main(int Argc, char **Argv) {
 			std::cout << "-m, --mmap\t\tStore database in memory only\n";
 			return 0;
 		} else if(Arg == "-v" || Arg == "--version") {
-			std::cout << "AstralDB version 1.0.0\n";
+			std::cout << "AstralDB version 0.0.1\n";
 			return 0;
 		} else if(Arg == "-q" || Arg == "--query") {
 			if(I + 1 < Argc) {
@@ -69,7 +83,9 @@ int main(int Argc, char **Argv) {
 				}
 				AstralDB::SQL::Parser Parser(QueryTemp);
 				Parser.DumpAST();
-				// TODO: Compile and run
+				AstralDB::SQL::Bytecode Code = AstralDB::SQL::BuildBytecode();
+				AstralDB::SQL::BytecodeInterpreter().Execute(Code);
+				std::cout << "Executed bytecode:\n" << AstralDB::SQL::Disassemble(Code) << "\n";
 				return 0;
 			} else {
 				std::cout << "AstralDB: No file provided after -s\n";
@@ -79,24 +95,68 @@ int main(int Argc, char **Argv) {
 			std::cout << "AstralDB REPL mode (not implemented yet)\n";
 			return 0;
 		} else if(Arg == "-fb" || Arg == "--from-bytecode") {
-			std::cout << "AstralDB: Bytecode execution not implemented yet\n";
-			return 0;
+			if(I + 1 < Argc) {
+				std::ifstream BytecodeFile(Argv[++I], std::ios::binary);
+				if(!BytecodeFile) {
+					std::cout << "AstralDB: Bytecode file " << Argv[I] << " does not exist\n";
+					return -1;
+				}
+				std::stringstream Buffer;
+				Buffer << BytecodeFile.rdbuf();
+				std::string BytecodeStr = Buffer.str();
+				// TODO: Proper bytecode deserialization
+				std::cout << "[Warning] Bytecode deserialization is not implemented.\n";
+				// AstralDB::SQL::Bytecode Code = ...
+				// AstralDB::SQL::BytecodeInterpreter().Execute(Code);
+				return 0;
+			} else {
+				std::cout << "AstralDB: No file provided after -fb/--from-bytecode\n";
+				return -1;
+			}
 		} else if(Arg == "-cc" || Arg == "--compile") {
-			std::cout << "AstralDB: Query compilation not implemented yet\n";
-			return 0;
+			if(I + 1 < Argc) {
+				std::ifstream QueryFile(Argv[++I], std::ios::binary);
+				if(!QueryFile) {
+					std::cout << "AstralDB: File " << Argv[I] << " does not exist\n";
+					return -1;
+				}
+				std::string QueryTemp((std::istreambuf_iterator<char>(QueryFile)), std::istreambuf_iterator<char>());
+				if(QueryTemp.empty()) {
+					std::cout << "AstralDB: File " << Argv[I] << " is empty\n";
+					return -1;
+				}
+				AstralDB::SQL::Parser Parser(QueryTemp);
+				AstralDB::SQL::Bytecode Code = AstralDB::SQL::BuildBytecode();
+				std::ofstream Out("out.abc", std::ios::binary);
+				if(!Out) {
+					std::cout << "AstralDB: Could not open output file out.abc\n";
+					return -1;
+				}
+				// TODO: Proper bytecode serialization
+				Out << AstralDB::SQL::Disassemble(Code);
+				std::cout << "Bytecode written to out.abc (disassembled text, not binary)\n";
+				return 0;
+			} else {
+				std::cout << "AstralDB: No file provided after -cc/--compile\n";
+				return -1;
+			}
 		} else if(Arg == "-V" || Arg == "--verbose") {
+			Verbose = true;
+			Logger.SetVerbose(true);
 			std::cout << "AstralDB: Verbose mode enabled\n";
-			// Set verbose flag (not implemented)
+			Logger.Info("Verbose mode enabled");
 		} else if(Arg == "-l" || Arg == "--log-file") {
 			if(I + 1 < Argc) {
-				std::cout << "AstralDB: Logging to file " << Argv[++I] << " (not implemented)\n";
+				LogFile = Argv[I];
+				Logger.Info("Logging to file " + LogFile);
 			} else {
 				std::cout << "AstralDB: No file provided after -l/--log-file\n";
+				Logger.Error("No file provided after -l/--log-file");
 				return -1;
 			}
 		} else if(Arg == "-m" || Arg == "--mmap") {
 			std::cout << "AstralDB: In-memory mode enabled (not implemented)\n";
-			// Set in-memory flag (not implemented)
+			// Feature not implemented, just print message
 		} else if(Arg[0] != '-') {
 			// Assume it's a query file
 			std::ifstream QueryFile(Arg.c_str(), std::ios::binary);

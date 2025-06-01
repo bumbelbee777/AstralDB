@@ -124,8 +124,8 @@ class BPlusTree {
 public:
     BPlusTree() { Root = std::make_shared<Node>(true); }
 
-    void Insert(const Key& KeyValue, const Value& Val) {
-        auto InsertResult = InsertInternal(Root, KeyValue, Val);
+    void Insert(const Key& KeyValue, Value Val) {
+        auto InsertResult = InsertInternal(Root, KeyValue, std::move(Val));
         if(InsertResult.has_value()) {
             auto NewRoot = std::make_shared<Node>(false);
             NewRoot->Keys.push_back(InsertResult->first);
@@ -136,19 +136,22 @@ public:
     }
 
     std::optional<std::pair<Key, std::shared_ptr<Node>>>
-    InsertInternal(const std::shared_ptr<Node>& CurrentNode, const Key& KeyValue, const Value& Val) {
+    InsertInternal(const std::shared_ptr<Node>& CurrentNode, const Key& KeyValue, Value Val) {
         if (CurrentNode->IsLeaf) {
             auto It = std::lower_bound(CurrentNode->Keys.begin(), CurrentNode->Keys.end(), KeyValue, Compare_);
             size_t Index = It - CurrentNode->Keys.begin();
             CurrentNode->Keys.insert(It, KeyValue);
-            CurrentNode->Values.insert(CurrentNode->Values.begin() + Index, Val);
+            CurrentNode->Values.insert(CurrentNode->Values.begin() + Index, std::move(Val));
             if (CurrentNode->Keys.size() > Order) {
                 size_t Mid = CurrentNode->Keys.size() / 2;
                 auto NewLeaf = std::make_shared<Node>(true);
                 NewLeaf->Keys.assign(CurrentNode->Keys.begin() + Mid, CurrentNode->Keys.end());
-                NewLeaf->Values.assign(CurrentNode->Values.begin() + Mid, CurrentNode->Values.end());
-                CurrentNode->Keys.erase(CurrentNode->Keys.begin() + Mid, CurrentNode->Keys.end());
+                NewLeaf->Values.assign(
+                    std::make_move_iterator(CurrentNode->Values.begin() + Mid),
+                    std::make_move_iterator(CurrentNode->Values.end())
+                );
                 CurrentNode->Values.erase(CurrentNode->Values.begin() + Mid, CurrentNode->Values.end());
+                CurrentNode->Keys.erase(CurrentNode->Keys.begin() + Mid, CurrentNode->Keys.end());
                 NewLeaf->Next = CurrentNode->Next;
                 CurrentNode->Next = NewLeaf;
                 return std::make_optional(std::make_pair(NewLeaf->Keys.front(), NewLeaf));
@@ -157,7 +160,7 @@ public:
         } else {
             size_t Index = std::upper_bound(CurrentNode->Keys.begin(), CurrentNode->Keys.end(), KeyValue, Compare_) - CurrentNode->Keys.begin();
             auto Child = CurrentNode->Children[Index];
-            auto Result = InsertInternal(Child, KeyValue, Val);
+            auto Result = InsertInternal(Child, KeyValue, std::move(Val));
             if (Result.has_value()) {
                 Key PromoteKey = Result->first;
                 auto NewChild = Result->second;
@@ -260,5 +263,19 @@ public:
     std::shared_ptr<Node> GetRoot() const { return Root; }
 
     void Remove(const Key& KeyValue) { Delete(KeyValue); }
+
+    Value* GetPointer(const Key& KeyValue) {
+        auto CurrentNode = Root;
+        while(!CurrentNode->IsLeaf) {
+            size_t Index = std::upper_bound(CurrentNode->Keys.begin(), CurrentNode->Keys.end(), KeyValue, Compare_) - CurrentNode->Keys.begin();
+            CurrentNode = CurrentNode->Children[Index];
+        }
+        auto It = std::lower_bound(CurrentNode->Keys.begin(), CurrentNode->Keys.end(), KeyValue, Compare_);
+        if(It != CurrentNode->Keys.end() && *It == KeyValue) {
+            size_t Index = It - CurrentNode->Keys.begin();
+            return &CurrentNode->Values[Index];
+        }
+        return nullptr;
+    }
 };
 } // namespace AstralDB

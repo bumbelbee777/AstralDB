@@ -6,6 +6,7 @@
 #include <functional>
 #include <ostream>
 #include <string>
+#include <iostream> // For debug logging
 
 namespace AstralDB {
 
@@ -51,9 +52,11 @@ public:
 
     // Add a new root node
     void Add(const T& Value) {
+        std::cout << "[Tree::Add] Adding node (const T&). Current size: " << this->Size() << std::endl;
         Nodes_.push_back(std::make_unique<Node>(Value));
     }
     void Add(T&& Value) {
+        std::cout << "[Tree::Add] Adding node (T&&). Current size: " << this->Size() << std::endl;
         Nodes_.push_back(std::make_unique<Node>(std::move(Value)));
     }
 

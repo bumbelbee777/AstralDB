@@ -80,10 +80,10 @@ public:
 		});
 	}
 
-	void Insert(const KeyType& Key, const ValueType& Value, size_t Depth = 0) {
+	void Insert(const KeyType& Key, ValueType&& Value, size_t Depth = 0) {
 		AstralDB::SpinlockGuard lock(Mutex_);
 		if (Depth == Key.size()) {
-			Value_ = Value;
+			Value_ = std::move(Value);
 			return;
 		}
 		const std::string_view RemainingKey = std::string_view(Key).substr(Depth);
@@ -96,16 +96,16 @@ public:
 
 			if (j == Edge.size() && j == RemainingKey.size()) {
 				// Exact match, update value
-				Children_[i]->Value_ = Value;
+				Children_[i]->Value_ = std::move(Value);
 				return;
 			} else if (j == Edge.size()) {
 				// Edge is a prefix of RemainingKey, go deeper
-				Children_[i]->Insert(Key, Value, Depth + j);
+				Children_[i]->Insert(Key, std::move(Value), Depth + j);
 				return;
 			} else if (j == RemainingKey.size()) {
 				// RemainingKey is a prefix of Edge, need to split edge
 				NodePointer NewChild = std::make_shared<RadixTree<KeyType, ValueType>>();
-				NewChild->Value_ = Value;
+				NewChild->Value_ = std::move(Value);
 				// Move the existing child under the new child
 				NewChild->Edges_.push_back(Edge.substr(j));
 				NewChild->Children_.push_back(Children_[i]);
@@ -121,7 +121,7 @@ public:
 				SplitNode->Children_.push_back(Children_[i]);
 				// New child for the new key
 				NodePointer NewChild = std::make_shared<RadixTree<KeyType, ValueType>>();
-				NewChild->Insert(Key, Value, Depth + j);
+				NewChild->Insert(Key, std::move(Value), Depth + j);
 				SplitNode->Edges_.push_back(std::string(RemainingKey.substr(j)));
 				SplitNode->Children_.push_back(NewChild);
 				// Update edge and child
@@ -132,7 +132,7 @@ public:
 		}
 		// No matching edge, create new
 		NodePointer Child = std::make_shared<RadixTree<KeyType, ValueType>>();
-		Child->Insert(Key, Value, Depth + RemainingKey.size());
+		Child->Insert(Key, std::move(Value), Depth + RemainingKey.size());
 		Edges_.push_back(std::string(RemainingKey));
 		Children_.push_back(Child);
 	}
@@ -143,9 +143,14 @@ public:
 		});
 	}
 
-	std::optional<ValueType> Find(const KeyType& Key, size_t Depth = 0) const {
+	// Return the raw pointer type for unique_ptr values
+	using RawPtrType = typename std::pointer_traits<decltype(std::declval<ValueType>().get())>::element_type*;
+	RawPtrType Find(const KeyType& Key, size_t Depth = 0) const {
 		SpinlockGuard lock(Mutex_);
-		if (Depth == Key.size()) return Value_;
+		if (Depth == Key.size()) {
+			if (Value_) return Value_->get();
+			return nullptr;
+		}
 		const std::string_view RemainingKey = std::string_view(Key).substr(Depth);
 		for (size_t i = 0; i < Edges_.size(); ++i) {
 			const std::string& Edge = Edges_[i];
@@ -153,7 +158,7 @@ public:
 				return Children_[i]->Find(Key, Depth + Edge.size());
 			}
 		}
-		return std::nullopt;
+		return nullptr;
 	}
 
 	auto RemoveAsync(const KeyType& Key, size_t Depth = 0) {
@@ -200,6 +205,15 @@ public:
 
 	void Add(const NodePointer & /*Node*/) {
 		
+	}
+
+	template<typename Visitor>
+	void Traverse(Visitor &&V, std::string Prefix) const {
+		AstralDB::SpinlockGuard lock(Mutex_);
+		if(Value_) V(Prefix, *Value_);
+		for(size_t i = 0; i < Edges_.size(); ++i) {
+			Children_[i]->Traverse(V, Prefix + Edges_[i]);
+		}
 	}
 };
 } // namespace DS

@@ -1,13 +1,14 @@
 #pragma once
 
+#include <IO/Logger.hxx>
 #include <Database/User.hxx>
 #include <SQL/Bytecode.hxx>
 #include <DS/Tree.hxx>
 #include <DS/BPlusTree.hxx>
+#include <DS/RadixTree.hxx>
 #include <cstdio>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <vector>
 #include <memory>
 #include <optional>
@@ -145,6 +146,27 @@ struct RevokeAST : public ExpressionAST {
 using ASTNode = std::unique_ptr<ExpressionAST>;
 using ASTType = std::vector<ASTNode>;
 
+// Hybrid AST structure: switches between BPlusTree and RadixTree based on depth
+class HybridAST {
+	using KeyType = std::string;
+	using ValueType = ASTNode;
+	using BPTree = BPlusTree<KeyType, ValueType>;
+	using RTree = DS::RadixTree<KeyType, ValueType>;
+
+	static constexpr size_t SwitchDepth = 3;
+	std::unique_ptr<BPTree> BPTreeRoot_;
+	std::unique_ptr<RTree> RadixRoot_;
+	bool UseRadix_ = false;
+
+public:
+	HybridAST();
+	void Add(const KeyType &Key, ValueType Node, size_t Depth = 0);
+	template<typename Func>
+	void Traverse(Func &&F, size_t Depth = 0) const;
+	bool Empty() const;
+	ExpressionAST *Find(const KeyType &Key, size_t Depth = 0);
+};
+
 extern Tree<ASTNode> AST;
 
 class Parser {
@@ -223,7 +245,6 @@ class Parser {
 public:
     explicit Parser(std::string_view Query) : Query_(Query) {
         std::cout << "[Parser] Initializing with query:\n\"" << Query << "\"\n";
-        
         // Tokenization phase
         std::cout << "[Tokenizer] Starting tokenization...\n";
         Tokens_ = Tokenize();
@@ -231,28 +252,22 @@ public:
         for (const auto& token : Tokens_)
             std::cout << "[" << static_cast<int>(token.Type) << ": " << token.Value << "] ";
         std::cout << "\n";
-        
         CurrentIndex_ = 0;
-        
         // Parsing phase
         try {
             std::cout << "[Parser] Starting AST construction...\n";
-            ParseStatement();
-            std::cout << "[Parser] Successfully parsed initial statement\n";
+            // Parse all statements, not just one!
+            auto NewAST = BuildAST();
+            AST = std::move(NewAST);
+            std::cout << "[Parser] Successfully parsed all statements\n";
         }
         catch(const std::exception& e) {
             std::cerr << "[ERROR] Parsing failed: " << e.what() << "\n";
             throw;
         }
-        
-        // AST finalization
-        std::cout << "[AST] Building final abstract syntax tree...\n";
-        auto NewAST = BuildAST();
-        AST = std::move(NewAST);
-        
         // AST diagnostics
         std::cout << "[AST] Final AST structure:\n";
-        DumpAST();  // Replace DumpTokens() with AST visualization
+        DumpAST();
         std::cout << "[AST] Construction completed successfully\n";
     }
 
@@ -266,10 +281,9 @@ public:
             for (const auto& Child : Node.Children)
                 DumpNode(*Child, Depth + 1);
         };
-        
-        for (const auto& Root : AST.GetNodes())
-            DumpNode(*Root, 0);
     }
 };
+
+Bytecode BuildBytecode(Logger* Logger = nullptr);
 }
 }

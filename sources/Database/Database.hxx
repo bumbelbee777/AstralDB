@@ -2,6 +2,7 @@
 
 #include <IO/Spinlock.hxx>
 #include <IO/Task.hxx>
+#include <IO/Logger.hxx>
 #include <DS/EncryptedString.hxx>
 #include <Database/User.hxx>
 #include <Database/IndexManagement.hxx>
@@ -50,6 +51,7 @@ class Database {
     std::unordered_map<std::string, Schema> TableSchemas_;
     TablesMap Tables_;
     std::filesystem::path DbPath_;
+    Logger* Logger_ = nullptr;
     std::unordered_map<std::string, std::unordered_map<std::string, IndexManagement<std::string, size_t>>> Indexes_;
     std::unordered_map<std::string, std::vector<ForeignKey>> ForeignKeys_;
 
@@ -66,7 +68,7 @@ class Database {
     std::string EncryptData(const std::string &Data);
     std::string DecryptData(const std::string &EncryptedData);
 public:
-    explicit Database(const std::filesystem::path &DbPath);
+    explicit Database(const std::filesystem::path &DbPath, Logger* Logger = nullptr);
     ~Database();
     Database(Database&&) noexcept = delete;
     Database& operator=(Database&&) noexcept = delete;
@@ -111,5 +113,11 @@ public:
     std::filesystem::path GetDbPath() const;
 
     IndexManagement<std::string, size_t>& GetOrCreateIndex(const std::string& table, const std::string& column);
+
+    bool ExportToCSV(std::filesystem::path Destination);
+    bool ExportToJSON(std::filesystem::path Destination);
+
+    void SetLogger(Logger* Logger) { Logger_ = Logger; }
+    Logger* GetLogger() const { return Logger_; }
 };
 }

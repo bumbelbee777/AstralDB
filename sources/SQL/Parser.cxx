@@ -94,28 +94,38 @@ TokenStream Parser::Tokenize() {
 }
 
 Tree<ASTNode> Parser::BuildAST() const {
-	Tree<ASTNode> Result;
-	ASTType Statements;
-	size_t Index = 0;
-	while(Index < Tokens_.size()) {
-		try {
-			auto Statement = const_cast<Parser*>(this)->ParseStatement();
-			if(Statement)
-				Statements.push_back(std::move(Statement));
-			else
-				throw std::runtime_error("Failed to parse statement.");
-		} catch (const std::exception& e) {
-			std::cerr << "Error parsing statement at token " << Index << ": " << e.what() << '\n';
-			const_cast<Parser*>(this)->AdvanceToken();
-			continue;
-		}
-	}
-	if(Statements.empty())
-		throw std::runtime_error("No valid statements were parsed.");
-	for(auto&& Stmt : Statements) {
-		Result.Add(std::move(Stmt));
-	}
-	return Result;
+    std::cout << "[BuildAST] Starting AST build. Token count: " << Tokens_.size() << std::endl;
+    Tree<ASTNode> Result;
+    ASTType Statements;
+    size_t Index = 0;
+    while(Index < Tokens_.size()) {
+        std::cout << "[BuildAST] Parsing statement at token index: " << Index << std::endl;
+        try {
+            auto Statement = const_cast<Parser*>(this)->ParseStatement();
+            if(Statement) {
+                std::cout << "[BuildAST] Parsed statement at index " << Index << std::endl;
+                Statements.push_back(std::move(Statement));
+            } else {
+                std::cerr << "[BuildAST] Failed to parse statement at index " << Index << std::endl;
+                throw std::runtime_error("Failed to parse statement.");
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[BuildAST] Error parsing statement at token " << Index << ": " << e.what() << '\n';
+            const_cast<Parser*>(this)->AdvanceToken();
+            continue;
+        }
+        // Defensive: advance token if not already advanced
+        const_cast<Parser*>(this)->AdvanceToken();
+        Index = const_cast<Parser*>(this)->CurrentIndex_;
+    }
+    if(Statements.empty())
+        throw std::runtime_error("No valid statements were parsed.");
+    for(auto&& Stmt : Statements) {
+        std::cout << "[BuildAST] Adding statement to AST tree." << std::endl;
+        Result.Add(std::move(Stmt));
+    }
+    std::cout << "[BuildAST] AST build complete. Node count: " << Result.Size() << std::endl;
+    return Result;
 }
 
 void Parser::DumpTokens() const {
@@ -214,23 +224,28 @@ ASTNode Parser::ParseInsertStatement() {
         throw std::runtime_error("Expected table name after INSERT INTO");
     std::string TableName = TableToken->Value;
     AdvanceToken();
-    if(!MatchToken(TokenType::PUNCTUATION))
-        throw std::runtime_error("Expected '(' after table name in INSERT");
     std::vector<std::string> Columns;
-    while (auto TokenOpt = CurrentToken()) {
-        if(TokenOpt->Value == ")") {
-            AdvanceToken();
-            break;
-        }
-        std::string Col = TokenOpt->Value;
-        if(!Col.empty() && Col.back() == ',') Col.pop_back();
-        Columns.push_back(Col);
+    // Check if next token is '('
+    if(CurrentToken() && CurrentToken()->Value == "(") {
         AdvanceToken();
+        while (auto TokenOpt = CurrentToken()) {
+            if(TokenOpt->Value == ")") {
+                AdvanceToken();
+                break;
+            }
+            std::string Col = TokenOpt->Value;
+            if(!Col.empty() && Col.back() == ',') Col.pop_back();
+            Columns.push_back(Col);
+            AdvanceToken();
+        }
     }
+    // Now expect VALUES
     if(!MatchKeyword("VALUES"))
         throw std::runtime_error("Expected VALUES in INSERT statement");
-    if(!MatchToken(TokenType::PUNCTUATION))
+    // Fix: Only advance if the next token is '('
+    if(!CurrentToken() || CurrentToken()->Value != "(")
         throw std::runtime_error("Expected '(' before values in INSERT");
+    AdvanceToken(); // consume '('
     std::vector<std::string> Values;
     while(auto TokenOpt = CurrentToken()) {
         if(TokenOpt->Value == ")") {
@@ -244,6 +259,11 @@ ASTNode Parser::ParseInsertStatement() {
         AdvanceToken();
     }
     auto TableAst = std::make_unique<TableAST>(TableName);
+    std::cout << "[ParseInsertStatement] Table: " << TableName << ", Columns: [";
+    for (const auto& c : Columns) std::cout << c << ", ";
+    std::cout << "] Values: [";
+    for (const auto& v : Values) std::cout << v << ", ";
+    std::cout << "]\n";
     return std::make_unique<InsertAST>(std::move(TableAst), Columns, Values);
 }
 
@@ -330,17 +350,17 @@ std::unique_ptr<ExpressionAST> Parser::ParseRevokeStatement() {
     AdvanceToken(); // consume REVOKE
     // Expect permission type (SELECT, INSERT, UPDATE, DELETE, etc.)
     if (!CurrentToken()) throw std::runtime_error("Expected permission after REVOKE");
-    std::string permStr = CurrentToken()->Value;
+    std::string PermissionString = CurrentToken()->Value;
     Permissions Perms;
-    if (permStr == "SELECT") Perms = Permissions::Select;
-    else if (permStr == "INSERT") Perms = Permissions::Insert;
-    else if (permStr == "UPDATE") Perms = Permissions::Update;
-    else if (permStr == "DELETE") Perms = Permissions::Delete;
-    else if (permStr == "TRUNCATE") Perms = Permissions::Truncate;
-    else if (permStr == "REFERENCES") Perms = Permissions::References;
-    else if (permStr == "TRIGGER") Perms = Permissions::Trigger;
-    else if (permStr == "ALL") Perms = Permissions::All;
-    else throw std::runtime_error("Unknown permission in REVOKE: " + permStr);
+    if (PermissionString == "SELECT") Perms = Permissions::Select;
+    else if (PermissionString == "INSERT") Perms = Permissions::Insert;
+    else if (PermissionString == "UPDATE") Perms = Permissions::Update;
+    else if (PermissionString == "DELETE") Perms = Permissions::Delete;
+    else if (PermissionString == "TRUNCATE") Perms = Permissions::Truncate;
+    else if (PermissionString == "REFERENCES") Perms = Permissions::References;
+    else if (PermissionString == "TRIGGER") Perms = Permissions::Trigger;
+    else if (PermissionString == "ALL") Perms = Permissions::All;
+    else throw std::runtime_error("Unknown permission in REVOKE: " + PermissionString);
     AdvanceToken();
     if (!MatchKeyword("ON")) throw std::runtime_error("Expected ON after permission in REVOKE");
     std::string tableName;
@@ -369,9 +389,9 @@ std::unique_ptr<ExpressionAST> Parser::ParseBinaryOperation() {
 }
 
 std::unique_ptr<ExpressionAST> Parser::ParseStatement() {
-    Tokens_ = Tokenize();
-    CurrentIndex_ = 0;
+    std::cout << "[ParseStatement] Called at token index: " << CurrentIndex_ << std::endl;
     if(auto CurrentTok = CurrentToken()) {
+        std::cout << "[ParseStatement] First token: " << CurrentTok->Value << std::endl;
         std::string FirstValue = CurrentTok->Value;
         if(FirstValue == "SELECT")
             return ParseSelectStatement();
@@ -388,7 +408,7 @@ std::unique_ptr<ExpressionAST> Parser::ParseStatement() {
         else if(FirstValue == "REVOKE")
             return ParseRevokeStatement();
         else
-            throw std::runtime_error("Unrecognized statement type: " + FirstValue);
+            std::cerr << "[ParseStatement] Unknown statement type: " << FirstValue << std::endl;
     }
     throw std::runtime_error("Empty query");
 }

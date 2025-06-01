@@ -25,12 +25,10 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             return false;
         case Opcode::PUSH: {
             if (inst.Operands.empty()) throw std::runtime_error("PUSH requires operand");
-            // Support int64_t and string for PUSH
-            if (auto val = std::get_if<int64_t>(&inst.Operands[0])) {
-                Push(static_cast<uint64_t>(*val));
-            } else if (std::holds_alternative<std::string>(inst.Operands[0])) {
-                // For string, could push to a string stack or handle as needed
-                // For now, ignore (or extend interpreter as needed)
+            if (auto Val = std::get_if<int64_t>(&inst.Operands[0])) {
+                Push(static_cast<uint64_t>(*Val));
+            } else if (auto Str = std::get_if<std::string>(&inst.Operands[0])) {
+                Push(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(new std::string(*Str))));
             } else {
                 throw std::runtime_error("PUSH only supports int64_t or string operand");
             }
@@ -38,6 +36,10 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             break;
         }
         case Opcode::POP: {
+            if (Stack_.empty()) {
+                ++Ic;
+                break;
+            }
             Pop();
             ++Ic;
             break;
@@ -198,35 +200,72 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             break;
         }
         case Opcode::SELECT: {
-            if (inst.Operands.empty()) throw std::runtime_error("SELECT requires table name operand");
-            if (auto tableName = std::get_if<std::string>(&inst.Operands[0])) {
-                if (Databases_.empty()) {
-                    Databases_.push_back(std::make_unique<Database>(std::filesystem::path("astral.db")));
-                }
-                auto result = Databases_[0]->Select(*tableName, [](const std::unordered_map<std::string, std::string>&) { return true; }).get();
-                std::cout << "SELECT result from table '" << *tableName << "':\n";
-                for (const auto& row : result) {
-                    for (const auto& [col, val] : row) {
-                        std::cout << col << ": " << val << ", ";
-                    }
-                    std::cout << std::endl;
-                }
+            if (inst.Operands.empty()) throw std::runtime_error("SELECT requires column name operand");
+            if (auto Column = std::get_if<std::string>(&inst.Operands[0])) {
+                Push(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(new std::string(*Column))));
             } else {
-                throw std::runtime_error("SELECT expects string operand");
+                throw std::runtime_error("SELECT expects string column operand");
             }
             ++Ic;
             break;
         }
-        // Database operations: SET, WHERE, ORDER_BY, GROUP_BY, LIMIT, OFFSET
-        case Opcode::SET:
-        case Opcode::WHERE:
-        case Opcode::ORDER_BY:
-        case Opcode::GROUP_BY:
-        case Opcode::LIMIT:
+        case Opcode::SET: {
+            if (inst.Operands.size() < 2) throw std::runtime_error("SET requires column and value operands");
+            if (auto Column = std::get_if<std::string>(&inst.Operands[0])) {
+                if (auto Value = std::get_if<std::string>(&inst.Operands[1])) {
+                    Push(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(new std::string(*Column))));
+                    Push(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(new std::string(*Value))));
+                } else {
+                    throw std::runtime_error("SET expects string value operand");
+                }
+            } else {
+                throw std::runtime_error("SET expects string column operand");
+            }
+            ++Ic;
+            break;
+        }
+        case Opcode::WHERE: {
+            Flags |= 0x1;
+            ++Ic;
+            break;
+        }
+        case Opcode::ORDER_BY: {
+            if (inst.Operands.empty()) throw std::runtime_error("ORDER_BY requires column name operand");
+            if (auto Column = std::get_if<std::string>(&inst.Operands[0])) {
+                Push(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(new std::string(*Column))));
+            } else {
+                throw std::runtime_error("ORDER_BY expects string column operand");
+            }
+            ++Ic;
+            break;
+        }
+        case Opcode::GROUP_BY: {
+            if (inst.Operands.empty()) throw std::runtime_error("GROUP_BY requires column name operand");
+            if (auto Column = std::get_if<std::string>(&inst.Operands[0])) {
+                Push(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(new std::string(*Column))));
+            } else {
+                throw std::runtime_error("GROUP_BY expects string column operand");
+            }
+            ++Ic;
+            break;
+        }
+        case Opcode::LIMIT: {
+            if (inst.Operands.empty()) throw std::runtime_error("LIMIT requires count operand");
+            if (auto Count = std::get_if<int64_t>(&inst.Operands[0])) {
+                Push(static_cast<uint64_t>(*Count));
+            } else {
+                throw std::runtime_error("LIMIT expects integer operand");
+            }
+            ++Ic;
+            break;
+        }
         case Opcode::OFFSET: {
-            // These would typically modify query state or context
-            // For now, just print a message and continue
-            std::cout << "Opcode not yet implemented: " << static_cast<int>(inst.Opcode) << std::endl;
+            if (inst.Operands.empty()) throw std::runtime_error("OFFSET requires count operand");
+            if (auto Count = std::get_if<int64_t>(&inst.Operands[0])) {
+                Push(static_cast<uint64_t>(*Count));
+            } else {
+                throw std::runtime_error("OFFSET expects integer operand");
+            }
             ++Ic;
             break;
         }

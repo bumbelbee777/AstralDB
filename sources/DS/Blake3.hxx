@@ -23,6 +23,7 @@ inline void Prefetch(const void* Pointer) {
 #if defined(__GNUC__)
 	__builtin_prefetch(Pointer);
 #endif
+	(void)Pointer;
     return;
 }
 

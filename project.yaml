@@ -9,4 +9,4 @@ project_dirs: ["sources/"]
 output: astraldb
 include_paths: ["sources/"]
 compiler_flags:
-  global: "-O3 -Wall -Wextra -Werror"
+  global: "-O3 -Os -Wall -Wextra -Werror"

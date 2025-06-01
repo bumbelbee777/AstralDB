@@ -1,4 +1,7 @@
 #include <SQL/SQL.hxx>
+#include <DS/HashTable.hxx>
+#include <DS/LZ4.hxx>
+#include <IO/Logger.hxx>
 
 namespace AstralDB {
 namespace SQL {
@@ -46,9 +49,9 @@ Bytecode InsertAST::EmitBytecode() const {
 
 Bytecode UpdateAST::EmitBytecode() const {
     Bytecode Code;
-    AppendInstruction(Code, MakeInstruction(Opcode::UPDATE, TableName));
-    for(const auto &Assignment : Assignments)
-        AppendInstruction(Code, MakeInstruction(Opcode::SET, Assignment.first, Assignment.second));
+    for(const auto &Assignment : Assignments) {
+        AppendInstruction(Code, MakeInstruction(Opcode::UPDATE, TableName, Assignment.first, Assignment.second));
+    }
     if(Condition) {
         AppendInstruction(Code, MakeInstruction(Opcode::WHERE));
         Bytecode CondCode = Condition->EmitBytecode();
@@ -89,6 +92,8 @@ Bytecode BinaryOpAST::EmitBytecode() const {
 		OpCode = Opcode::MOD;
 	else if(Op == "==")
 		OpCode = Opcode::EQ;
+	else if(Op == "=")
+		OpCode = Opcode::EQ;
 	else if(Op == "!=")
 		OpCode = Opcode::NE;
 	else if(Op == "<")
@@ -117,23 +122,25 @@ Bytecode RevokeAST::EmitBytecode() const {
     return Code;
 }
 
-Bytecode BuildBytecode() {
+Bytecode BuildBytecode(Logger* Logger) {
     Bytecode Result;
     int Counter = 0;
     std::vector<Bytecode> BatchBytecodes;
-    std::vector<ExpressionAST*> BatchAST;
+    std::vector<std::unique_ptr<ExpressionAST>> BatchAST;
     for (auto &Statement : AST) {
         if (Statement && Statement->Value) {
+            if(Logger) Logger->Info("Emitting bytecode for AST node");
             Bytecode Dummy = Statement->Value->EmitBytecode();
             for(auto &Inst : Dummy)
                 AppendInstruction(Result, Inst);
             BatchBytecodes.push_back(Dummy);
-            BatchAST.push_back(Statement->Value.get());
+            BatchAST.push_back(std::move(Statement->Value));
         }
         if (Counter >= 35) {
-            BPlusTree<Bytecode, ExpressionAST*, 4, BytecodeComparator> Tree;
+            if(Logger) Logger->Warn("Batching bytecode emission");
+            BPlusTree<Bytecode, std::unique_ptr<ExpressionAST>, 4, BytecodeComparator> Tree;
             for(size_t i = 0; i < BatchBytecodes.size(); i++)
-                Tree.Insert(BatchBytecodes[i], BatchAST[i]);
+                Tree.Insert(BatchBytecodes[i], std::move(BatchAST[i]));
             std::vector<Bytecode> SortedBytecodes = Tree.GetAllKeys();
             for(auto &BC : SortedBytecodes) {
                 for(auto &Inst : BC)
@@ -147,15 +154,17 @@ Bytecode BuildBytecode() {
         }
     }
     if(!BatchBytecodes.empty()) {
-        BPlusTree<Bytecode, ExpressionAST*, 4, BytecodeComparator> Tree;
+        if(Logger) Logger->Warn("Final batch emission");
+        BPlusTree<Bytecode, std::unique_ptr<ExpressionAST>, 4, BytecodeComparator> Tree;
         for(size_t i = 0; i < BatchBytecodes.size(); i++)
-            Tree.Insert(BatchBytecodes[i], BatchAST[i]);
+            Tree.Insert(BatchBytecodes[i], std::move(BatchAST[i]));
         std::vector<Bytecode> SortedBytecodes = Tree.GetAllKeys();
         for(auto &BC : SortedBytecodes) {
             for(auto &Inst : BC)
                 AppendInstruction(Result, Inst);
         }
     }
+    if(Logger) Logger->Info("Bytecode build complete");
     return Result;
 }
 }

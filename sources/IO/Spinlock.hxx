@@ -48,4 +48,17 @@ public:
         Lock_.OnUnlock(Callback, std::forward<Args>(Arguments)...);
     }
 };
+
+class Mutex {
+    Spinlock Lock_;
+public:
+    void Lock() { Lock_.Lock(); }
+    void Unlock() { Lock_.Unlock(); }
+
+    bool Locked() const { return Lock_.Locked(); }
+
+    template<class ReturnType, class... Args> void OnUnlock(std::function<ReturnType(Args...)> Callback, Args... Arguments) {
+        Lock_.OnUnlock(Callback, std::forward<Args>(Arguments)...);
+    }
+};
 }

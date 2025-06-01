@@ -7,6 +7,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <memory>
+#include <IO/Logger.hxx>
 
 namespace AstralDB {
 namespace SQL {
@@ -19,22 +20,38 @@ class BytecodeInterpreter {
     std::vector<uint64_t> Stack_;
 
     std::vector<std::unique_ptr<Database>> Databases_;
+    Logger* Logger_ = nullptr;
+
+    void CleanupStack() {
+        for (auto Value : Stack_)
+            if (Value > 0x1000) // Simple heuristic to detect pointers
+                delete reinterpret_cast<std::string*>(Value);
+        Stack_.clear();
+    }
+
 public:
-    BytecodeInterpreter() : Ic(0), Sp(0), Bp(0), Flags(0) {
+    BytecodeInterpreter(Logger* Logger = nullptr) : Ic(0), Sp(0), Bp(0), Flags(0), Logger_(Logger) {
         Registers_.resize(16, 0);
     }
+
+    ~BytecodeInterpreter() {
+        CleanupStack();
+    }
+
+    void SetLogger(Logger* Logger) { Logger_ = Logger; }
+    Logger* GetLogger() const { return Logger_; }
 
     void Execute(const Bytecode &Code);
 
     bool Step(const Bytecode &Code);
 
     void Reset() {
+        CleanupStack();
         Ic = 0;
         Sp = 0;
         Bp = 0;
         Flags = 0;
         Registers_.assign(Registers_.size(), 0);
-        Stack_.clear();
     }
 
     uintptr_t CurrentInstruction() const { return Ic; }
