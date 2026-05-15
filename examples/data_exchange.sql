@@ -1,0 +1,5 @@
+CREATE TABLE xfer (k INT, v TEXT);
+INSERT INTO xfer VALUES (1, 'hello');
+EXPORT DATABASE TO 'xfer_dump.json' FORMAT JSON;
+DROP TABLE xfer;
+IMPORT DATABASE FROM 'xfer_dump.json' FORMAT JSON;

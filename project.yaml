@@ -1,12 +1,28 @@
 project: AstralDB
 authors: ["bumblebee777"]
 license: MIT
-compiler: clang++
+version: 1.0
 language: cpp
 standard: c++23
-project_type: executable
-project_dirs: ["sources/"]
-output: astraldb
-include_paths: ["sources/"]
+compiler: clang++
+project_type: library
+project_dirs:
+  - sources/Database
+  - sources/SQL
+  - sources/IO
+  - sources/DS
+output: bin/libastraldb.a
 compiler_flags:
-  global: "-O3 -Os -Wall -Wextra -Werror"
+  global: "-Wall -Wextra -Werror -Isources -Ithird_party -Itests"
+  common: "-O2"
+  cpp: ""
+  ar: ""
+  ld: "-Wl,--stack,8388608"
+
+unit_tests:
+  project_dirs:
+    - tests
+  output: bin/run_tests
+
+subprojects:
+  - app

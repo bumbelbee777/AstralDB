@@ -29,9 +29,13 @@ public:
         EncryptInput(Input);
     }
 
+    /** Rebuild from persisted ciphertext + key (snapshot / WAL); does not encrypt \a Plaintext. */
+    EncryptedString(std::string EncryptedPayload, const std::array<uint8_t, 32> &KeyMaterial)
+        : EncryptedData_(std::move(EncryptedPayload)), EncryptionKey_(KeyMaterial) {}
+
     EncryptedString(std::string_view Data, bool AlreadyEncrypted) {
         if(AlreadyEncrypted) {
-            std::copy(Data.begin(), Data.end(), EncryptedData_.begin());
+            EncryptedData_.assign(Data.begin(), Data.end());
         } else {
             std::array<uint8_t, 24> Nonce{};
             std::copy(Data.begin(), Data.begin() + 24, Nonce.begin());
@@ -39,15 +43,23 @@ public:
             XChaCha20 Cipher(EncryptionKey_, Nonce);
             std::vector<uint8_t> Plaintext;
             Cipher.Decrypt(Ciphertext, Plaintext);
-            std::copy(Plaintext.begin(), Plaintext.end(), EncryptedData_.begin());
+            EncryptedData_.assign(Plaintext.begin(), Plaintext.end());
         }
     }
 
-    EncryptedString(const EncryptedString &) = delete;
-    EncryptedString &operator=(const EncryptedString &) = delete;
+    EncryptedString(const EncryptedString &Other)
+        : EncryptedData_(Other.EncryptedData_), EncryptionKey_(Other.EncryptionKey_) {}
 
-    EncryptedString(EncryptedString&& other) noexcept = default;
-    EncryptedString& operator=(EncryptedString&& other) noexcept = default;
+    EncryptedString &operator=(const EncryptedString &Other) {
+        if(this != &Other) {
+            EncryptedData_ = Other.EncryptedData_;
+            EncryptionKey_ = Other.EncryptionKey_;
+        }
+        return *this;
+    }
+
+    EncryptedString(EncryptedString&& Other) noexcept = default;
+    EncryptedString& operator=(EncryptedString&& Other) noexcept = default;
 
     const std::array<uint8_t, 32> &EncryptionKey() const {
         return EncryptionKey_;

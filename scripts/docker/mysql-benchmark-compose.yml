@@ -1,0 +1,29 @@
+# Ephemeral MySQL 8 for benchmark automation (see scripts/run_benchmark_with_mysql.ps1 / .sh).
+# Host port 13306 avoids colliding with a typical local MySQL on 3306.
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: astraldb-benchmark-mysql
+    restart: "no"
+    environment:
+      MYSQL_ROOT_PASSWORD: astraldb_bench_root
+      MYSQL_DATABASE: astraldb_bench
+    ports:
+      - "13306:3306"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "mysqladmin",
+          "ping",
+          "-h",
+          "127.0.0.1",
+          "-u",
+          "root",
+          "-pastraldb_bench_root",
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 45
+      start_period: 20s

@@ -1,171 +1,1214 @@
+#include <SQL/Bytecode.hxx>
 #include <SQL/SQL.hxx>
+#include <Database/Database.hxx>
+#include <IO/Limits.hxx>
+#include <IO/ArenaAllocator.hxx>
+#include <IO/Error.hxx>
 #include <DS/HashTable.hxx>
 #include <DS/LZ4.hxx>
 #include <IO/Logger.hxx>
+#include <memory>
+#include <memory_resource>
+#include <sstream>
+#include <stdexcept>
+#include <unordered_map>
+#include <vector>
+#include <algorithm>
+#include <cctype>
+#include <atomic>
 
-namespace AstralDB {
-namespace SQL {
-Bytecode LiteralAST::EmitBytecode() const {
-    Bytecode Code;
-    AppendInstruction(Code, MakeInstruction(Opcode::PUSH, Value));
-    return Code;
+namespace AstralDB::SQL {
+
+namespace {
+
+using RowTriple = std::tuple<std::string, std::string, std::string>;
+
+[[noreturn]] inline void FailCodegen(std::string Message) {
+	throw std::runtime_error(AstralDB::Err::Prefixed("SQL codegen", std::move(Message)));
 }
 
-Bytecode TableAST::EmitBytecode() const {
-    Bytecode Code;
-    AppendInstruction(Code, MakeInstruction(Opcode::PUSH, TableName));
-    return Code;
+struct SqlViewCodegenState {
+	std::unordered_map<std::string, std::string> *LiveBodies = nullptr;
+	std::unordered_map<std::string, const StatementAST *> *SessionParsedBodies = nullptr;
+	std::unordered_map<std::string, std::unique_ptr<StatementAST>> WalReparsedBodies;
+	unsigned ExpansionDepth = 0;
+	uint64_t ScratchCounter = 0;
+};
+
+thread_local SqlViewCodegenState *GViewCodegen = nullptr;
+
+class ScopedViewCodegen {
+	SqlViewCodegenState *Prev_;
+
+public:
+	explicit ScopedViewCodegen(SqlViewCodegenState *Cx) : Prev_(GViewCodegen) { GViewCodegen = Cx; }
+	~ScopedViewCodegen() { GViewCodegen = Prev_; }
+};
+
+std::string ResolveRelationLogicalName(const std::string &Logical, BytecodeScratch &Instructions);
+
+const StatementAST *ResolveViewAstForExpansion(const std::string &ViewName, SqlViewCodegenState &St) {
+	auto ItS = St.SessionParsedBodies->find(ViewName);
+	if(ItS != St.SessionParsedBodies->end())
+		return ItS->second;
+	auto ItW = St.WalReparsedBodies.find(ViewName);
+	if(ItW != St.WalReparsedBodies.end())
+		return ItW->second.get();
+	auto ItB = St.LiveBodies->find(ViewName);
+	if(ItB == St.LiveBodies->end())
+		return nullptr;
+	Parser Sub(ItB->second, ParserTokenizeOnly);
+	auto Node = Sub.ParseStandaloneSelectForViewExpansion();
+	if(!Node || !dynamic_cast<const SelectAST *>(Node.get()))
+		FailCodegen(
+		    "View \"" + ViewName + "\" has an invalid or unsupported definition (expected a single SELECT).");
+	if(!Sub.StandaloneSelectConsumedAllTokens())
+		FailCodegen("View \"" + ViewName + "\" body must be a single SELECT with no trailing tokens.");
+	const StatementAST *Raw = Node.get();
+	St.WalReparsedBodies[ItB->first] = std::move(Node);
+	return Raw;
 }
 
-Bytecode CreateAST::EmitBytecode() const {
-    Bytecode Code;
-    AppendInstruction(Code, MakeInstruction(Opcode::CREATE_TABLE, TableName));
-    for(const auto &Column : Columns) {
-        AppendInstruction(Code, MakeInstruction(Opcode::PUSH, Column.Name));
-        AppendInstruction(Code, MakeInstruction(Opcode::PUSH, Column.Type));
-        for(auto Constraint : Column.Constraints)
-            AppendInstruction(Code, MakeInstruction(Opcode::PUSH, Constraint));
-    }
-    return Code;
+void EmitExpandedViewToScratch(const std::string &Scratch, const std::string &ViewName, BytecodeScratch &Instr) {
+	auto *G = GViewCodegen;
+	if(!G)
+		FailCodegen("Internal error: missing view codegen context.");
+	const StatementAST *Raw = ResolveViewAstForExpansion(ViewName, *G);
+	const auto *Sel = dynamic_cast<const SelectAST *>(Raw);
+	if(!Sel)
+		FailCodegen("Internal error: expanding non-SELECT view \"" + ViewName + "\".");
+	const std::string Base = ResolveRelationLogicalName(Sel->SourceTableName(), Instr);
+	AppendInstruction(Instr, MakeInstruction(Opcode::CLONE_TABLE, Scratch, Base));
+	Sel->EmitBytecodeForScratchTable(Scratch, Instr);
 }
 
-Bytecode SelectAST::EmitBytecode() const {
-    Bytecode Code;
-    for(const auto &Column : Columns)
-        AppendInstruction(Code, MakeInstruction(Opcode::SELECT, Column));
-    AppendInstruction(Code, MakeInstruction(Opcode::PUSH, Table->TableName));
-    return Code;
+std::string ResolveRelationLogicalName(const std::string &Logical, BytecodeScratch &Instructions) {
+	auto *G = GViewCodegen;
+	if(!G || !G->LiveBodies || G->LiveBodies->find(Logical) == G->LiveBodies->end())
+		return Logical;
+	if(++G->ExpansionDepth > Limits::MaxSqlViewExpansionDepth)
+		FailCodegen("View expansion exceeded maximum depth (" +
+		            std::to_string(static_cast<int>(Limits::MaxSqlViewExpansionDepth)) + ").");
+	const std::string Scratch = std::string("__AstView_") + std::to_string(++G->ScratchCounter);
+	EmitExpandedViewToScratch(Scratch, Logical, Instructions);
+	--G->ExpansionDepth;
+	return Scratch;
 }
 
-Bytecode InsertAST::EmitBytecode() const {
-    Bytecode Code;
-    AppendInstruction(Code, MakeInstruction(Opcode::PUSH, Table->TableName));
-    for(const auto &Column : Columns)
-        AppendInstruction(Code, MakeInstruction(Opcode::PUSH, Column));
-    for(const auto &Value : Values)
-        AppendInstruction(Code, MakeInstruction(Opcode::PUSH, Value));
-    return Code;
+static constexpr const char *kExistCol = "__ASTRAL_EXISTS__";
+/** Stored as predicate RHS bytes; MatchOnePredicate resolves against the enclosing+inner merged row (correlation). */
+static constexpr const char kAstRhsColMarker[] = "__AST_RHS_COL__:";
+
+static constexpr const char *kOpIsNull = "__IS_NULL__";
+static constexpr const char *kOpIsNotNull = "__IS_NOT_NULL__";
+static constexpr const char *kOpIn = "__IN__";
+
+static std::string MapHavingAggOutputColumn(const FuncCallExprAST &F, const SelectAST &Sel) {
+	switch(F.BuiltinKind) {
+	case FuncCallExprAST::Kind::CountStar:
+		if(Sel.AggKind() != GroupAggMode::CountStar)
+			FailCodegen("HAVING COUNT(*) requires COUNT(*) in the grouped SELECT list.");
+		if(!Sel.CountAggregateOutputColumn().empty())
+			return Sel.CountAggregateOutputColumn();
+		return "cnt";
+	case FuncCallExprAST::Kind::CountDistinct:
+		if(Sel.AggKind() != GroupAggMode::CountDistinct)
+			FailCodegen("HAVING COUNT(DISTINCT …) requires COUNT(DISTINCT …) in the grouped SELECT list.");
+		if(!Sel.CountDistinctColumn().has_value() || *Sel.CountDistinctColumn() != F.ArgColumn)
+			FailCodegen("HAVING COUNT(DISTINCT column) must match the SELECT COUNT(DISTINCT column).");
+		if(!Sel.CountAggregateOutputColumn().empty())
+			return Sel.CountAggregateOutputColumn();
+		return "cnt";
+	case FuncCallExprAST::Kind::Sum:
+	case FuncCallExprAST::Kind::Min:
+	case FuncCallExprAST::Kind::Max:
+	case FuncCallExprAST::Kind::Avg: {
+		GroupCombAggKind Want = GroupCombAggKind::Sum;
+		if(F.BuiltinKind == FuncCallExprAST::Kind::Min)
+			Want = GroupCombAggKind::Min;
+		else if(F.BuiltinKind == FuncCallExprAST::Kind::Max)
+			Want = GroupCombAggKind::Max;
+		else if(F.BuiltinKind == FuncCallExprAST::Kind::Avg)
+			Want = GroupCombAggKind::Avg;
+		for(const auto &Ca : Sel.ComboAggs()) {
+			if(Ca.Kind == Want && Ca.SourceColumn == F.ArgColumn)
+				return Ca.OutputColumn;
+		}
+		FailCodegen("HAVING aggregate does not match a grouped SUM/MIN/MAX/AVG(column) in the SELECT list.");
+	}
+	default:
+		FailCodegen("Internal error: unknown aggregate in HAVING lowering.");
+	}
 }
 
-Bytecode UpdateAST::EmitBytecode() const {
-    Bytecode Code;
-    for(const auto &Assignment : Assignments) {
-        AppendInstruction(Code, MakeInstruction(Opcode::UPDATE, TableName, Assignment.first, Assignment.second));
-    }
-    if(Condition) {
-        AppendInstruction(Code, MakeInstruction(Opcode::WHERE));
-        Bytecode CondCode = Condition->EmitBytecode();
-        Code.insert(Code.end(), CondCode.begin(), CondCode.end());
-    }
-    AppendInstruction(Code, MakeInstruction(Opcode::HALT));
-    return Code;
+static std::unique_ptr<ExpressionAST> NormalizeHavingExpr(const ExpressionAST *Root, const SelectAST &Sel) {
+	if(!Root)
+		return nullptr;
+	if(const auto *F = dynamic_cast<const FuncCallExprAST *>(Root))
+		return std::make_unique<ColumnRefAST>(MapHavingAggOutputColumn(*F, Sel));
+	if(const auto *B = dynamic_cast<const BinaryOpAST *>(Root)) {
+		auto L = NormalizeHavingExpr(B->LHS.get(), Sel);
+		auto R = NormalizeHavingExpr(B->RHS.get(), Sel);
+		return std::make_unique<BinaryOpAST>(std::move(L), B->Op, std::move(R));
+	}
+	if(const auto *C = dynamic_cast<const ColumnRefAST *>(Root))
+		return std::make_unique<ColumnRefAST>(C->Name);
+	if(const auto *L = dynamic_cast<const LiteralAST *>(Root))
+		return std::make_unique<LiteralAST>(L->Value);
+	if(dynamic_cast<const NullLiteralAST *>(Root))
+		return std::make_unique<NullLiteralAST>();
+	if(const auto *N = dynamic_cast<const IsNullPredAST *>(Root)) {
+		auto Subj = NormalizeHavingExpr(N->Subject.get(), Sel);
+		return std::make_unique<IsNullPredAST>(std::move(Subj), N->Negated);
+	}
+	if(const auto *Btw = dynamic_cast<const BetweenAST *>(Root)) {
+		return std::make_unique<BetweenAST>(NormalizeHavingExpr(Btw->Subject.get(), Sel),
+		                                    NormalizeHavingExpr(Btw->Low.get(), Sel),
+		                                    NormalizeHavingExpr(Btw->High.get(), Sel));
+	}
+	if(const auto *Ep = dynamic_cast<const ExistsPredAST *>(Root)) {
+		auto InnerW = Ep->InnerWhere ? NormalizeHavingExpr(Ep->InnerWhere.get(), Sel) : nullptr;
+		return std::make_unique<ExistsPredAST>(Ep->Negated, Ep->InnerTable, std::move(InnerW));
+	}
+	if(const auto *Iv = dynamic_cast<const InValuesAST *>(Root))
+		return std::make_unique<InValuesAST>(Iv->Values);
+	FailCodegen("HAVING uses an expression shape that cannot be lowered for grouped columns.");
 }
 
-Bytecode DeleteAST::EmitBytecode() const {
-    Bytecode Code;
-    AppendInstruction(Code, MakeInstruction(Opcode::DELETE, TableName));
-    if(Condition) {
-        AppendInstruction(Code, MakeInstruction(Opcode::WHERE));
-        Bytecode CondCode = Condition->EmitBytecode();
-        Code.insert(Code.end(), CondCode.begin(), CondCode.end());
-    }
-    AppendInstruction(Code, MakeInstruction(Opcode::HALT));
-    return Code;
+bool BuildWhereDnf(const ExpressionAST *WhereRoot, std::vector<std::vector<RowTriple>> &OutBranches);
+
+static void PutLeI64(std::string &S, int64_t V) {
+	for(int B = 0; B < 8; ++B)
+		S.push_back(
+		    static_cast<char>(static_cast<unsigned char>((static_cast<uint64_t>(V) >> (8 * B)) & 0xFF)));
 }
 
-Bytecode BinaryOpAST::EmitBytecode() const {
-	Bytecode Code;
-	Bytecode LHSCode = LHS->EmitBytecode();
-	Code.insert(Code.end(), LHSCode.begin(), LHSCode.end());
-	Bytecode RHSCode = RHS->EmitBytecode();
-	Code.insert(Code.end(), RHSCode.begin(), RHSCode.end());
-	Opcode OpCode;
-	if(Op == "+")
-		OpCode = Opcode::ADD;
-	else if(Op == "-")
-		OpCode = Opcode::SUB;
-	else if(Op == "*")
-		OpCode = Opcode::MUL;
-	else if(Op == "/")
-		OpCode = Opcode::DIV;
-	else if(Op == "%")
-		OpCode = Opcode::MOD;
-	else if(Op == "==")
-		OpCode = Opcode::EQ;
-	else if(Op == "=")
-		OpCode = Opcode::EQ;
-	else if(Op == "!=")
-		OpCode = Opcode::NE;
-	else if(Op == "<")
-		OpCode = Opcode::LT;
-	else if(Op == "<=")
-		OpCode = Opcode::LE;
-	else if(Op == ">")
-		OpCode = Opcode::GT;
-	else if(Op == ">=")
-		OpCode = Opcode::GE;
+static void PackLenStr(std::string &S, const std::string &X) {
+	PutLeI64(S, static_cast<int64_t>(X.size()));
+	S.append(X);
+}
+
+void AppendDnfOperands(std::vector<Value> &Ops, const std::vector<std::vector<RowTriple>> &Dnf) {
+	Ops.push_back(static_cast<int64_t>(Dnf.size()));
+	for(const auto &Branch : Dnf) {
+		Ops.push_back(static_cast<int64_t>(Branch.size()));
+		for(const auto &[Col, O, V] : Branch) {
+			Ops.push_back(Col);
+			Ops.push_back(O);
+			Ops.push_back(V);
+		}
+	}
+}
+
+static void PackDnfOperandsBlob(const std::vector<std::vector<RowTriple>> &Dnf, std::string &Out) {
+	Out.clear();
+	std::vector<Value> Ops;
+	AppendDnfOperands(Ops, Dnf);
+	for(const auto &Elem : Ops) {
+		if(const auto *Iv = std::get_if<int64_t>(&Elem)) {
+			Out.push_back('Q');
+			PutLeI64(Out, *Iv);
+		} else if(const auto *Sv = std::get_if<std::string>(&Elem)) {
+			Out.push_back('S');
+			PackLenStr(Out, *Sv);
+		} else
+			FailCodegen("Internal error: malformed DNF operand while packing bytecode.");
+	}
+}
+
+bool ColumnNameExpr(const ExpressionAST *E, std::string &Out) {
+	const auto *C = dynamic_cast<const ColumnRefAST *>(E);
+	if(!C)
+		return false;
+	Out = C->Name;
+	return true;
+}
+
+bool LiteralOrNullCsv(const ExpressionAST *E, std::string &Out) {
+	if(const auto *L = dynamic_cast<const LiteralAST *>(E)) {
+		Out = L->Value;
+		return true;
+	}
+	if(dynamic_cast<const NullLiteralAST *>(E)) {
+		Out.clear();
+		return true;
+	}
+	return false;
+}
+
+bool ExtractOneComparison(const ExpressionAST *Expr, RowTriple &Out) {
+	if(!Expr)
+		return false;
+	const auto *Bin = dynamic_cast<const BinaryOpAST *>(Expr);
+	if(!Bin || Bin->Op == "IN" || Bin->Op == "LIKE" || Bin->Op == "NOT LIKE")
+		return false;
+
+	const auto *LCol = dynamic_cast<const ColumnRefAST *>(Bin->LHS.get());
+	const auto *RLit = dynamic_cast<const LiteralAST *>(Bin->RHS.get());
+	const auto *RNullRhs = dynamic_cast<const NullLiteralAST *>(Bin->RHS.get());
+	const auto *LLit = dynamic_cast<const LiteralAST *>(Bin->LHS.get());
+	const auto *LNullLhs = dynamic_cast<const NullLiteralAST *>(Bin->LHS.get());
+	const auto *RCol = dynamic_cast<const ColumnRefAST *>(Bin->RHS.get());
+
+	std::string Col;
+	std::string Op = Bin->Op;
+	std::string Rhs;
+
+	if(LCol && (RLit || RNullRhs)) {
+		Col = LCol->Name;
+		Rhs = RLit ? RLit->Value : std::string();
+	} else if((LLit || LNullLhs) && RCol) {
+		Col = RCol->Name;
+		Rhs = LLit ? LLit->Value : std::string();
+		if(Op == "<")
+			Op = ">";
+		else if(Op == "<=")
+			Op = ">=";
+		else if(Op == ">")
+			Op = "<";
+		else if(Op == ">=")
+			Op = "<=";
+		else if(Op != "=" && Op != "==" && Op != "!=")
+			return false;
+	} else if(LCol && RCol) {
+		Col = LCol->Name;
+		if(Op == "==")
+			Op = "=";
+		Rhs = std::string(kAstRhsColMarker) + RCol->Name;
+	} else
+		return false;
+
+	if(Col.empty() || Op.empty())
+		return false;
+	if(Op != "=" && Op != "==" && Op != "!=" && Op != "<" && Op != "<=" && Op != ">" && Op != ">=")
+		return false;
+	Out = RowTriple(std::move(Col), std::move(Op), std::move(Rhs));
+	return true;
+}
+
+bool AtomToTriples(const ExpressionAST *Expr, std::vector<RowTriple> &Out) {
+	RowTriple One;
+	if(ExtractOneComparison(Expr, One)) {
+		Out.push_back(std::move(One));
+		return true;
+	}
+
+	if(const auto *Ep = dynamic_cast<const ExistsPredAST *>(Expr)) {
+		std::vector<std::vector<RowTriple>> Inner;
+		if(Ep->InnerWhere) {
+			if(!BuildWhereDnf(Ep->InnerWhere.get(), Inner))
+				return false;
+		} else
+			Inner.push_back({});
+		std::string Blob;
+		PackDnfOperandsBlob(Inner, Blob);
+		std::string Payload;
+		Payload.reserve(2 + Blob.size());
+		Payload.push_back(Ep->Negated ? '1' : '0');
+		Payload.push_back('\x1E');
+		Payload.append(Blob);
+		Out.emplace_back(std::string(kExistCol), Ep->InnerTable, std::move(Payload));
+		return true;
+	}
+
+	if(const auto *Btw = dynamic_cast<const BetweenAST *>(Expr)) {
+		std::string Col;
+		std::string Lo, Hi;
+		if(!ColumnNameExpr(Btw->Subject.get(), Col))
+			return false;
+		if(!LiteralOrNullCsv(Btw->Low.get(), Lo) || !LiteralOrNullCsv(Btw->High.get(), Hi))
+			return false;
+		Out.emplace_back(Col, ">=", Lo);
+		Out.emplace_back(Col, "<=", Hi);
+		return true;
+	}
+
+	if(const auto *Nl = dynamic_cast<const IsNullPredAST *>(Expr)) {
+		std::string Col;
+		if(!ColumnNameExpr(Nl->Subject.get(), Col))
+			return false;
+		Out.emplace_back(Col, Nl->Negated ? kOpIsNotNull : kOpIsNull, std::string());
+		return true;
+	}
+
+	const auto *Bin = dynamic_cast<const BinaryOpAST *>(Expr);
+	if(Bin && Bin->Op == "IN") {
+		std::string Col;
+		if(!ColumnNameExpr(Bin->LHS.get(), Col))
+			return false;
+		const auto *Rhs = dynamic_cast<const InValuesAST *>(Bin->RHS.get());
+		if(!Rhs || Rhs->Values.empty())
+			return false;
+		std::ostringstream O;
+		for(size_t I = 0; I < Rhs->Values.size(); ++I) {
+			if(I)
+				O << '\x1E';
+			O << Rhs->Values[I];
+		}
+		Out.emplace_back(Col, kOpIn, std::move(O).str());
+		return true;
+	}
+
+	if(Bin && (Bin->Op == "LIKE" || Bin->Op == "NOT LIKE")) {
+		std::string Col, Pat;
+		if(!ColumnNameExpr(Bin->LHS.get(), Col))
+			return false;
+		if(!LiteralOrNullCsv(Bin->RHS.get(), Pat))
+			return false;
+		Out.emplace_back(Col, Bin->Op, Pat);
+		return true;
+	}
+	return false;
+}
+
+void FlattenOrBranches(const ExpressionAST *Root, std::vector<const ExpressionAST *> &Out) {
+	if(!Root)
+		return;
+	const auto *B = dynamic_cast<const BinaryOpAST *>(Root);
+	if(B && B->Op == "OR") {
+		FlattenOrBranches(B->LHS.get(), Out);
+		FlattenOrBranches(B->RHS.get(), Out);
+		return;
+	}
+	Out.push_back(Root);
+}
+
+void FlattenAndAtoms(const ExpressionAST *Root, std::vector<const ExpressionAST *> &Out) {
+	if(!Root)
+		return;
+	const auto *B = dynamic_cast<const BinaryOpAST *>(Root);
+	if(B && B->Op == "AND") {
+		FlattenAndAtoms(B->LHS.get(), Out);
+		FlattenAndAtoms(B->RHS.get(), Out);
+		return;
+	}
+	Out.push_back(Root);
+}
+
+bool BuildWhereDnf(const ExpressionAST *WhereRoot, std::vector<std::vector<RowTriple>> &OutBranches) {
+	std::vector<const ExpressionAST *> OrBranches;
+	FlattenOrBranches(WhereRoot, OrBranches);
+	if(OrBranches.empty())
+		return false;
+	for(const ExpressionAST *OrNode : OrBranches) {
+		std::vector<const ExpressionAST *> Atoms;
+		FlattenAndAtoms(OrNode, Atoms);
+		std::vector<RowTriple> Conj;
+		for(const ExpressionAST *A : Atoms) {
+			if(!AtomToTriples(A, Conj))
+				return false;
+		}
+		OutBranches.push_back(std::move(Conj));
+	}
+	return true;
+}
+
+Instruction MakeFilterDnf(const std::vector<std::vector<RowTriple>> &Dnf) {
+	Instruction I;
+	I.Opcode = Opcode::FILTER_DNF;
+	AppendDnfOperands(I.Operands, Dnf);
+	return I;
+}
+
+Instruction MakeDeleteDnf(const std::string &Table, const std::vector<std::vector<RowTriple>> &Dnf) {
+	Instruction I;
+	I.Opcode = Opcode::DELETE_MATCHING;
+	I.Operands.push_back(Table);
+	AppendDnfOperands(I.Operands, Dnf);
+	return I;
+}
+
+Instruction MakeUpdateDnf(const std::string &Table, const std::vector<std::pair<std::string, std::string>> &Assigns,
+                            const std::vector<std::vector<RowTriple>> &Dnf) {
+	Instruction I;
+	I.Opcode = Opcode::UPDATE_MATCHING;
+	I.Operands.push_back(Table);
+	I.Operands.push_back(static_cast<int64_t>(Assigns.size()));
+	for(const auto &[C, V] : Assigns) {
+		I.Operands.push_back(C);
+		I.Operands.push_back(V);
+	}
+	AppendDnfOperands(I.Operands, Dnf);
+	return I;
+}
+
+static void AppendCaseScalarPayload(Instruction &Inst, const ExpressionAST *E) {
+	if(const auto *L = dynamic_cast<const LiteralAST *>(E)) {
+		Inst.Operands.push_back(static_cast<int64_t>(0));
+		Inst.Operands.push_back(L->Value);
+	} else if(const auto *C = dynamic_cast<const ColumnRefAST *>(E)) {
+		Inst.Operands.push_back(static_cast<int64_t>(1));
+		Inst.Operands.push_back(C->Name);
+	} else if(dynamic_cast<const NullLiteralAST *>(E)) {
+		Inst.Operands.push_back(static_cast<int64_t>(2));
+		Inst.Operands.push_back(std::string());
+	} else
+		FailCodegen("CASE THEN/ELSE must be a literal, a column reference, or NULL in this dialect.");
+}
+
+static void EmitCaseEvalInstruction(const CaseExprAST &C, const std::string &OutCol,
+                                    BytecodeScratch &Instructions) {
+	if(C.Arms.empty() && !C.ElseResult)
+		FailCodegen("CASE requires at least one WHEN arm or ELSE.");
+	if(C.Arms.size() > Limits::MaxCaseWhenArms)
+		FailCodegen("CASE WHEN arm count exceeds configured limit (Limits::MaxCaseWhenArms).");
+	Instruction I;
+	I.Opcode = Opcode::CASE_EVAL;
+	I.Operands.push_back(OutCol);
+	I.Operands.push_back(static_cast<int64_t>(C.Arms.size()));
+	for(const auto &Arm : C.Arms) {
+		if(!Arm.When)
+			FailCodegen("CASE WHEN arm missing predicate.");
+		std::vector<std::vector<RowTriple>> Branches;
+		if(!BuildWhereDnf(Arm.When.get(), Branches))
+			FailCodegen(
+			    "CASE WHEN predicate shape is not supported for this statement (simplify or extend the WHERE grammar).");
+		std::string Blob;
+		PackDnfOperandsBlob(Branches, Blob);
+		I.Operands.push_back(std::move(Blob));
+		if(!Arm.Then)
+			FailCodegen("CASE WHEN arm missing THEN expression.");
+		AppendCaseScalarPayload(I, Arm.Then.get());
+	}
+	if(C.ElseResult)
+		AppendCaseScalarPayload(I, C.ElseResult.get());
+	else {
+		I.Operands.push_back(static_cast<int64_t>(3));
+		I.Operands.push_back(std::string());
+	}
+	Instructions.push_back(std::move(I));
+}
+
+static void EmitCastEvalInstruction(const CastExprAST &C, const std::string &OutCol, BytecodeScratch &Instructions) {
+	if(!C.Operand)
+		FailCodegen("CAST missing operand expression.");
+	Instruction I;
+	I.Opcode = Opcode::CAST_EVAL;
+	I.Operands.push_back(OutCol);
+	AppendCaseScalarPayload(I, C.Operand.get());
+	I.Operands.push_back(static_cast<int64_t>(C.Target));
+	Instructions.push_back(std::move(I));
+}
+
+static void CompileCheckSqlToDnfPackedOrThrowImpl(std::string_view Sql, std::string &OutPacked) {
+	if(Sql.empty())
+		FailCodegen("CHECK constraint has an empty predicate.");
+	Parser ParserCtx(Sql, ParserTokenizeOnly);
+	auto Ex = ParserCtx.ParseStandalonePredicateExpression();
+	std::vector<std::vector<RowTriple>> Branches;
+	if(!BuildWhereDnf(Ex.get(), Branches))
+		FailCodegen(
+		    "CHECK constraint is not supported for this bytecode path (predicate must fold like a WHERE clause).");
+	PackDnfOperandsBlob(Branches, OutPacked);
+}
+
+/** Emits constraint PUSH tokens possibly expanding CHECK → CHECK + CHECKDNF (two pseudotokens per CHECK). */
+static void EmitCodegenColumnConstraints(const std::vector<std::string> &Constraints,
+                                         BytecodeScratch &Instructions) {
+	int64_t NConsEmitted = 0;
+	for(const auto &Constraint : Constraints) {
+		if(Constraint.rfind("CHECK:", 0) == 0)
+			NConsEmitted += 2;
+		else
+			NConsEmitted += 1;
+	}
+	if(NConsEmitted > 128)
+		FailCodegen("Too many bytecode constraint pseudotokens for one column.");
+	Instructions.push_back(MakeInstruction(Opcode::PUSH, static_cast<int64_t>(NConsEmitted)));
+	for(const auto &Constraint : Constraints) {
+		if(Constraint.rfind("CHECK:", 0) == 0) {
+			std::string Blob;
+			const std::string Body = Constraint.size() > 6 ? Constraint.substr(6) : std::string();
+			CompileCheckSqlToDnfPackedOrThrowImpl(Body, Blob);
+			AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Constraint));
+			AppendInstruction(Instructions,
+			                  MakeInstruction(Opcode::PUSH, std::string("CHECKDNF:") + std::move(Blob)));
+		} else
+			AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Constraint));
+	}
+}
+
+} // namespace
+
+void NullLiteralAST::EmitBytecode(BytecodeScratch &) const {
+	FailCodegen("Internal: NULL literal should not emit standalone bytecode.");
+}
+
+void InValuesAST::EmitBytecode(BytecodeScratch &) const {
+	FailCodegen("Internal: IN list should not emit standalone bytecode.");
+}
+
+void BetweenAST::EmitBytecode(BytecodeScratch &) const {
+	FailCodegen("Internal: BETWEEN should not emit standalone bytecode.");
+}
+
+void IsNullPredAST::EmitBytecode(BytecodeScratch &) const {
+	FailCodegen("Internal: IS NULL should not emit standalone bytecode.");
+}
+
+void ExistsPredAST::EmitBytecode(BytecodeScratch &) const {
+	FailCodegen("Internal: EXISTS should not emit standalone bytecode.");
+}
+
+void CaseExprAST::EmitBytecode(BytecodeScratch &) const {
+	FailCodegen("Internal: CASE projection is lowered via Opcode::CASE_EVAL, not standalone bytecode.");
+}
+
+void CastExprAST::EmitBytecode(BytecodeScratch &) const {
+	FailCodegen("Internal: CAST projection is lowered via Opcode::CAST_EVAL, not standalone bytecode.");
+}
+
+void LiteralAST::EmitBytecode(BytecodeScratch& Instructions) const {
+	AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Value));
+}
+
+void ColumnRefAST::EmitBytecode(BytecodeScratch& Instructions) const {
+	AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Name));
+}
+
+void DropAST::EmitBytecode(BytecodeScratch& Instructions) const {
+	const int64_t Flags = static_cast<int64_t>(IfExists ? 1 : 0);
+	AppendInstruction(Instructions, MakeInstruction(Opcode::DROP_TABLE, TableName, Flags));
+}
+
+void TableAST::EmitBytecode(BytecodeScratch& Instructions) const {
+	AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, TableName));
+}
+
+void CreateAST::EmitBytecode(BytecodeScratch& Instructions) const {
+	const int64_t Flags = static_cast<int64_t>(IfNotExists ? 1 : 0);
+	AppendInstruction(Instructions,
+	                   MakeInstruction(Opcode::CREATE_TABLE, TableName, static_cast<int64_t>(Columns.size()), Flags,
+	                                   static_cast<int64_t>(TableConstraints.size())));
+	for(const auto &Column : Columns) {
+		AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Column.Name));
+		AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Column.Type));
+		EmitCodegenColumnConstraints(Column.Constraints, Instructions);
+	}
+	for(const auto &TC : TableConstraints) {
+		if(TC.Kind == TableConstraintKind::PrimaryKey) {
+			AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, std::string("__PK__")));
+			AppendInstruction(Instructions,
+			                   MakeInstruction(Opcode::PUSH, static_cast<int64_t>(TC.Columns.size())));
+			for(const auto &Cn : TC.Columns)
+				AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Cn));
+		} else if(TC.Kind == TableConstraintKind::Unique) {
+			AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, std::string("__UQ__")));
+			AppendInstruction(Instructions,
+			                   MakeInstruction(Opcode::PUSH, static_cast<int64_t>(TC.Columns.size())));
+			for(const auto &Cn : TC.Columns)
+				AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Cn));
+		} else if(TC.Kind == TableConstraintKind::ForeignKey) {
+			AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, std::string("__FK__")));
+			AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, static_cast<int64_t>(1)));
+			if(TC.Columns.size() != 1)
+				FailCodegen("Composite FOREIGN KEY bytecode not wired yet.");
+			AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, TC.Columns.front()));
+			AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, TC.RefTable));
+			AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, TC.RefColumn));
+		} else if(TC.Kind == TableConstraintKind::Check) {
+			std::string Blob;
+			CompileCheckSqlToDnfPackedOrThrowImpl(TC.CheckSql, Blob);
+			AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, std::string("__CK__")));
+			AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, TC.CheckSql));
+			AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, std::move(Blob)));
+		}
+	}
+}
+
+void AlterTableAST::EmitBytecode(BytecodeScratch& Instructions) const {
+	Instruction Alter;
+	Alter.Opcode = Opcode::ALTER_TABLE;
+	if(Kind == AlterTableKind::AddColumn) {
+		BytecodeScratch Expanded;
+		EmitCodegenColumnConstraints(AddedColumn.Constraints, Expanded);
+		std::vector<Value> ExpandedOps;
+		for(const auto &Ix : Expanded) {
+			if(Ix.Opcode != Opcode::PUSH || Ix.Operands.size() != 1)
+				FailCodegen("Internal: malformed expanded ALTER constraints.");
+			ExpandedOps.push_back(Ix.Operands[0]);
+		}
+		if(ExpandedOps.empty() || ExpandedOps.size() < 2 ||
+		   !std::holds_alternative<int64_t>(ExpandedOps[0]))
+			FailCodegen("Internal: malformed ALTER constraint count encoding.");
+		Alter.Operands.push_back(static_cast<int64_t>(0));
+		Alter.Operands.push_back(TableName);
+		Alter.Operands.push_back(AddedColumn.Name);
+		Alter.Operands.push_back(AddedColumn.Type);
+		Alter.Operands.push_back(std::move(ExpandedOps[0]));
+		for(size_t Ei = 1; Ei < ExpandedOps.size(); ++Ei)
+			Alter.Operands.push_back(std::move(ExpandedOps[Ei]));
+	} else if(Kind == AlterTableKind::DropColumn) {
+		Alter.Operands.push_back(static_cast<int64_t>(1));
+		Alter.Operands.push_back(TableName);
+		Alter.Operands.push_back(DropColumnName);
+	} else {
+		Alter.Operands.push_back(static_cast<int64_t>(2));
+		Alter.Operands.push_back(TableName);
+		Alter.Operands.push_back(RenameFrom);
+		Alter.Operands.push_back(RenameTo);
+	}
+	Instructions.push_back(std::move(Alter));
+}
+
+void SavepointAST::EmitBytecode(BytecodeScratch& Instructions) const {
+	if(Kind == SavepointStmtKind::Set)
+		AppendInstruction(Instructions, MakeInstruction(Opcode::SAVEPOINT, Name));
+	else if(Kind == SavepointStmtKind::RollbackTo)
+		AppendInstruction(Instructions, MakeInstruction(Opcode::ROLLBACK_TO, Name));
+	else if(Kind == SavepointStmtKind::Release)
+		AppendInstruction(Instructions, MakeInstruction(Opcode::RELEASE_SAVEPOINT, Name));
+}
+
+void DataExchangeAST::EmitBytecode(BytecodeScratch& Instructions) const {
+	auto UpFmt = [](std::string V) -> std::string {
+		for(char &C : V)
+			C = static_cast<char>(std::toupper(static_cast<unsigned char>(C)));
+		return V;
+	};
+	if(Kind == DataExchangeKind::ExportDatabase)
+		AppendInstruction(Instructions,
+		                   MakeInstruction(Opcode::EXPORT_DATABASE, Path, UpFmt(Format)));
+	else if(Kind == DataExchangeKind::ImportDatabase)
+		AppendInstruction(Instructions,
+		                   MakeInstruction(Opcode::IMPORT_DATABASE, Path, UpFmt(Format)));
 	else
-		throw std::runtime_error("Unsupported binary operator: " + Op);
-	AppendInstruction(Code, MakeInstruction(OpCode));
-	return Code;
+		AppendInstruction(
+		    Instructions,
+		    MakeInstruction(Opcode::CONVERT_TABULAR_FILES, Path, DestPath, UpFmt(Format), UpFmt(DestFormat)));
 }
 
-Bytecode GrantAST::EmitBytecode() const {
-    Bytecode Code;
-    AppendInstruction(Code, MakeInstruction(Opcode::GRANT, Username, static_cast<int64_t>(Perms), TableName));
-    return Code;
+void SelectAST::EmitBytecode(BytecodeScratch& Instructions) const {
+	EmitRelationPipeline(Table_, "__AstralJoin_", Instructions);
+	EmitOrderingFinalize(Instructions);
 }
 
-Bytecode RevokeAST::EmitBytecode() const {
-    Bytecode Code;
-    AppendInstruction(Code, MakeInstruction(Opcode::REVOKE, UserName, static_cast<int64_t>(Perms), TableName));
-    return Code;
+void SelectAST::EmitBytecodeForScratchTable(const std::string &ScratchPhysicalName,
+                                             BytecodeScratch& Instructions) const {
+	EmitRelationPipeline(ScratchPhysicalName, "__AstralJoin_", Instructions);
+	EmitOrderingFinalize(Instructions);
 }
 
-Bytecode BuildBytecode(Logger* Logger) {
-    Bytecode Result;
-    int Counter = 0;
-    std::vector<Bytecode> BatchBytecodes;
-    std::vector<std::unique_ptr<ExpressionAST>> BatchAST;
-    for (auto &Statement : AST) {
-        if (Statement && Statement->Value) {
-            if(Logger) Logger->Info("Emitting bytecode for AST node");
-            Bytecode Dummy = Statement->Value->EmitBytecode();
-            for(auto &Inst : Dummy)
-                AppendInstruction(Result, Inst);
-            BatchBytecodes.push_back(Dummy);
-            BatchAST.push_back(std::move(Statement->Value));
-        }
-        if (Counter >= 35) {
-            if(Logger) Logger->Warn("Batching bytecode emission");
-            BPlusTree<Bytecode, std::unique_ptr<ExpressionAST>, 4, BytecodeComparator> Tree;
-            for(size_t i = 0; i < BatchBytecodes.size(); i++)
-                Tree.Insert(BatchBytecodes[i], std::move(BatchAST[i]));
-            std::vector<Bytecode> SortedBytecodes = Tree.GetAllKeys();
-            for(auto &BC : SortedBytecodes) {
-                for(auto &Inst : BC)
-                    AppendInstruction(Result, Inst);
-            }
-            BatchBytecodes.clear();
-            BatchAST.clear();
-            Counter = 0;
-        } else {
-            Counter++;
-        }
-    }
-    if(!BatchBytecodes.empty()) {
-        if(Logger) Logger->Warn("Final batch emission");
-        BPlusTree<Bytecode, std::unique_ptr<ExpressionAST>, 4, BytecodeComparator> Tree;
-        for(size_t i = 0; i < BatchBytecodes.size(); i++)
-            Tree.Insert(BatchBytecodes[i], std::move(BatchAST[i]));
-        std::vector<Bytecode> SortedBytecodes = Tree.GetAllKeys();
-        for(auto &BC : SortedBytecodes) {
-            for(auto &Inst : BC)
-                AppendInstruction(Result, Inst);
-        }
-    }
-    if(Logger) Logger->Info("Bytecode build complete");
-    return Result;
+namespace {
+
+Opcode SqlJoinToOpcode(SqlJoinKind K) {
+	switch(K) {
+	case SqlJoinKind::Inner:
+		return Opcode::INNER_JOIN;
+	case SqlJoinKind::Left:
+		return Opcode::LEFT_JOIN;
+	case SqlJoinKind::Right:
+		return Opcode::RIGHT_JOIN;
+	case SqlJoinKind::Full:
+		return Opcode::FULL_JOIN;
+	case SqlJoinKind::Cross:
+		return Opcode::CROSS_JOIN;
+	}
+	return Opcode::INNER_JOIN;
 }
+
+} // namespace
+
+void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const std::string &JoinDestPrefix,
+                                     BytecodeScratch &Instructions) const {
+	const auto &Grp = GroupKeys();
+	/** Fallback if parser lost \c AggMode but projection includes \c cnt with GROUP BY. */
+	const bool HeuristicAgg = !Grp.empty() &&
+	        std::find(Columns_.begin(), Columns_.end(), std::string("cnt")) != Columns_.end();
+	const bool AggCount = AggKind() == GroupAggMode::CountStar || AggKind() == GroupAggMode::CountDistinct ||
+	                      HeuristicAgg;
+	if(AggKind() == GroupAggMode::CountDistinct && !ComboAggs().empty())
+		FailCodegen("COUNT(DISTINCT column) cannot be combined with SUM/MIN/MAX/AVG in this dialect.");
+	if(AggKind() == GroupAggMode::CountDistinct && !CountDistinctColumn().has_value())
+		FailCodegen("Internal: COUNT(DISTINCT) missing column name.");
+	if(AggKind() == GroupAggMode::CountDistinct && Grp.empty())
+		FailCodegen("COUNT(DISTINCT column) requires a GROUP BY clause in this SQL dialect.");
+	if((AggKind() == GroupAggMode::CountStar || HeuristicAgg) && Grp.empty())
+		FailCodegen("COUNT(*) requires a GROUP BY clause in this SQL dialect.");
+	if(!ComboAggs().empty() && Grp.empty())
+		FailCodegen("SUM, MIN, MAX, and AVG require a GROUP BY clause when used in the SELECT list.");
+
+	std::string Work = ResolveRelationLogicalName(MaterializedTable, Instructions);
+	for(size_t Ij = 0; Ij < JoinSpecs().size(); ++Ij) {
+		const JoinClause &Jc = JoinSpecs()[Ij];
+		const std::string Dst = JoinDestPrefix + std::to_string(Ij);
+		Instruction Ji;
+		Ji.Opcode = SqlJoinToOpcode(Jc.Kind);
+		Ji.Operands.push_back(Dst);
+		Ji.Operands.push_back(Work);
+		Ji.Operands.push_back(ResolveRelationLogicalName(Jc.RightTable, Instructions));
+		Ji.Operands.push_back(static_cast<int64_t>(Jc.OnPairs.size()));
+		for(const auto &Pr : Jc.OnPairs) {
+			Ji.Operands.push_back(Pr.first);
+			Ji.Operands.push_back(Pr.second);
+		}
+		Instructions.push_back(std::move(Ji));
+		Work = Dst;
+	}
+
+	for(const auto &Column : Columns_)
+		AppendInstruction(Instructions, MakeInstruction(Opcode::SELECT, Column));
+	AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Work));
+
+	if(WhereRoot()) {
+		std::vector<std::vector<RowTriple>> Branches;
+		if(!BuildWhereDnf(WhereRoot(), Branches))
+			FailCodegen(
+			    "WHERE clause shape is not supported yet for this statement (predicate grammar extension required).");
+		Instructions.push_back(MakeFilterDnf(Branches));
+	}
+
+	if(DistinctSelected())
+		AppendInstruction(Instructions, MakeInstruction(Opcode::DEDUP_ROWS));
+
+	if(!Grp.empty()) {
+		Instruction G;
+		G.Opcode = Opcode::GROUP_BY;
+		const auto CountStarOutCol = [&]() -> std::string {
+			return CountAggregateOutputColumn().empty() ? std::string("cnt") : CountAggregateOutputColumn();
+		};
+		if(ComboAggs().empty()) {
+			if(AggKind() == GroupAggMode::CountDistinct) {
+				const int64_t kCountDistinctTag = 4;
+				G.Operands.push_back(kCountDistinctTag);
+				G.Operands.push_back(static_cast<int64_t>(Grp.size()));
+				for(const auto &Gc : Grp)
+					G.Operands.push_back(Gc);
+				G.Operands.push_back(*CountDistinctColumn());
+				G.Operands.push_back(CountStarOutCol());
+			} else {
+				G.Operands.push_back(static_cast<int64_t>(AggCount ? 1 : 0));
+				G.Operands.push_back(static_cast<int64_t>(Grp.size()));
+				for(const auto &Gc : Grp)
+					G.Operands.push_back(Gc);
+				if(AggCount)
+					G.Operands.push_back(CountStarOutCol());
+			}
+		} else {
+			const int64_t kMultiAggTag = 3;
+			G.Operands.push_back(kMultiAggTag);
+			G.Operands.push_back(static_cast<int64_t>(Grp.size()));
+			for(const auto &Gc : Grp)
+				G.Operands.push_back(Gc);
+			G.Operands.push_back(static_cast<int64_t>(AggCount ? 1LL : 0LL));
+			G.Operands.push_back(static_cast<int64_t>(ComboAggs().size()));
+			for(const auto &Ca : ComboAggs()) {
+				G.Operands.push_back(static_cast<int64_t>(Ca.Kind));
+				G.Operands.push_back(Ca.SourceColumn);
+				G.Operands.push_back(Ca.OutputColumn);
+			}
+			if(AggCount)
+				G.Operands.push_back(CountStarOutCol());
+		}
+		Instructions.push_back(std::move(G));
+	}
+
+	if(HavingRoot()) {
+		std::vector<std::vector<RowTriple>> HBranches;
+		auto NormHaving = NormalizeHavingExpr(HavingRoot(), *this);
+		if(!BuildWhereDnf(NormHaving.get(), HBranches))
+			FailCodegen(
+			    "HAVING clause shape is not supported yet for this statement (predicate grammar extension required).");
+		Instructions.push_back(MakeFilterDnf(HBranches));
+	}
+
+	if(RowNumberOrderSpec().has_value()) {
+		const auto &[OrdCol, Asc] = *RowNumberOrderSpec();
+		const auto &Pc = RowNumberPartitionByColumns();
+		if(Pc.size() > Limits::MaxWindowPartitionColumns)
+			FailCodegen("PARTITION BY column count exceeds AstralDB limit (Limits::MaxWindowPartitionColumns).");
+		Instruction WI;
+		WI.Opcode = Opcode::WINDOW_ROW_NUMBER;
+		WI.Operands.push_back(static_cast<int64_t>(Pc.size()));
+		for(const auto &K : Pc)
+			WI.Operands.push_back(K);
+		WI.Operands.push_back(OrdCol);
+		WI.Operands.push_back(static_cast<int64_t>(Asc ? 1 : 0));
+		WI.Operands.push_back(RowNumberOutColumn());
+		WI.Operands.push_back(static_cast<int64_t>(WindowOrdinalKind()));
+		Instructions.push_back(std::move(WI));
+	}
+
+	for(size_t Pi = 0; Pi < ProjectionExprs_.size(); ++Pi) {
+		const auto &Ptr = ProjectionExprs_[Pi];
+		if(!Ptr)
+			continue;
+		if(const auto *Ca = dynamic_cast<const CastExprAST *>(Ptr.get()))
+			EmitCastEvalInstruction(*Ca, Columns_[Pi], Instructions);
+		else if(const auto *Ce = dynamic_cast<const CaseExprAST *>(Ptr.get()))
+			EmitCaseEvalInstruction(*Ce, Columns_[Pi], Instructions);
+		else
+			FailCodegen("Internal: unsupported SELECT projection expression.");
+	}
 }
+
+void SelectAST::EmitOrderingFinalize(BytecodeScratch &Instructions) const {
+	for(const auto &[Column, Ascending] : OrderBySpecs()) {
+		AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, static_cast<int64_t>(Ascending ? 1 : 0)));
+		AppendInstruction(Instructions, MakeInstruction(Opcode::ORDER_BY, Column));
+	}
+
+	const int64_t Lim = SelectLimitValue();
+	const int64_t Off = SelectOffsetValue();
+	if(Off > 0 && Lim >= 0)
+		AppendInstruction(Instructions, MakeInstruction(Opcode::SLICE_RANGE, Off, Lim));
+	else if(Off > 0)
+		AppendInstruction(Instructions, MakeInstruction(Opcode::OFFSET, Off));
+	else if(Lim >= 0)
+		AppendInstruction(Instructions, MakeInstruction(Opcode::LIMIT, Lim));
+
+	AppendInstruction(Instructions, MakeInstruction(Opcode::SELECT, static_cast<int64_t>(Columns_.size())));
 }
+
+void CompoundSelectAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	if(Arms.size() < 2 || Ops.size() + 1 != Arms.size())
+		FailCodegen("Internal error: compound SELECT arm/operator mismatch.");
+
+	static std::atomic<uint64_t> BatchSeq{1};
+	const uint64_t Batch = BatchSeq.fetch_add(1, std::memory_order_relaxed);
+
+	const std::vector<std::string> &CanonCols = Arms[0]->ProjectionColumns();
+	const size_t NC = CanonCols.size();
+	if(NC == 0)
+		FailCodegen("UNION / INTERSECT / EXCEPT requires a non-empty SELECT list.");
+	for(const auto &A : Arms) {
+		if(A->ProjectionColumns().size() != NC)
+			FailCodegen("All SELECT arms in UNION / INTERSECT / EXCEPT must have the same number of columns.");
+		for(const auto &Cn : A->ProjectionColumns()) {
+			if(Cn == "*")
+				FailCodegen("SELECT * may not appear in UNION / INTERSECT / EXCEPT (name columns explicitly).");
+		}
+	}
+
+	auto ArmResultTableName = [](const SelectAST &Arm, const std::string &ScratchBase, const std::string &JPfx)
+	    -> std::string {
+		    if(Arm.JoinSpecs().empty())
+			    return ScratchBase;
+		    return JPfx + std::to_string(Arm.JoinSpecs().size() - 1);
+	    };
+
+	auto StashArm = [&](size_t Idx, std::string &OutStashName) {
+		const SelectAST &Arm = *Arms[Idx];
+		const std::string Scratch =
+		    std::string("__AstralCmp_") + std::to_string(Batch) + "_" + std::to_string(Idx) + "_src";
+		const std::string JPfx =
+		    std::string("__AstralCmp_") + std::to_string(Batch) + "_" + std::to_string(Idx) + "_J_";
+		AppendInstruction(Instructions,
+		                   MakeInstruction(Opcode::CLONE_TABLE, Scratch,
+		                                 ResolveRelationLogicalName(Arm.SourceTableName(), Instructions)));
+		Arm.EmitRelationPipeline(Scratch, JPfx, Instructions);
+		const std::string WorkTab = ArmResultTableName(Arm, Scratch, JPfx);
+		OutStashName = std::string("__AstralCmp_") + std::to_string(Batch) + "_" + std::to_string(Idx) + "_k";
+		AppendInstruction(Instructions, MakeInstruction(Opcode::CLONE_TABLE, OutStashName, WorkTab));
+	};
+
+	std::string Acc;
+	StashArm(0, Acc);
+
+	for(size_t OpIx = 0; OpIx < Ops.size(); ++OpIx) {
+		std::string Rstash;
+		StashArm(OpIx + 1, Rstash);
+		const std::string OutTab = std::string("__AstralCmp_") + std::to_string(Batch) + "_m_" + std::to_string(OpIx);
+
+		Instruction Comb;
+		Comb.Opcode = Opcode::SET_COMBINE;
+		Comb.Operands.push_back(OutTab);
+		Comb.Operands.push_back(Acc);
+		Comb.Operands.push_back(Rstash);
+		Comb.Operands.push_back(static_cast<int64_t>(Ops[OpIx]));
+		Comb.Operands.push_back(static_cast<int64_t>(NC));
+		for(size_t Ci = 0; Ci < NC; ++Ci)
+			Comb.Operands.push_back(CanonCols[Ci]);
+
+		const std::vector<std::string> &Lsrc =
+		    OpIx == 0 ? Arms[0]->ProjectionColumns() : CanonCols;
+		const std::vector<std::string> &Rsrc = Arms[OpIx + 1]->ProjectionColumns();
+
+		for(size_t Ci = 0; Ci < NC; ++Ci)
+			Comb.Operands.push_back(Lsrc[Ci]);
+		for(size_t Ci = 0; Ci < NC; ++Ci)
+			Comb.Operands.push_back(Rsrc[Ci]);
+		Instructions.push_back(std::move(Comb));
+		Acc = OutTab;
+	}
+
+	AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Acc));
+	for(const auto &[Column, Ascending] : OrderByColumns) {
+		AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, static_cast<int64_t>(Ascending ? 1 : 0)));
+		AppendInstruction(Instructions, MakeInstruction(Opcode::ORDER_BY, Column));
+	}
+	if(Offset > 0 && Limit >= 0)
+		AppendInstruction(Instructions, MakeInstruction(Opcode::SLICE_RANGE, Offset, Limit));
+	else if(Offset > 0)
+		AppendInstruction(Instructions, MakeInstruction(Opcode::OFFSET, Offset));
+	else if(Limit >= 0)
+		AppendInstruction(Instructions, MakeInstruction(Opcode::LIMIT, Limit));
+	AppendInstruction(Instructions, MakeInstruction(Opcode::SELECT, static_cast<int64_t>(NC)));
+}
+
+void WithSelectAST::EmitBytecode(BytecodeScratch& Instructions) const {
+	for(const auto &Ct : Clauses) {
+		AppendInstruction(Instructions,
+		                   MakeInstruction(Opcode::CLONE_TABLE, Ct.PhysicalTable,
+		                                 ResolveRelationLogicalName(Ct.Definition->SourceTableName(), Instructions)));
+		Ct.Definition->EmitBytecodeForScratchTable(Ct.PhysicalTable, Instructions);
+	}
+	if(Main)
+		Main->EmitBytecode(Instructions);
+}
+
+void InsertAST::EmitBytecode(BytecodeScratch& Instructions) const {
+	for(const auto &RowValue : Values) {
+		AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Table->TableName));
+		for(const auto &Column : Columns)
+			AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Column));
+		for(const auto &Val : RowValue)
+			AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Val));
+		const int64_t Explicit = Columns.empty() ? 0LL : 1LL;
+		AppendInstruction(Instructions,
+		                   MakeInstruction(Opcode::INSERT, static_cast<int64_t>(RowValue.size()), Explicit));
+	}
+}
+
+void BulkInsertAST::EmitBytecode(BytecodeScratch& Instructions) const {
+	if(Count <= 0)
+		FailCodegen("BULK INSERT row count must be a positive integer.");
+	if(static_cast<std::uint64_t>(Count) > Limits::MaxBulkInsertRows)
+		FailCodegen("BULK INSERT row count exceeds the configured maximum (see server limits).");
+	const bool Implicit = Columns.empty();
+	if(!Implicit && Columns.size() != 5)
+		FailCodegen("BULK INSERT with a column list must name exactly these columns: id, a, b, c, d.");
+	for(int64_t K = 0; K < Count; ++K) {
+		const int64_t RowId = StartId + K * Step;
+		const std::string IdStr = std::to_string(RowId);
+		std::vector<std::string> RowValues;
+		RowValues.push_back(IdStr);
+		RowValues.push_back(std::to_string(RowId % 997));
+		RowValues.push_back(std::string("txt_") + IdStr);
+		RowValues.push_back(std::string("chk_") + std::to_string(RowId % 71));
+		RowValues.push_back(std::string("e_") + std::to_string(RowId / 17));
+		AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, TableName));
+		if(!Implicit) {
+			for(const auto &Col : Columns)
+				AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Col));
+		}
+		for(const auto &Val : RowValues)
+			AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Val));
+		const int64_t Explicit = Implicit ? 0LL : 1LL;
+		AppendInstruction(Instructions,
+		                   MakeInstruction(Opcode::INSERT, static_cast<int64_t>(RowValues.size()), Explicit));
+	}
+}
+
+void UpdateAST::EmitBytecode(BytecodeScratch& Instructions) const {
+	std::vector<std::vector<RowTriple>> Branches;
+	if(Condition) {
+		if(!BuildWhereDnf(Condition.get(), Branches))
+			FailCodegen("Unsupported WHERE on UPDATE (extend SQLite-lite predicate grammar).");
+	} else
+		Branches.push_back({}); /* tautology: UPDATE all rows (consistent with DELETE without WHERE). */
+	Instructions.push_back(MakeUpdateDnf(TableName, Assignments, Branches));
+}
+
+void DeleteAST::EmitBytecode(BytecodeScratch& Instructions) const {
+	if(Condition) {
+		std::vector<std::vector<RowTriple>> Branches;
+		if(!BuildWhereDnf(Condition.get(), Branches))
+			FailCodegen("Unsupported WHERE on DELETE.");
+		Instructions.push_back(MakeDeleteDnf(TableName, Branches));
+		return;
+	}
+	AppendInstruction(Instructions, MakeInstruction(Opcode::DELETE, TableName));
+}
+
+void BinaryOpAST::EmitBytecode(BytecodeScratch& Instructions) const {
+	LHS->EmitBytecode(Instructions);
+	RHS->EmitBytecode(Instructions);
+	Opcode SqlOp;
+	if(Op == "+")
+		SqlOp = Opcode::ADD;
+	else if(Op == "-")
+		SqlOp = Opcode::SUB;
+	else if(Op == "*")
+		SqlOp = Opcode::MUL;
+	else if(Op == "/")
+		SqlOp = Opcode::DIV;
+	else if(Op == "%")
+		SqlOp = Opcode::MOD;
+	else if(Op == "==" || Op == "=")
+		SqlOp = Opcode::EQ;
+	else if(Op == "!=")
+		SqlOp = Opcode::NE;
+	else if(Op == "<")
+		SqlOp = Opcode::LT;
+	else if(Op == "<=")
+		SqlOp = Opcode::LE;
+	else if(Op == ">")
+		SqlOp = Opcode::GT;
+	else if(Op == ">=")
+		SqlOp = Opcode::GE;
+	else
+		FailCodegen("Unsupported binary operator: " + Op);
+	AppendInstruction(Instructions, MakeInstruction(SqlOp));
+}
+
+void FuncCallExprAST::EmitBytecode(BytecodeScratch &) const {
+	FailCodegen("Internal: aggregate call in HAVING should be lowered before bytecode emission.");
+}
+
+void GrantAST::EmitBytecode(BytecodeScratch& Instructions) const {
+	if(!Columns.empty()) {
+		for(const std::string &Col : Columns) {
+			AppendInstruction(Instructions,
+			                  MakeInstruction(Opcode::GRANT_COLUMN, Grantee, static_cast<int64_t>(Perms), TableName,
+			                                  Col, static_cast<int64_t>(GranteeIsRole ? 1 : 0)));
+		}
+		return;
+	}
+	AppendInstruction(Instructions,
+	                  MakeInstruction(Opcode::GRANT, Grantee, static_cast<int64_t>(Perms), TableName,
+	                                  static_cast<int64_t>(GranteeIsRole ? 1 : 0)));
+}
+
+void RevokeAST::EmitBytecode(BytecodeScratch& Instructions) const {
+	if(!Columns.empty()) {
+		for(const std::string &Col : Columns) {
+			AppendInstruction(Instructions,
+			                  MakeInstruction(Opcode::REVOKE_COLUMN, Grantee, static_cast<int64_t>(Perms), TableName,
+			                                  Col, static_cast<int64_t>(GranteeIsRole ? 1 : 0)));
+		}
+		return;
+	}
+	AppendInstruction(Instructions,
+	                  MakeInstruction(Opcode::REVOKE, Grantee, static_cast<int64_t>(Perms), TableName,
+	                                  static_cast<int64_t>(GranteeIsRole ? 1 : 0)));
+}
+
+void GrantRoleMembershipAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions, MakeInstruction(Opcode::GRANT_ROLE_MEMBERSHIP, RoleName, UserName));
+}
+
+void RevokeRoleMembershipAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions, MakeInstruction(Opcode::REVOKE_ROLE_MEMBERSHIP, RoleName, UserName));
+}
+
+void CreateRoleAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions, MakeInstruction(Opcode::CREATE_ROLE, RoleName));
+}
+
+void DropRoleAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions, MakeInstruction(Opcode::DROP_ROLE, RoleName));
+}
+
+void CreateViewAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	if(!dynamic_cast<const SelectAST *>(Definition_.get()))
+		FailCodegen("CREATE VIEW expects a plain SELECT definition.");
+	AppendInstruction(Instructions, MakeInstruction(Opcode::CREATE_VIEW, ViewName, BodySql_));
+}
+
+void DropViewAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions,
+	                  MakeInstruction(Opcode::DROP_VIEW, ViewName, static_cast<int64_t>(IfExists ? 1 : 0)));
+}
+
+Bytecode BuildBytecode(Logger *Logger, OptimizationLevel OptLevel, const AstralDB::Database *ViewCatalogDb) {
+	Bytecode Result;
+	std::unordered_map<std::string, std::string> LiveBodies;
+	if(ViewCatalogDb)
+		LiveBodies = ViewCatalogDb->ViewDefinitionsSnapshot();
+	std::unordered_map<std::string, const StatementAST *> SessionParsedBodies;
+	SqlViewCodegenState ViewCodegen;
+	ViewCodegen.LiveBodies = &LiveBodies;
+	ViewCodegen.SessionParsedBodies = &SessionParsedBodies;
+	ViewCodegen.ExpansionDepth = 0;
+	ViewCodegen.ScratchCounter = 0;
+	ViewCodegen.WalReparsedBodies.clear();
+	ScopedViewCodegen ViewGuard(&ViewCodegen);
+	AstralDB::ArenaAllocator Arena(Limits::SqlBytecodeArenaBytes);
+
+	for(auto &Statement : AST) {
+		if(Statement && Statement->Value) {
+			if(Logger)
+				Logger->Info("Emitting bytecode for AST node");
+			Arena.reset();
+			std::pmr::monotonic_buffer_resource Pool(
+			    Arena.data(), Arena.capacity(), std::pmr::new_delete_resource());
+			BytecodeScratchAlloc Alloc(&Pool);
+			BytecodeScratch Instructions(Alloc);
+			if(auto *Cv = dynamic_cast<CreateViewAST *>(Statement->Value.get())) {
+				Cv->EmitBytecode(Instructions);
+				LiveBodies[Cv->ViewName] = Cv->BodySql_;
+				SessionParsedBodies[Cv->ViewName] = Cv->Definition_.get();
+			} else if(auto *Dv = dynamic_cast<DropViewAST *>(Statement->Value.get())) {
+				Dv->EmitBytecode(Instructions);
+				LiveBodies.erase(Dv->ViewName);
+				SessionParsedBodies.erase(Dv->ViewName);
+				ViewCodegen.WalReparsedBodies.erase(Dv->ViewName);
+			} else
+				Statement->Value->EmitBytecode(Instructions);
+			for(auto &Inst : Instructions)
+				Result.push_back(std::move(Inst));
+		}
+	}
+
+	if(OptLevel != OptimizationLevel::None) {
+		if(Logger)
+			Logger->Info("Applying optimizations");
+
+		if(OptLevel >= OptimizationLevel::Basic) {
+			ConstantFoldingPass().Run(Result, Logger);
+			DeadCodeEliminationPass().Run(Result, Logger);
+		}
+
+		if(OptLevel >= OptimizationLevel::Advanced) {
+			InstructionCombiningPass().Run(Result, Logger);
+		}
+
+		if(OptLevel >= OptimizationLevel::Aggressive) {
+			RegisterAllocationPass().Run(Result, Logger);
+		}
+	}
+
+	if(Logger)
+		Logger->Info("Bytecode build complete with " + std::to_string(Result.size()) + " instructions");
+	return Result;
+}
+
+void CompileCheckSqlToDnfPackedOrThrow(std::string_view CheckBodySql, std::string &OutPackedBlob) {
+	CompileCheckSqlToDnfPackedOrThrowImpl(CheckBodySql, OutPackedBlob);
+}
+
+void DedupBytecodeStringImmediates(Bytecode &Code, std::vector<std::string> &PoolOut) {
+	PoolOut.clear();
+	std::unordered_map<std::string, size_t> Pos;
+	auto Intern = [&](const std::string &S) -> int64_t {
+		auto It = Pos.find(S);
+		if(It != Pos.end())
+			return static_cast<int64_t>(It->second);
+		const size_t Id = PoolOut.size();
+		PoolOut.push_back(S);
+		Pos.emplace(S, Id);
+		return static_cast<int64_t>(Id);
+	};
+
+	for(auto &Inst : Code) {
+		if(Inst.Opcode == Opcode::PUSH && Inst.Operands.size() == 1) {
+			if(auto *Sv = std::get_if<std::string>(&Inst.Operands[0])) {
+				const int64_t Idx = Intern(*Sv);
+				Inst.Opcode = Opcode::PUSH_POOL;
+				Inst.Operands[0] = Idx;
+				continue;
+			}
+		}
+	}
+}
+
+CompiledBytecode BuildCompiledBytecode(Logger *Logger, OptimizationLevel OptLevel,
+                                       const AstralDB::Database *ViewCatalogDb) {
+	CompiledBytecode Out;
+	Out.Instructions = BuildBytecode(Logger, OptLevel, ViewCatalogDb);
+	DedupBytecodeStringImmediates(Out.Instructions, Out.StringPool);
+	return Out;
+}
+
+} // namespace AstralDB::SQL

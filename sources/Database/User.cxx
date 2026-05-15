@@ -82,6 +82,9 @@ User::User(const std::string& Name, const std::string& Password, enum Permission
 	this->Password = EncryptedString(std::string_view(reinterpret_cast<const char*>(Encrypted.data()), Encrypted.size()));
 }
 
+User::User(std::string Name, EncryptedString PasswordField)
+	: Name(std::move(Name)), Password(std::move(PasswordField)) {}
+
 bool User::VerifyPassword(const std::string& Input) const {
 	auto Hashed = SaltAndHashPassword(Input);
 	std::vector<uint8_t> Encrypted;

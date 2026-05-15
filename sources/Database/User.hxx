@@ -33,10 +33,20 @@ struct User {
 
     User(const std::string &Password);
     User(const std::string& Name, const std::string& Password, enum Permissions Permissions);
+    /** Restore catalog row from persisted password field (no plaintext password). */
+    User(std::string Name, EncryptedString PasswordField);
+    User(const User& other)
+        : Name(other.Name), Password(other.Password), FineGrainedPermissions(other.FineGrainedPermissions) {}
+    User& operator=(const User& other) {
+        if(this != &other) {
+            Name = other.Name;
+            Password = other.Password;
+            FineGrainedPermissions = other.FineGrainedPermissions;
+        }
+        return *this;
+    }
     User(User&&) noexcept = default;
     User& operator=(User&&) noexcept = default;
-    User(const User&) = delete;
-    User& operator=(const User&) = delete;
 
     bool VerifyPassword(const std::string& Input) const;
 

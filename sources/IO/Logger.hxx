@@ -6,6 +6,7 @@
 #include <vector>
 #include <format>
 #include <chrono>
+#include <IO/Error.hxx>
 #include <IO/Spinlock.hxx>
 #if __cpp_lib_source_location
 #include <source_location>
@@ -66,7 +67,7 @@ inline void Logger::FlushBuffer() {
 inline Logger::Logger(const std::string &FilePath, bool Verbose) : Verbose_(Verbose) {
 	OutputStream_.open(FilePath, std::ios::app);
 	if (!OutputStream_) {
-		throw std::runtime_error("Failed to open log file");
+		throw std::runtime_error(Err::Prefixed("logging", "Cannot open log file for append: " + FilePath));
 	}
 }
 

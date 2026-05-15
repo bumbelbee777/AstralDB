@@ -28,12 +28,12 @@ ExpressionAST *HybridAST::Find(const KeyType &Key, size_t Depth) {
 	if(Depth < SwitchDepth && BPTreeRoot_) {
 		ValueType *Ptr = BPTreeRoot_->GetPointer(Key);
 		if(Ptr && Ptr->get())
-			return Ptr->get();
+			return dynamic_cast<ExpressionAST*>(Ptr->get());
 	}
 	if(RadixRoot_) {
 		auto Result = RadixRoot_->Find(Key);
 		if(Result)
-			return Result;
+			return dynamic_cast<ExpressionAST*>(Result);
 	}
 	return nullptr;
 }

@@ -1,25 +1,115 @@
 #pragma once
 
 #include <cstdint>
+#include <memory_resource>
 #include <vector>
 #include <string>
 #include <variant>
 #include <sstream>
 #include <iostream>
+#include <string_view>
+#include <unordered_map>
 #include <initializer_list>
 #include <utility>
 #include <concepts>
+#include <DS/BPlusTree.hxx>
+#include <DS/HashTable.hxx>
+#include <IO/Logger.hxx>
 
 namespace AstralDB {
+
+class Database;
+
 namespace SQL {
 enum class Opcode : uint8_t {
     SELECT, INSERT, UPDATE, DELETE, CREATE_TABLE, DROP_TABLE,
     SET, WHERE, ORDER_BY, GROUP_BY, LIMIT, OFFSET,
+    KEEP_ROWS, DEDUP_ROWS,
+    /** Operands: dst, lhs, rhs, mode (CompoundSetOpKind as int64), ncol, outCols..., lhsCols..., rhsCols... */
+    SET_COMBINE,
+    DELETE_MATCHING, UPDATE_MATCHING,
+    FILTER_DNF,
+    PUSH_POOL,
     AND, OR, NOT, EQ, NE, LT, LE, GT, GE,
     ADD, SUB, MUL, DIV, MOD,
     PUSH, POP, LOAD, STORE,
     CALL, RET, JMP, NOP, HALT,
-    GRANT, REVOKE // Permission management
+    GRANT, REVOKE,
+	CREATE_ROLE, DROP_ROLE, GRANT_ROLE_MEMBERSHIP, REVOKE_ROLE_MEMBERSHIP,
+	GRANT_COLUMN, REVOKE_COLUMN,
+
+    // Transaction control
+    BEGIN, COMMIT, ROLLBACK,
+    
+    // New opcodes for advanced features
+    // JOIN types
+    INNER_JOIN, LEFT_JOIN, RIGHT_JOIN, FULL_JOIN, CROSS_JOIN,
+    
+    // Advanced query features
+    WITH, // For CTEs
+    WINDOW, // For window functions
+    PARTITION_BY, // For window partitioning
+    OVER, // For window function context
+    
+    // String operations
+    CONCAT, SUBSTRING, TRIM, LTRIM, RTRIM,
+    UPPER, LOWER, REPLACE, REGEXP_MATCH,
+    
+    // Date/Time operations
+    DATE_ADD, DATE_SUB, DATE_DIFF,
+    EXTRACT_DATE, EXTRACT_TIME,
+    
+    // JSON operations
+    JSON_EXTRACT, JSON_CONTAINS, JSON_MERGE,
+    
+    // Full-text search
+    MATCH, AGAINST,
+    
+    // Advanced aggregations
+    ROLLUP, CUBE, GROUPING_SETS,
+    
+    // Subquery support
+    EXISTS, IN, ANY, ALL,
+    
+    // Advanced constraints
+    CHECK_CONSTRAINT, FOREIGN_KEY,
+    
+    // Index operations
+    CREATE_INDEX, DROP_INDEX,
+    
+    // View operations
+    CREATE_VIEW, DROP_VIEW,
+    
+    // Schema operations
+    CREATE_SCHEMA, DROP_SCHEMA, ALTER_SCHEMA,
+    
+    // Table operations
+    ALTER_TABLE, RENAME_TABLE,
+    
+    // Transaction control
+    SAVEPOINT, ROLLBACK_TO,
+    RELEASE_SAVEPOINT,
+    EXPORT_DATABASE,
+    IMPORT_DATABASE,
+    CONVERT_TABULAR_FILES,
+
+    /** Operand strings: dest name, source table (deep copy schema + rows). */
+    CLONE_TABLE,
+    /** Operands: PARTITION count (int64, 0=no partition), PARTITION col names..., ORDER BY col, asc (int64), out col name,
+     *  optional ordinal kind (int64: 0=\c ROW_NUMBER() , 1=\c RANK() , 2=\c DENSE_RANK() ; omitted = 0 for older bytecode).
+     *  Table taken from stack. */
+    WINDOW_ROW_NUMBER,
+    /** Operands: offset rows (int64), max rows (int64). Table on stack; applies OFFSET then LIMIT in one step. */
+    SLICE_RANGE,
+    /** Searched CASE on current row batch. Operand layout: output column name, arm count \e N (may be \c 0 for ELSE-only),
+     *  then \e N repetitions of (WHEN predicate as FILTER_Dnf-style packed blob string, THEN kind \e int64 , THEN payload string),
+     *  then ELSE kind \e int64 and ELSE payload string. THEN/ELSE kinds: 0=literal text, 1=copy from column named
+     *  by payload, 2=NULL, 3=no-ELSE sentinel (omit column / empty). Table name popped from stack, rows updated in-place,
+     *  table name pushed back. */
+    CASE_EVAL,
+    /** Four operands: output column name; source kind (0 literal, 1 column ref, 2 NULL); source payload string;
+     *  target tag (\c SqlCastTarget as \e int64 ). Table name popped from stack; rows updated in-place. */
+    CAST_EVAL,
 };
 
 using Value = std::variant<int64_t, double, std::string>;
@@ -28,15 +118,106 @@ struct Instruction {
     Opcode Opcode;
     std::vector<Value> Operands;
 
+    // Default constructor
+    constexpr Instruction() : Opcode(Opcode::NOP) {}
+
+    // Constructor with opcode and initializer list
     constexpr Instruction(enum Opcode Op, std::initializer_list<Value> Ops)
         : Opcode(Op), Operands(Ops) {}
 
     bool operator==(const Instruction &Other) const {
         return Opcode == Other.Opcode && Operands == Other.Operands;
     }
+
+    bool IsPure() const {
+        switch (Opcode) {
+            case Opcode::ADD:
+            case Opcode::SUB:
+            case Opcode::MUL:
+            case Opcode::DIV:
+            case Opcode::MOD:
+            case Opcode::AND:
+            case Opcode::OR:
+            case Opcode::NOT:
+            case Opcode::EQ:
+            case Opcode::NE:
+            case Opcode::LT:
+            case Opcode::LE:
+            case Opcode::GT:
+            case Opcode::GE:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    bool HasSideEffects() const {
+        switch (Opcode) {
+            case Opcode::CREATE_TABLE:
+            case Opcode::DROP_TABLE:
+            case Opcode::CREATE_VIEW:
+            case Opcode::DROP_VIEW:
+            case Opcode::INSERT:
+            case Opcode::DELETE:
+            case Opcode::UPDATE:
+            case Opcode::KEEP_ROWS:
+            case Opcode::FILTER_DNF:
+            case Opcode::DEDUP_ROWS:
+            case Opcode::DELETE_MATCHING:
+            case Opcode::UPDATE_MATCHING:
+            case Opcode::GRANT:
+            case Opcode::REVOKE:
+			case Opcode::CREATE_ROLE:
+			case Opcode::DROP_ROLE:
+			case Opcode::GRANT_ROLE_MEMBERSHIP:
+			case Opcode::REVOKE_ROLE_MEMBERSHIP:
+			case Opcode::GRANT_COLUMN:
+			case Opcode::REVOKE_COLUMN:
+            case Opcode::ALTER_TABLE:
+            case Opcode::SAVEPOINT:
+            case Opcode::ROLLBACK_TO:
+            case Opcode::RELEASE_SAVEPOINT:
+            case Opcode::EXPORT_DATABASE:
+            case Opcode::IMPORT_DATABASE:
+            case Opcode::CONVERT_TABULAR_FILES:
+            case Opcode::CLONE_TABLE:
+            case Opcode::SET_COMBINE:
+            case Opcode::GROUP_BY:
+            case Opcode::WINDOW_ROW_NUMBER:
+            case Opcode::SLICE_RANGE:
+            case Opcode::CASE_EVAL:
+            case Opcode::CAST_EVAL:
+            case Opcode::INNER_JOIN:
+            case Opcode::LEFT_JOIN:
+            case Opcode::RIGHT_JOIN:
+            case Opcode::FULL_JOIN:
+            case Opcode::CROSS_JOIN:
+                return true;
+            // Stack-machine immediates are consumed by later side-effecting ops; naive DCE must not drop them.
+            case Opcode::PUSH:
+            case Opcode::PUSH_POOL:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    bool IsTerminator() const {
+        switch (Opcode) {
+            case Opcode::HALT:
+            case Opcode::JMP:
+            case Opcode::RET:
+                return true;
+            default:
+                return false;
+        }
+    }
 };
 
 using Bytecode = std::vector<Instruction>;
+
+using BytecodeScratchAlloc = std::pmr::polymorphic_allocator<Instruction>;
+using BytecodeScratch = std::vector<Instruction, BytecodeScratchAlloc>;
 
 struct BytecodeComparator {
     bool operator()(const Bytecode &A, const Bytecode &B) const {
@@ -63,6 +244,10 @@ constexpr Instruction MakeInstruction(Opcode Op, Args&&... Operands) {
 }
 
 inline void AppendInstruction(Bytecode &Code, const Instruction &Inst) {
+    Code.push_back(Inst);
+}
+
+inline void AppendInstruction(BytecodeScratch &Code, const Instruction &Inst) {
     Code.push_back(Inst);
 }
 
@@ -99,6 +284,76 @@ inline std::ostream& operator<<(std::ostream& os, const Bytecode& bc) {
     }
     return os;
 }
+
+// Optimization flags
+enum class OptimizationLevel : uint8_t {
+    None = 0,
+    Basic = 1,    // Basic optimizations (constant folding, dead code elimination)
+    Advanced = 2, // Advanced optimizations (instruction combining, register allocation)
+    Aggressive = 3 // Aggressive optimizations (loop unrolling, instruction reordering)
+};
+
+// Basic block structure for control flow analysis
+struct BasicBlock {
+    size_t Start;
+    size_t End;
+    std::vector<size_t> Predecessors;
+    std::vector<size_t> Successors;
+    std::vector<Instruction> Instructions;
+};
+
+// Optimization pass interface
+class OptimizationPass {
+public:
+    virtual ~OptimizationPass() = default;
+    virtual bool Run(Bytecode& Code, Logger* Logger = nullptr) = 0;
+    virtual const char* GetName() const = 0;
+};
+
+// Constant folding optimization
+class ConstantFoldingPass : public OptimizationPass {
+public:
+    bool Run(Bytecode& Code, Logger* Logger = nullptr) override;
+    const char* GetName() const override { return "ConstantFolding"; }
+};
+
+// Dead code elimination
+class DeadCodeEliminationPass : public OptimizationPass {
+public:
+    bool Run(Bytecode& Code, Logger* Logger = nullptr) override;
+    const char* GetName() const override { return "DeadCodeElimination"; }
+};
+
+// Instruction combining
+class InstructionCombiningPass : public OptimizationPass {
+public:
+    bool Run(Bytecode& Code, Logger* Logger = nullptr) override;
+    const char* GetName() const override { return "InstructionCombining"; }
+};
+
+// Register allocation
+class RegisterAllocationPass : public OptimizationPass {
+public:
+    bool Run(Bytecode& Code, Logger* Logger = nullptr) override;
+    const char* GetName() const override { return "RegisterAllocation"; }
+};
+
+Bytecode BuildBytecode(Logger *Logger, OptimizationLevel OptLevel = OptimizationLevel::Basic,
+                       const Database *ViewCatalogDb = nullptr);
+
+struct CompiledBytecode {
+	Bytecode Instructions;
+	std::vector<std::string> StringPool;
+};
+
+void DedupBytecodeStringImmediates(Bytecode &Code, std::vector<std::string> &PoolOut);
+CompiledBytecode BuildCompiledBytecode(Logger *Logger, OptimizationLevel OptLevel = OptimizationLevel::Basic,
+                                       const Database *ViewCatalogDb = nullptr);
+
+/** Evaluate a packed FILTER_Dnf blob (Codegen::PackDnfOperandsBlob layout) against a row map. false if blob invalid. */
+bool EvaluatePackedWhereDnf(const Database *Db,
+                            const std::unordered_map<std::string, std::string> &Row,
+                            std::string_view PackedDnfBlob);
 
 } 
 }

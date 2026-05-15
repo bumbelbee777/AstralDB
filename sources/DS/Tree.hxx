@@ -38,9 +38,9 @@ public:
       : Nodes_(std::move(nodes)) {}
 
     Tree(Tree&& Other) noexcept {
-		Nodes_ = std::move(Other.Nodes_);
-		Compare_ = std::move(Other.Compare_);
-	}
+        Nodes_ = std::move(Other.Nodes_);
+        Compare_ = std::move(Other.Compare_);
+    }
 
     // Friend operator<< for pretty-print
     friend std::ostream& operator<<(std::ostream& os, const Tree<T,Compare>& tree) {
@@ -52,11 +52,9 @@ public:
 
     // Add a new root node
     void Add(const T& Value) {
-        std::cout << "[Tree::Add] Adding node (const T&). Current size: " << this->Size() << std::endl;
         Nodes_.push_back(std::make_unique<Node>(Value));
     }
     void Add(T&& Value) {
-        std::cout << "[Tree::Add] Adding node (T&&). Current size: " << this->Size() << std::endl;
         Nodes_.push_back(std::make_unique<Node>(std::move(Value)));
     }
 

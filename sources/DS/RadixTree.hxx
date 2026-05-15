@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <atomic>
+#include <functional>
 #include <mutex>
 
 namespace AstralDB {
@@ -14,14 +15,14 @@ namespace DS {
 // Platform-agnostic RCU tracker
 class RCUTracker {
 	std::atomic<size_t> GlobalEpoch_ {0};
-	std::mutex RetireMutex_;
+	AstralDB::Mutex RetireMutex_;
 	std::vector<std::pair<size_t, std::function<void()>>> Retired_;
 public:
 	static thread_local size_t LocalEpoch_;
 	void Enter() { LocalEpoch_ = GlobalEpoch_.load(std::memory_order_acquire); }
 	void Exit() { LocalEpoch_ = 0; }
 	void Synchronize() {
-		std::lock_guard<std::mutex> Lock(RetireMutex_);
+		std::lock_guard<AstralDB::Mutex> Lock(RetireMutex_);
 		// NOTE: This is a minimal, header-only, single-threaded-safe version.
 		for(auto It = Retired_.begin(); It != Retired_.end();) {
 			if(It->first <= LocalEpoch_) {
@@ -31,7 +32,7 @@ public:
 		}
 	}
 	void Retire(std::function<void()> Deleter) {
-		std::lock_guard<std::mutex> Lock(RetireMutex_);
+		std::lock_guard<AstralDB::Mutex> Lock(RetireMutex_);
 		Retired_.emplace_back(GlobalEpoch_.fetch_add(1, std::memory_order_acq_rel), std::move(Deleter));
 	}
 };
@@ -45,7 +46,7 @@ private:
 	std::vector<std::string> Edges_;
 	std::vector<NodePointer> Children_;
 	std::optional<ValueType> Value_;
-	mutable Spinlock Mutex_;
+	mutable AstralDB::Spinlock Mutex_;
 	static inline RCUTracker RCU_{};
 public:
 	RadixTree() = default;
@@ -146,7 +147,7 @@ public:
 	// Return the raw pointer type for unique_ptr values
 	using RawPtrType = typename std::pointer_traits<decltype(std::declval<ValueType>().get())>::element_type*;
 	RawPtrType Find(const KeyType& Key, size_t Depth = 0) const {
-		SpinlockGuard lock(Mutex_);
+		AstralDB::SpinlockGuard lock(Mutex_);
 		if (Depth == Key.size()) {
 			if (Value_) return Value_->get();
 			return nullptr;
@@ -168,7 +169,7 @@ public:
 	}
 
 	bool Remove(const KeyType& Key, size_t Depth = 0) {
-		SpinlockGuard lock(Mutex_);
+		AstralDB::SpinlockGuard lock(Mutex_);
 		if (Depth == Key.size()) {
 			if (Value_) {
 				Value_.reset();
@@ -199,7 +200,7 @@ public:
 	}
 
 	bool Empty() const {
-		SpinlockGuard lock(Mutex_);
+		AstralDB::SpinlockGuard lock(Mutex_);
 		return !Value_.has_value() && Children_.empty();
 	}
 

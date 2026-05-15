@@ -1,8 +1,8 @@
-# AstralDB Coding Style (C/C++)
+# Solstice Coding Style (C/C++)
 
 ## Overview
 
-AstralDB's coding style is oriented towards simplicity and efficiency. While being conscious of performance and security. Of course, balancing these requirements and demands isn't the most straightforward thing, hence why this piece of documentation outlines not just the coding style, but best practices when it comes to C/C++ code as well.
+Solstice's coding style is oriented towards simplicity and efficiency. While being conscious of performance and security. Of course, balancing these requirements and demands isn't the most straightforward thing, hence why this piece of documentation outlines not just the coding style, but best practices when it comes to C/C++ code as well.
 
 ## Styling
 
@@ -17,10 +17,10 @@ namespace Global {
 class Foo {
 	int HiddenVar;
 public:
-	Foo(int HiddenVar) : HiddenVar(HiddenVar) {} //This is a comment.
+	Foo(int HiddenVar) : HiddenVar(HiddenVar) {} // This is a comment.
 
-	/*Pretend this is a multi-line comment explaining some stuff
-	Lorem ipsum dolor sit amet...*/
+	/* Pretend this is a multi-line comment explaining some stuff
+	Lorem ipsum dolor sit amet... */
 	int Bar() {
 		if(HiddenVar > 0) return HiddenVar + 2;
 		else if(HiddenVar = 0) return HiddenVar - 2;
@@ -42,25 +42,25 @@ public:
 static constexpr int VERY_USEFUL_CONSTANT = 69420;
 
 class SomeClass {
-	int X_; //Good
-	int Y; //Bad
+	int X_; // Good
+	int Y; // Bad
 public:
 	SomeClass() = default;
 
-	int GetY() const { return X_; } //Bad
-	int X() const { return X_; } //Good
+	int GetY() const { return X_; } // Bad
+	int X() const { return X_; } // Good
 
 	void SetY(int NewY) const { Y = NewY; }
-	void SetX(int NewX) { X_ = X; } //Good
+	void SetX(int NewX) { X_ = X; } // Good
 };
 ```
 
 ## Language Features
 
-- Avoid raw pointers whenever possible, use Xenon abstractions like those found in `SafePointersNeStatus.hxx` (`UniquePointer<T>`, `SharedPointer<T>`, `SmartPointer<T>`, `WeakPointer<T>`) alongside built-in language features (`reinterpret_cast`, `const_cast`, `static_cast`, etc..) to work with pointers and memory in general.
-- Same goes with the preprocessor (outside of includes and simple definitions), for more complex or hacky things use C++ templates instead, which are more powerful and robust.
+- Avoid raw pointers whenever possible, use `std` abstractions (`UniquePointer<T>`, `SharedPointer<T>`, `SmartPointer<T>`, `WeakPointer<T>`) alongside built-in language features (`reinterpret_cast`, `const_cast`, `static_cast`, etc..) to work with pointers and memory in general.
+- Same goes with the preprocessor (outside of includes and simple definitions), for more complex or hacky things use C++ templates instead, which are far more powerful and robust.
 - Since we'll mostly be working in kernel-mode and generally low-level environments, use `NeStatus` for return environments in the kernel. For Xenon, use standard data types (`void`, `int`, `bool`, etc...).
-- Don't use exceptions except for user-space components, instead use assertions and error messages/panics if possible.
+- Minimize exceptions as much as possible; ideally avoid, instead use assertions and error messages if possible.
 - When working with pointers and references, **ALWAYS** make sure to clean up and/or dereference properly.
 
 ## Best Practices
