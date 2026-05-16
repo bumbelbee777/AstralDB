@@ -1,8 +1,8 @@
-# Solstice Coding Style (C/C++)
+# AstralDB Coding Style (C/C++)
 
 ## Overview
 
-Solstice's coding style is oriented towards simplicity and efficiency. While being conscious of performance and security. Of course, balancing these requirements and demands isn't the most straightforward thing, hence why this piece of documentation outlines not just the coding style, but best practices when it comes to C/C++ code as well.
+AstralDB's coding style is oriented towards simplicity and efficiency. While being conscious of performance and security. Of course, balancing these requirements and demands isn't the most straightforward thing, hence why this piece of documentation outlines not just the coding style, but best practices when it comes to C/C++ code as well.
 
 ## Styling
 

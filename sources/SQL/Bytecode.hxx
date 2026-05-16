@@ -28,6 +28,13 @@ enum class Opcode : uint8_t {
     /** Operands: dst, lhs, rhs, mode (CompoundSetOpKind as int64), ncol, outCols..., lhsCols..., rhsCols... */
     SET_COMBINE,
     DELETE_MATCHING, UPDATE_MATCHING,
+	/** Stack layout matches \c INSERT (table, optional col names, values). Operand tail after stack pop:
+	 *  \e K, Explicit, DoNothing (int64 0=DO UPDATE, 1=DO NOTHING), \e NConflict, conflict cols...,
+	 *  \e NSet, (col, fromExcluded int64, payload)* . */
+	UPSERT,
+	/** Operands: target table, source table, target key col, source key col, \e Nm, (tgtCol, fromSrc int64, payload)*,
+	 *  \e Ni, (insCol, fromSrc int64, payload)*. */
+	MERGE_INTO,
     FILTER_DNF,
     PUSH_POOL,
     AND, OR, NOT, EQ, NE, LT, LE, GT, GE,
@@ -95,9 +102,13 @@ enum class Opcode : uint8_t {
 
     /** Operand strings: dest name, source table (deep copy schema + rows). */
     CLONE_TABLE,
+	/** Operands: work_table, delta_table, max_iterations (int64), loop_start_ip (int64). Executes bytecode
+	 *  in \c [loop_start_ip, this instruction) repeatedly, appending only new row signatures from \c delta_table
+	 *  into \c work_table until no growth or \c max_iterations exceeded. */
+	RECURSIVE_CTE_FIXPOINT,
     /** Operands: PARTITION count (int64, 0=no partition), PARTITION col names..., ORDER BY col, asc (int64), out col name,
-     *  optional ordinal kind (int64: 0=\c ROW_NUMBER() , 1=\c RANK() , 2=\c DENSE_RANK() ; omitted = 0 for older bytecode).
-     *  Table taken from stack. */
+     *  kind (int64: 0–2 ordinals, 3–6 running SUM/MIN/MAX/AVG, 7–8 LAG/LEAD), source column, frame offset (int64).
+     *  Legacy layouts without kind/source/offset treat kind as \c ROW_NUMBER() . Table taken from stack. */
     WINDOW_ROW_NUMBER,
     /** Operands: offset rows (int64), max rows (int64). Table on stack; applies OFFSET then LIMIT in one step. */
     SLICE_RANGE,
@@ -110,6 +121,9 @@ enum class Opcode : uint8_t {
     /** Four operands: output column name; source kind (0 literal, 1 column ref, 2 NULL); source payload string;
      *  target tag (\c SqlCastTarget as \e int64 ). Table name popped from stack; rows updated in-place. */
     CAST_EVAL,
+    /** SELECT projection: operands are output column; \c ScalarSqlFn as \e int64 ; argc; then \e argc × (scalar kind,
+     *  payload) using the same scalar encoding as \c CAST_EVAL sources. Table popped/pushed like \c CAST_EVAL . */
+    SCALAR_FUNC_EVAL,
 };
 
 using Value = std::variant<int64_t, double, std::string>;
@@ -165,6 +179,8 @@ struct Instruction {
             case Opcode::DEDUP_ROWS:
             case Opcode::DELETE_MATCHING:
             case Opcode::UPDATE_MATCHING:
+			case Opcode::UPSERT:
+			case Opcode::MERGE_INTO:
             case Opcode::GRANT:
             case Opcode::REVOKE:
 			case Opcode::CREATE_ROLE:
@@ -181,13 +197,18 @@ struct Instruction {
             case Opcode::IMPORT_DATABASE:
             case Opcode::CONVERT_TABULAR_FILES:
             case Opcode::CLONE_TABLE:
+			case Opcode::RECURSIVE_CTE_FIXPOINT:
             case Opcode::SET_COMBINE:
-            case Opcode::GROUP_BY:
+			case Opcode::GROUP_BY:
+			case Opcode::ROLLUP:
+			case Opcode::CUBE:
+			case Opcode::GROUPING_SETS:
             case Opcode::WINDOW_ROW_NUMBER:
             case Opcode::SLICE_RANGE:
-            case Opcode::CASE_EVAL:
-            case Opcode::CAST_EVAL:
-            case Opcode::INNER_JOIN:
+			case Opcode::CASE_EVAL:
+			case Opcode::CAST_EVAL:
+			case Opcode::SCALAR_FUNC_EVAL:
+			case Opcode::INNER_JOIN:
             case Opcode::LEFT_JOIN:
             case Opcode::RIGHT_JOIN:
             case Opcode::FULL_JOIN:

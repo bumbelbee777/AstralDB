@@ -127,7 +127,7 @@ bool Parser::IsKeyword(const std::string &TokenValue) {
         "SELECT", "FROM", "WHERE", "GROUP", "BY", "ORDER", "HAVING", "AS",
         "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE",
         "CREATE", "TABLE", "DROP", "ALTER", "ADD", "COLUMN", "MODIFY", "RENAME",
-        "PRIMARY", "KEY", "FOREIGN", "REFERENCES", "UNIQUE",
+        "PRIMARY", "KEY", "FOREIGN", "REFERENCES", "UNIQUE", "CASCADE", "RESTRICT",
         "NOT", "NULL", "DEFAULT", "AUTO_INCREMENT", "CONSTRAINT", "CHECK",
         "BOOLEAN", "BOOL", "INT", "INTEGER", "BIGINT", "SMALLINT", "TEXT", "REAL", "DOUBLE", "FLOAT",
         "DECIMAL", "NUMERIC", "CHAR", "VARCHAR", "CHARACTER",
@@ -136,17 +136,23 @@ bool Parser::IsKeyword(const std::string &TokenValue) {
         "VIEW",
         "DISTINCT",
         "AND", "OR", "LIKE", "IN", "BETWEEN", "EXISTS",
-        "ASC", "DESC", "LIMIT", "OFFSET",
+        "ASC", "DESC", "LIMIT", "OFFSET", "FETCH", "FIRST", "ROWS", "ONLY",
         "BULK", "START", "STEP",
         "BEGIN", "COMMIT", "ROLLBACK", "TO",
         "GRANT", "REVOKE", "FROM", "ROLE", "TO",
         "IF", "EXISTS",
         "IS", "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME",
         "EXPORT", "IMPORT", "CONVERT", "DATABASE", "FORMAT", "FILE",
-        "WITH", "PARTITION", "ROW_NUMBER", "RANK", "DENSE_RANK", "OVER", "COUNT",
+        "WITH", "RECURSIVE", "UNION", "ALL", "INTERSECT", "EXCEPT",
+        "MERGE", "USING", "MATCHED", "CONFLICT", "DO", "NOTHING", "EXCLUDED",
+        "ROLLUP", "CUBE", "GROUPING", "SETS",
+        "PARTITION", "ROW_NUMBER", "RANK", "DENSE_RANK", "OVER", "LAG", "LEAD", "COUNT",
         "INNER", "LEFT", "RIGHT", "FULL", "OUTER", "CROSS", "JOIN", "ON",
         "SUM", "MIN", "MAX", "AVG",
-        "CASE", "WHEN", "THEN", "ELSE", "END", "CAST", "COALESCE"};
+        "CASE", "WHEN", "THEN", "ELSE", "END", "CAST", "COALESCE",
+        "SUBSTRING", "POSITION", "CHAR_LENGTH", "CHARACTER_LENGTH", "TRIM", "CONCAT", "EXTRACT",
+        "DATE_ADD", "DATE_SUB", "DATE_DIFF", "FOR", "BOTH", "LEADING", "TRAILING",
+        "YEAR", "MONTH", "DAY"};
     return Keywords.find(TokenValue) != Keywords.end();
 }
 
@@ -383,6 +389,10 @@ ASTNode Parser::ParsePrimary() {
         AdvanceToken();
         return std::make_unique<NullLiteralAST>();
     }
+    if(MatchKeyword("TRUE"))
+        return std::make_unique<BooleanLiteralAST>(true);
+    if(MatchKeyword("FALSE"))
+        return std::make_unique<BooleanLiteralAST>(false);
     if(CurrentToken()->Type == TokenType::IDENTIFIER) {
         std::unique_ptr<ExpressionAST> Col = std::make_unique<ColumnRefAST>(CurrentToken()->Value);
         AdvanceToken();
@@ -462,6 +472,10 @@ ASTNode Parser::ParseUnaryOrPostfixPredicate() {
         AdvanceToken();
         if(MatchKeyword("EXISTS"))
             return ParseExistsPredicate(true);
+        if(MatchKeyword("TRUE"))
+            return std::make_unique<BooleanLiteralAST>(false);
+        if(MatchKeyword("FALSE"))
+            return std::make_unique<BooleanLiteralAST>(true);
         CurrentIndex_ = Save;
     }
     auto Node = ParsePrimary();
@@ -804,14 +818,23 @@ TableConstraintDef Parser::ParseTableConstraint() {
 		if(!CurrentToken() || CurrentToken()->Value != "(")
 			ParseFail("Expected '(' after FOREIGN KEY");
 		AdvanceToken();
-		auto LC = CurrentToken();
-		if(!LC)
-			ParseFail("Expected FK column");
-		Def.Columns.push_back(LC->Value);
-		AdvanceToken();
-		if(!CurrentToken() || CurrentToken()->Value != ")")
-			ParseFail("Expected ')' after FK column list");
-		AdvanceToken();
+		while(auto LC = CurrentToken()) {
+			if(LC->Value == ")") {
+				AdvanceToken();
+				break;
+			}
+			if(LC->Value == ",") {
+				AdvanceToken();
+				continue;
+			}
+			if(LC->Type == TokenType::IDENTIFIER || LC->Type == TokenType::KEYWORD) {
+				Def.Columns.push_back(LC->Value);
+				AdvanceToken();
+			} else
+				ParseFail("Expected FK column name");
+		}
+		if(Def.Columns.empty())
+			ParseFail("FOREIGN KEY requires at least one column");
 		if(!MatchKeyword("REFERENCES"))
 			ParseFail("Expected REFERENCES");
 		auto RT = CurrentToken();
@@ -822,14 +845,35 @@ TableConstraintDef Parser::ParseTableConstraint() {
 		if(!CurrentToken() || CurrentToken()->Value != "(")
 			ParseFail("Expected '(' after REFERENCES table");
 		AdvanceToken();
-		auto Rpc = CurrentToken();
-		if(!Rpc || (Rpc->Type != TokenType::IDENTIFIER && Rpc->Type != TokenType::KEYWORD))
-			ParseFail("Expected referenced column");
-		Def.RefColumn = Rpc->Value;
-		AdvanceToken();
-		if(!CurrentToken() || CurrentToken()->Value != ")")
-			ParseFail("Expected ')' closing REFERENCES column");
-		AdvanceToken();
+		while(auto Rpc = CurrentToken()) {
+			if(Rpc->Value == ")") {
+				AdvanceToken();
+				break;
+			}
+			if(Rpc->Value == ",") {
+				AdvanceToken();
+				continue;
+			}
+			if(Rpc->Type == TokenType::IDENTIFIER || Rpc->Type == TokenType::KEYWORD) {
+				Def.RefColumns.push_back(Rpc->Value);
+				AdvanceToken();
+			} else
+				ParseFail("Expected referenced column name");
+		}
+		if(Def.RefColumns.empty())
+			ParseFail("REFERENCES requires at least one column");
+		if(MatchKeyword("ON")) {
+			if(!MatchKeyword("DELETE"))
+				ParseFail("Expected DELETE after ON");
+			if(MatchKeyword("CASCADE"))
+				Def.OnDeleteAction = 1;
+			else if(MatchKeyword("SET") && MatchKeyword("NULL"))
+				Def.OnDeleteAction = 2;
+			else if(MatchKeyword("RESTRICT") || MatchKeyword("NO"))
+				Def.OnDeleteAction = 0;
+			else
+				ParseFail("Expected CASCADE, SET NULL, or RESTRICT after ON DELETE");
+		}
 		Def.Kind = TableConstraintKind::ForeignKey;
 		return Def;
 	}
@@ -983,7 +1027,8 @@ ASTNode Parser::ParseDropStatement() {
         ParseFail("Expected table name after DROP TABLE.");
     std::string TableName = NameTok->Value;
     AdvanceToken();
-    return std::make_unique<DropAST>(TableName, IfExists);
+	bool Cascade = MatchKeyword("CASCADE");
+    return std::make_unique<DropAST>(TableName, IfExists, Cascade);
 }
 
 std::unique_ptr<SelectAST> Parser::ParseSelectArmThroughHaving() {
@@ -994,10 +1039,7 @@ std::unique_ptr<SelectAST> Parser::ParseSelectArmThroughHaving() {
     GroupAggMode AggMode = GroupAggMode::None;
     std::optional<std::string> CountDistinctCol;
     std::string CountOutputColumnForAst;
-    std::optional<std::pair<std::string, bool>> RowNumberOver;
-    std::vector<std::string> RowNumberPartitionCols;
-    std::string RowNumberOutputCol = "rn";
-    int WinOrdinalKind = 0;
+    std::vector<WindowSpec> WindowSpecs;
     auto FoldUpperAscii = [](std::string S) {
         for(char &C : S)
             C = static_cast<char>(std::toupper(static_cast<unsigned char>(C)));
@@ -1071,88 +1113,78 @@ std::unique_ptr<SelectAST> Parser::ParseSelectArmThroughHaving() {
         const bool LooksLikeRowNumber =
             (TokenOpt->Type == TokenType::KEYWORD && TokenOpt->Value == "ROW_NUMBER") ||
             (TokenOpt->Type == TokenType::IDENTIFIER && FoldUpperAscii(TokenOpt->Value) == "ROW_NUMBER");
-        if(LooksLikeDenseRank || LooksLikeRank || LooksLikeRowNumber) {
+        const bool LooksLikeLag =
+            (TokenOpt->Type == TokenType::KEYWORD && TokenOpt->Value == "LAG") ||
+            (TokenOpt->Type == TokenType::IDENTIFIER && FoldUpperAscii(TokenOpt->Value) == "LAG");
+        const bool LooksLikeLead =
+            (TokenOpt->Type == TokenType::KEYWORD && TokenOpt->Value == "LEAD") ||
+            (TokenOpt->Type == TokenType::IDENTIFIER && FoldUpperAscii(TokenOpt->Value) == "LEAD");
+        if(LooksLikeDenseRank || LooksLikeRank || LooksLikeRowNumber || LooksLikeLag || LooksLikeLead) {
+            WindowSpec Ws;
             if(LooksLikeDenseRank)
-                WinOrdinalKind = 2;
+                Ws.Kind = WindowFnKind::DenseRank;
             else if(LooksLikeRank)
-                WinOrdinalKind = 1;
+                Ws.Kind = WindowFnKind::Rank;
+            else if(LooksLikeRowNumber)
+                Ws.Kind = WindowFnKind::RowNumber;
+            else if(LooksLikeLag)
+                Ws.Kind = WindowFnKind::Lag;
             else
-                WinOrdinalKind = 0;
+                Ws.Kind = WindowFnKind::Lead;
             AdvanceToken();
             if(!CurrentToken() || CurrentToken()->Value != "(")
                 ParseFail("Expected '(' after window function name");
             AdvanceToken();
-            if(!CurrentToken() || CurrentToken()->Value != ")")
-                ParseFail("ROW_NUMBER/RANK/DENSE_RANK expect an empty argument list ()");
-            AdvanceToken();
-            if(!MatchKeyword("OVER"))
-                ParseFail("Expected OVER after window function()");
-            if(!CurrentToken() || CurrentToken()->Value != "(")
-                ParseFail("Expected '(' after OVER");
-            AdvanceToken();
-            if(MatchKeyword("PARTITION")) {
-                if(!MatchKeyword("BY"))
-                    ParseFail("Expected BY after PARTITION in window OVER clause");
-                RowNumberPartitionCols.clear();
-                std::unordered_set<std::string> PartSeen;
-                for(;;) {
-                    auto Pc = CurrentToken();
-                    if(!Pc || Pc->Type != TokenType::IDENTIFIER)
-                        ParseFail(
-                            "Expected PARTITION BY column (use a plain column name — reserved words belong in ORDER BY)");
-                    const std::string Pname = Pc->Value;
-                    if(PartSeen.count(Pname))
-                        ParseFail("Duplicate column \"" + Pname + "\" in PARTITION BY");
-                    if(RowNumberPartitionCols.size() >= Limits::MaxWindowPartitionColumns)
-                        ParseFail(
-                            "PARTITION BY column list exceeds the configured maximum "
-                            "(see Limits::MaxWindowPartitionColumns)");
-                    PartSeen.insert(Pname);
-                    RowNumberPartitionCols.push_back(Pname);
+            if(Ws.Kind == WindowFnKind::Lag || Ws.Kind == WindowFnKind::Lead) {
+                auto ColTk = CurrentToken();
+                if(!ColTk || ColTk->Type != TokenType::IDENTIFIER)
+                    ParseFail("LAG/LEAD expect a column name inside ()");
+                Ws.SourceColumn = ColTk->Value;
+                AdvanceToken();
+                Ws.FrameOffset = 1;
+                if(CurrentToken() && CurrentToken()->Value == ",") {
                     AdvanceToken();
-                    if(CurrentToken() && CurrentToken()->Value == ",") {
-                        AdvanceToken();
-                        continue;
+                    auto OffTk = CurrentToken();
+                    if(!OffTk || OffTk->Type != TokenType::LITERAL)
+                        ParseFail("LAG/LEAD offset must be a numeric literal");
+                    try {
+                        const long long Off = std::stoll(OffTk->Value);
+                        if(Off < 0)
+                            ParseFail("LAG/LEAD offset must be non-negative");
+                        Ws.FrameOffset = Off;
+                    } catch(...) {
+                        ParseFail("LAG/LEAD offset must be a numeric literal");
                     }
-                    break;
+                    AdvanceToken();
                 }
-                if(RowNumberPartitionCols.empty())
-                    ParseFail("PARTITION BY requires at least one column");
-            }
-            if(!MatchKeyword("ORDER"))
-                ParseFail(
-                    RowNumberPartitionCols.empty() ?
-                        "WINDOW requires ORDER BY after OVER (" :
-                        "WINDOW requires ORDER BY after PARTITION BY (only PARTITION BY without ORDER BY is invalid)");
-            if(!MatchKeyword("BY"))
-                ParseFail("WINDOW requires ORDER BY");
-            auto OCol = CurrentToken();
-            if(!OCol)
-                ParseFail("Expected column after ORDER BY in window");
-            const std::string OrderCol = OCol->Value;
-            AdvanceToken();
-            bool Asc = true;
-            if(auto Ot = CurrentToken(); Ot && Ot->Value == "ASC") {
-                Asc = true;
-                AdvanceToken();
-            } else if(Ot && Ot->Value == "DESC") {
-                Asc = false;
-                AdvanceToken();
-            }
+            } else if(!CurrentToken() || CurrentToken()->Value != ")")
+                ParseFail("ROW_NUMBER/RANK/DENSE_RANK expect an empty argument list ()");
             if(!CurrentToken() || CurrentToken()->Value != ")")
-                ParseFail("Expected ')' closing OVER clause");
+                ParseFail("Expected ')' after window function arguments");
             AdvanceToken();
-            if(RowNumberOver.has_value())
-                ParseFail("Multiple ROW_NUMBER/RANK/DENSE_RANK expressions are not supported");
-            RowNumberOver = std::make_pair(OrderCol, Asc);
+            ParseWindowOverClause(Ws);
+            std::string OutCol =
+                Ws.Kind == WindowFnKind::RowNumber ?
+                    std::string("rn") :
+                Ws.Kind == WindowFnKind::Rank ?
+                    std::string("rk") :
+                Ws.Kind == WindowFnKind::DenseRank ?
+                    std::string("dr") :
+                Ws.Kind == WindowFnKind::Lag ?
+                    std::string("lag_") + Ws.SourceColumn :
+                    std::string("lead_") + Ws.SourceColumn;
             if(MatchKeyword("AS")) {
                 auto At = CurrentToken();
                 if(!At)
                     ParseFail("Expected alias after AS for window function");
-                RowNumberOutputCol = At->Value;
+                OutCol = At->Value;
                 AdvanceToken();
             }
-            Columns.push_back(RowNumberOutputCol);
+            Ws.OutputColumn = OutCol;
+            if(WindowSpecs.size() >= Limits::MaxWindowFunctionsPerSelect)
+                ParseFail("Too many window functions in one SELECT (see Limits::MaxWindowFunctionsPerSelect).");
+            WindowSpecs.push_back(std::move(Ws));
+            Columns.push_back(OutCol);
             ProjectionExprs.push_back(nullptr);
             if(auto NextToken = CurrentToken(); NextToken && NextToken->Value == ",")
                 AdvanceToken();
@@ -1203,6 +1235,33 @@ std::unique_ptr<SelectAST> Parser::ParseSelectArmThroughHaving() {
                 AdvanceToken();
             continue;
         }
+        if(MatchKeyword("GROUPING")) {
+            if(!CurrentToken() || CurrentToken()->Value != "(")
+                ParseFail("Expected '(' after GROUPING");
+            AdvanceToken();
+            auto ColTk = CurrentToken();
+            if(!ColTk || ColTk->Type != TokenType::IDENTIFIER)
+                ParseFail("Expected column name in GROUPING(...)");
+            const std::string GCol = ColTk->Value;
+            AdvanceToken();
+            if(!CurrentToken() || CurrentToken()->Value != ")")
+                ParseFail("Expected ')' after GROUPING column");
+            AdvanceToken();
+            std::string Alias;
+            if(MatchKeyword("AS")) {
+                auto At = CurrentToken();
+                if(!At || At->Type != TokenType::IDENTIFIER)
+                    ParseFail("Expected identifier alias after AS for GROUPING");
+                Alias = At->Value;
+                AdvanceToken();
+            } else
+                Alias = std::string("_grouping_") + GCol;
+            Columns.push_back(std::move(Alias));
+            ProjectionExprs.push_back(std::make_unique<GroupingExprAST>(std::move(GCol)));
+            if(auto NextToken = CurrentToken(); NextToken && NextToken->Value == ",")
+                AdvanceToken();
+            continue;
+        }
         if(MatchKeyword("COALESCE")) {
             auto Ce = ParseCoalesceExpression();
             std::string Alias;
@@ -1216,6 +1275,22 @@ std::unique_ptr<SelectAST> Parser::ParseSelectArmThroughHaving() {
                 Alias = std::string("_coalesce") + std::to_string(NextAnonCoalesceAlias_++);
             Columns.push_back(std::move(Alias));
             ProjectionExprs.push_back(std::unique_ptr<ExpressionAST>(static_cast<ExpressionAST *>(Ce.release())));
+            if(auto NextToken = CurrentToken(); NextToken && NextToken->Value == ",")
+                AdvanceToken();
+            continue;
+        }
+        if(auto Sfb = TryParseScalarSqlBuiltinSelectExpr()) {
+            std::string Alias;
+            if(MatchKeyword("AS")) {
+                auto At = CurrentToken();
+                if(!At || At->Type != TokenType::IDENTIFIER)
+                    ParseFail("Expected identifier alias after AS for scalar function");
+                Alias = At->Value;
+                AdvanceToken();
+            } else
+                Alias = std::string("_sqlfn") + std::to_string(NextAnonScalarSqlFnAlias_++);
+            Columns.push_back(std::move(Alias));
+            ProjectionExprs.push_back(std::unique_ptr<ExpressionAST>(static_cast<ExpressionAST *>(Sfb.release())));
             if(auto NextToken = CurrentToken(); NextToken && NextToken->Value == ",")
                 AdvanceToken();
             continue;
@@ -1258,6 +1333,32 @@ std::unique_ptr<SelectAST> Parser::ParseSelectArmThroughHaving() {
                 Ak == GroupCombAggKind::Min ?
                     std::string("min_") + SrcCol :
                 Ak == GroupCombAggKind::Max ? std::string("max_") + SrcCol : std::string("avg_") + SrcCol;
+            if(CurrentToken() && CurrentToken()->Type == TokenType::KEYWORD && CurrentToken()->Value == "OVER") {
+                WindowSpec Ws;
+                Ws.Kind = Ak == GroupCombAggKind::Sum ?
+                              WindowFnKind::Sum :
+                          Ak == GroupCombAggKind::Min ?
+                              WindowFnKind::Min :
+                          Ak == GroupCombAggKind::Max ? WindowFnKind::Max : WindowFnKind::Avg;
+                Ws.SourceColumn = SrcCol;
+                ParseWindowOverClause(Ws);
+                if(MatchKeyword("AS")) {
+                    auto AliasTok = CurrentToken();
+                    if(!AliasTok)
+                        ParseFail("Expected alias after AS for window aggregate");
+                    OutCol = AliasTok->Value;
+                    AdvanceToken();
+                }
+                Ws.OutputColumn = OutCol;
+                if(WindowSpecs.size() >= Limits::MaxWindowFunctionsPerSelect)
+                    ParseFail("Too many window functions in one SELECT (see Limits::MaxWindowFunctionsPerSelect).");
+                WindowSpecs.push_back(std::move(Ws));
+                Columns.push_back(OutCol);
+                ProjectionExprs.push_back(nullptr);
+                if(auto NextToken = CurrentToken(); NextToken && NextToken->Value == ",")
+                    AdvanceToken();
+                continue;
+            }
             if(MatchKeyword("AS")) {
                 auto AliasTok = CurrentToken();
                 if(!AliasTok)
@@ -1430,13 +1531,16 @@ std::unique_ptr<SelectAST> Parser::ParseSelectArmThroughHaving() {
                 Node ? std::unique_ptr<ExpressionAST>(static_cast<ExpressionAST*>(Node.release())) : nullptr;
         }
         std::vector<std::string> GroupByCols;
+        std::vector<std::vector<std::string>> GroupingSetsList;
+        GroupOlapModifier OlapMod = GroupOlapModifier::None;
         if(auto Gt = CurrentToken(); Gt && Gt->Value == "GROUP") {
             AdvanceToken();
             if(!MatchKeyword("BY"))
                 ParseFail("Expected BY after GROUP");
             while(auto ColTk = CurrentToken()) {
-                if(ColTk->Value == "ORDER" || ColTk->Value == "LIMIT" || ColTk->Value == "HAVING" ||
-                   ColTk->Value == "UNION" || ColTk->Value == "INTERSECT" || ColTk->Value == "EXCEPT")
+                if(ColTk->Value == "GROUPING" || ColTk->Value == "ORDER" || ColTk->Value == "LIMIT" ||
+                   ColTk->Value == "HAVING" || ColTk->Value == "UNION" || ColTk->Value == "INTERSECT" ||
+                   ColTk->Value == "EXCEPT" || ColTk->Value == "WITH")
                     break;
                 if(ColTk->Type != TokenType::IDENTIFIER && ColTk->Type != TokenType::KEYWORD)
                     ParseFail("GROUP BY expects a column name");
@@ -1456,7 +1560,72 @@ std::unique_ptr<SelectAST> Parser::ParseSelectArmThroughHaving() {
                 else
                     break;
             }
+            if(MatchKeyword("GROUPING")) {
+                if(!MatchKeyword("SETS"))
+                    ParseFail("Expected SETS after GROUPING");
+                OlapMod = GroupOlapModifier::GroupingSets;
+            }
+            if(OlapMod == GroupOlapModifier::GroupingSets) {
+                if(!CurrentToken() || CurrentToken()->Value != "(")
+                    ParseFail("GROUPING SETS expects '(' after SETS");
+                AdvanceToken();
+                for(;;) {
+                    if(!CurrentToken() || CurrentToken()->Value != "(")
+                        ParseFail("GROUPING SETS expects '(' before each grouping set");
+                    AdvanceToken();
+                    std::vector<std::string> OneSet;
+                    while(auto ColTk = CurrentToken()) {
+                        if(ColTk->Value == ")") {
+                            AdvanceToken();
+                            break;
+                        }
+                        if(ColTk->Type != TokenType::IDENTIFIER && ColTk->Type != TokenType::KEYWORD)
+                            ParseFail("GROUPING SETS expects column names");
+                        std::string GKey = ColTk->Value;
+                        AdvanceToken();
+                        if(CurrentToken() && CurrentToken()->Value == ".") {
+                            AdvanceToken();
+                            auto Id2 = CurrentToken();
+                            if(!Id2 || Id2->Type != TokenType::IDENTIFIER)
+                                ParseFail("Expected column name after '.' in GROUPING SETS");
+                            GKey = Id2->Value;
+                            AdvanceToken();
+                        }
+                        OneSet.push_back(std::move(GKey));
+                        if(CurrentToken() && CurrentToken()->Value == ",")
+                            AdvanceToken();
+                    }
+                    GroupingSetsList.push_back(std::move(OneSet));
+                    if(CurrentToken() && CurrentToken()->Value == ",") {
+                        AdvanceToken();
+                        continue;
+                    }
+                    break;
+                }
+                if(!CurrentToken() || CurrentToken()->Value != ")")
+                    ParseFail("GROUPING SETS expects ')' after grouping set list");
+                AdvanceToken();
+            } else if(MatchKeyword("WITH")) {
+                if(MatchKeyword("ROLLUP"))
+                    OlapMod = GroupOlapModifier::Rollup;
+                else if(MatchKeyword("CUBE"))
+                    OlapMod = GroupOlapModifier::Cube;
+                else
+                    ParseFail("GROUP BY WITH expects ROLLUP or CUBE");
+            }
         }
+        if(OlapMod == GroupOlapModifier::GroupingSets && GroupByCols.empty()) {
+            for(const auto &S : GroupingSetsList) {
+                for(const auto &C : S) {
+                    if(std::find(GroupByCols.begin(), GroupByCols.end(), C) == GroupByCols.end())
+                        GroupByCols.push_back(C);
+                }
+            }
+        }
+        if(OlapMod != GroupOlapModifier::None && GroupByCols.empty())
+            ParseFail("ROLLUP, CUBE, and GROUPING SETS require at least one GROUP BY column");
+        if(OlapMod != GroupOlapModifier::None && AggMode == GroupAggMode::CountDistinct)
+            ParseFail("COUNT(DISTINCT) cannot be combined with ROLLUP, CUBE, or GROUPING SETS in this dialect");
         std::unique_ptr<ExpressionAST> HavingClause;
         if(auto Ht = CurrentToken(); Ht && Ht->Value == "HAVING") {
             AdvanceToken();
@@ -1478,10 +1647,66 @@ std::unique_ptr<SelectAST> Parser::ParseSelectArmThroughHaving() {
         return std::make_unique<SelectAST>(
             Columns, TableName, std::move(WhereClause), std::move(HavingClause),
             std::vector<std::pair<std::string, bool>>{}, -1, 0, Distinct, std::move(GroupByCols), AggMode,
-            CountDistinctCol, RowNumberOver, std::move(RowNumberPartitionCols), RowNumberOutputCol, WinOrdinalKind,
-            std::move(Joins), std::move(CombinedAggs), std::move(ProjectionExprs), CountColArg);
+            CountDistinctCol, std::move(WindowSpecs), std::move(Joins), std::move(CombinedAggs),
+            std::move(ProjectionExprs), CountColArg, OlapMod, std::move(GroupingSetsList));
     }
     ParseFail("Expected table name after FROM");
+}
+
+std::unique_ptr<ExpressionAST> Parser::ParseSetValueExpression(const std::optional<std::string> &TargetAlias,
+                                                             const std::optional<std::string> &SourceAlias,
+                                                             bool AllowExcluded) {
+    auto ParsePrimarySet = [&]() -> std::unique_ptr<ExpressionAST> {
+        if(MatchKeyword("NULL"))
+            return std::make_unique<NullLiteralAST>();
+        auto T = CurrentToken();
+        if(!T)
+            ParseFail("Unexpected end of input in SET expression");
+        if(T->Type == TokenType::IDENTIFIER ||
+           (AllowExcluded && T->Type == TokenType::KEYWORD && T->Value == "EXCLUDED")) {
+            std::string First = T->Value;
+            AdvanceToken();
+            if(AllowExcluded && First == "EXCLUDED" && CurrentToken() && CurrentToken()->Value == ".") {
+                AdvanceToken();
+                auto C = CurrentToken();
+                if(!C || C->Type != TokenType::IDENTIFIER)
+                    ParseFail("Expected column after EXCLUDED.");
+                std::string Col = C->Value;
+                AdvanceToken();
+                return std::make_unique<QualifiedRefAST>(QualifiedRefAST::Role::Excluded, std::move(Col));
+            }
+            if(CurrentToken() && CurrentToken()->Value == ".") {
+                AdvanceToken();
+                auto C = CurrentToken();
+                if(!C || C->Type != TokenType::IDENTIFIER)
+                    ParseFail("Expected column after '.' in SET expression.");
+                std::string Col = C->Value;
+                AdvanceToken();
+                if(SourceAlias && First == *SourceAlias)
+                    return std::make_unique<QualifiedRefAST>(QualifiedRefAST::Role::Source, std::move(Col));
+                if(TargetAlias && First == *TargetAlias)
+                    return std::make_unique<QualifiedRefAST>(QualifiedRefAST::Role::Target, std::move(Col));
+                ParseFail("Unknown table alias in SET expression.");
+            }
+            if(!TargetAlias && !SourceAlias)
+                return std::make_unique<ColumnRefAST>(std::move(First));
+            return std::make_unique<LiteralAST>(std::move(First));
+        }
+        std::string Lit = T->Value;
+        AdvanceToken();
+        return std::make_unique<LiteralAST>(std::move(Lit));
+    };
+
+    auto LHS = ParsePrimarySet();
+    while(auto Nxt = CurrentToken()) {
+        if(Nxt->Value != "+" && Nxt->Value != "-" && Nxt->Value != "*" && Nxt->Value != "/")
+            break;
+        std::string Op = Nxt->Value;
+        AdvanceToken();
+        auto RHS = ParsePrimarySet();
+        LHS = std::make_unique<BinaryOpAST>(std::move(LHS), std::move(Op), std::move(RHS));
+    }
+    return LHS;
 }
 
 std::unique_ptr<ExpressionAST> Parser::ParseCaseScalarResult() {
@@ -1561,6 +1786,153 @@ std::unique_ptr<CaseExprAST> Parser::ParseCoalesceExpression() {
 	return std::make_unique<CaseExprAST>(std::move(Arms), std::move(ElseE));
 }
 
+std::unique_ptr<ScalarFuncExprAST> Parser::TryParseScalarSqlBuiltinSelectExpr() {
+	auto T = CurrentToken();
+	if(!T || (T->Type != TokenType::KEYWORD && T->Type != TokenType::IDENTIFIER))
+		return nullptr;
+	std::string Name = T->Value;
+	for(char &C : Name)
+		C = static_cast<char>(std::toupper(static_cast<unsigned char>(C)));
+	{
+		const size_t Save = CurrentIndex_;
+		AdvanceToken();
+		const bool Ok = CurrentToken() && CurrentToken()->Value == "(";
+		CurrentIndex_ = Save;
+		if(!Ok)
+			return nullptr;
+	}
+	static const std::unordered_set<std::string> Starters = {"SUBSTRING", "UPPER", "LOWER", "CHAR_LENGTH",
+	    "CHARACTER_LENGTH", "POSITION", "TRIM", "CONCAT", "EXTRACT", "DATE_ADD", "DATE_SUB", "DATE_DIFF"};
+	if(!Starters.count(Name))
+		return nullptr;
+	AdvanceToken();
+	if(!CurrentToken() || CurrentToken()->Value != "(")
+		ParseFail("Expected '(' after " + Name);
+	AdvanceToken();
+
+	auto FinishClose = [&]() {
+		if(!CurrentToken() || CurrentToken()->Value != ")")
+			ParseFail("Expected ')' closing scalar function call");
+		AdvanceToken();
+	};
+
+	std::vector<std::unique_ptr<ExpressionAST>> Args;
+
+	if(Name == "UPPER" || Name == "LOWER" || Name == "CHAR_LENGTH" || Name == "CHARACTER_LENGTH") {
+		Args.push_back(ParseCaseScalarResult());
+		ScalarSqlFn K = ScalarSqlFn::Upper;
+		if(Name == "LOWER")
+			K = ScalarSqlFn::Lower;
+		else if(Name == "CHAR_LENGTH" || Name == "CHARACTER_LENGTH")
+			K = ScalarSqlFn::CharLength;
+		FinishClose();
+		return std::make_unique<ScalarFuncExprAST>(K, std::move(Args));
+	}
+	if(Name == "SUBSTRING") {
+		Args.push_back(ParseCaseScalarResult());
+		if(MatchKeyword("FROM")) {
+			Args.push_back(ParseCaseScalarResult());
+			if(MatchKeyword("FOR"))
+				Args.push_back(ParseCaseScalarResult());
+		} else {
+			if(!CurrentToken() || CurrentToken()->Value != ",")
+				ParseFail("SUBSTRING expects FROM … FOR … or comma-separated arguments");
+			AdvanceToken();
+			Args.push_back(ParseCaseScalarResult());
+			if(!CurrentToken() || CurrentToken()->Value != ",")
+				ParseFail("SUBSTRING comma form requires three arguments");
+			AdvanceToken();
+			Args.push_back(ParseCaseScalarResult());
+		}
+		FinishClose();
+		return std::make_unique<ScalarFuncExprAST>(ScalarSqlFn::SubstringFromFor, std::move(Args));
+	}
+	if(Name == "POSITION") {
+		Args.push_back(ParseCaseScalarResult());
+		if(!MatchKeyword("IN"))
+			ParseFail("POSITION requires IN between search string and source string");
+		Args.push_back(ParseCaseScalarResult());
+		FinishClose();
+		return std::make_unique<ScalarFuncExprAST>(ScalarSqlFn::PositionIn, std::move(Args));
+	}
+	if(Name == "TRIM") {
+		ScalarSqlFn Tk = ScalarSqlFn::TrimBoth;
+		if(MatchKeyword("LEADING")) {
+			Tk = ScalarSqlFn::TrimLeading;
+			if(!MatchKeyword("FROM"))
+				ParseFail("TRIM LEADING requires FROM");
+			Args.push_back(ParseCaseScalarResult());
+		} else if(MatchKeyword("TRAILING")) {
+			Tk = ScalarSqlFn::TrimTrailing;
+			if(!MatchKeyword("FROM"))
+				ParseFail("TRIM TRAILING requires FROM");
+			Args.push_back(ParseCaseScalarResult());
+		} else if(MatchKeyword("BOTH")) {
+			if(!MatchKeyword("FROM"))
+				ParseFail("TRIM BOTH requires FROM");
+			Args.push_back(ParseCaseScalarResult());
+		} else
+			Args.push_back(ParseCaseScalarResult());
+		FinishClose();
+		return std::make_unique<ScalarFuncExprAST>(Tk, std::move(Args));
+	}
+	if(Name == "CONCAT") {
+		Args.push_back(ParseCaseScalarResult());
+		while(CurrentToken() && CurrentToken()->Value == ",") {
+			AdvanceToken();
+			Args.push_back(ParseCaseScalarResult());
+		}
+		if(Args.size() < 2)
+			ParseFail("CONCAT expects at least two arguments");
+		FinishClose();
+		return std::make_unique<ScalarFuncExprAST>(ScalarSqlFn::ConcatVariadic, std::move(Args));
+	}
+	if(Name == "EXTRACT") {
+		ScalarSqlFn Field = ScalarSqlFn::ExtractYear;
+		if(MatchKeyword("YEAR"))
+			Field = ScalarSqlFn::ExtractYear;
+		else if(MatchKeyword("MONTH"))
+			Field = ScalarSqlFn::ExtractMonth;
+		else if(MatchKeyword("DAY"))
+			Field = ScalarSqlFn::ExtractDay;
+		else
+			ParseFail("EXTRACT supports YEAR, MONTH, or DAY only in this dialect");
+		if(!MatchKeyword("FROM"))
+			ParseFail("EXTRACT requires FROM");
+		Args.push_back(ParseCaseScalarResult());
+		FinishClose();
+		return std::make_unique<ScalarFuncExprAST>(Field, std::move(Args));
+	}
+	if(Name == "DATE_ADD") {
+		Args.push_back(ParseCaseScalarResult());
+		if(!CurrentToken() || CurrentToken()->Value != ",")
+			ParseFail("DATE_ADD expects two arguments");
+		AdvanceToken();
+		Args.push_back(ParseCaseScalarResult());
+		FinishClose();
+		return std::make_unique<ScalarFuncExprAST>(ScalarSqlFn::DateAddDays, std::move(Args));
+	}
+	if(Name == "DATE_SUB") {
+		Args.push_back(ParseCaseScalarResult());
+		if(!CurrentToken() || CurrentToken()->Value != ",")
+			ParseFail("DATE_SUB expects two arguments");
+		AdvanceToken();
+		Args.push_back(ParseCaseScalarResult());
+		FinishClose();
+		return std::make_unique<ScalarFuncExprAST>(ScalarSqlFn::DateSubDays, std::move(Args));
+	}
+	if(Name == "DATE_DIFF") {
+		Args.push_back(ParseCaseScalarResult());
+		if(!CurrentToken() || CurrentToken()->Value != ",")
+			ParseFail("DATE_DIFF expects two arguments");
+		AdvanceToken();
+		Args.push_back(ParseCaseScalarResult());
+		FinishClose();
+		return std::make_unique<ScalarFuncExprAST>(ScalarSqlFn::DateDiffDays, std::move(Args));
+	}
+	ParseFail("Internal: scalar builtin not handled: " + Name);
+}
+
 ASTNode Parser::ParseSelectStatement() {
     AdvanceToken();
     std::vector<std::unique_ptr<SelectAST>> Arms;
@@ -1580,23 +1952,27 @@ ASTNode Parser::ParseSelectStatement() {
             continue;
         }
         if(MatchKeyword("INTERSECT")) {
-            (void)MatchKeyword("DISTINCT");
+            const bool All = MatchKeyword("ALL");
+            if(!All)
+                (void)MatchKeyword("DISTINCT");
             auto Sel = CurrentToken();
             if(!Sel || Sel->Type != TokenType::SELECT)
                 ParseFail("Expected SELECT after INTERSECT");
             AdvanceToken();
             Arms.push_back(ParseSelectArmThroughHaving());
-            Ops.push_back(CompoundSetOpKind::Intersect);
+            Ops.push_back(All ? CompoundSetOpKind::IntersectAll : CompoundSetOpKind::Intersect);
             continue;
         }
         if(MatchKeyword("EXCEPT")) {
-            (void)MatchKeyword("DISTINCT");
+            const bool All = MatchKeyword("ALL");
+            if(!All)
+                (void)MatchKeyword("DISTINCT");
             auto Sel = CurrentToken();
             if(!Sel || Sel->Type != TokenType::SELECT)
                 ParseFail("Expected SELECT after EXCEPT");
             AdvanceToken();
             Arms.push_back(ParseSelectArmThroughHaving());
-            Ops.push_back(CompoundSetOpKind::Except);
+            Ops.push_back(All ? CompoundSetOpKind::ExceptAll : CompoundSetOpKind::Except);
             continue;
         }
         break;
@@ -1631,6 +2007,15 @@ ASTNode Parser::ParseSelectStatement() {
     }
     int64_t Limit = -1;
     int64_t Offset = 0;
+	if(auto OffTok = CurrentToken(); OffTok && OffTok->Value == "OFFSET") {
+		AdvanceToken();
+		if(auto Ov = CurrentToken()) {
+			Offset = std::stoll(Ov->Value);
+			AdvanceToken();
+		}
+		if(MatchKeyword("ROWS"))
+			(void)0;
+	}
     if(auto NextToken = CurrentToken(); NextToken && NextToken->Value == "LIMIT") {
         AdvanceToken();
         if(auto LimitToken = CurrentToken()) {
@@ -1652,7 +2037,17 @@ ASTNode Parser::ParseSelectStatement() {
                 }
             }
         }
-    }
+    } else if(auto FetchTok = CurrentToken(); FetchTok && FetchTok->Value == "FETCH") {
+		AdvanceToken();
+		if(!MatchKeyword("FIRST"))
+			ParseFail("FETCH expects FIRST");
+		if(auto Cnt = CurrentToken()) {
+			Limit = std::stoll(Cnt->Value);
+			AdvanceToken();
+		}
+		if(MatchKeyword("ROWS"))
+			MatchKeyword("ONLY");
+	}
 
     if(Arms.size() == 1) {
         Arms[0]->ApplyQueryOrdering(std::move(OrderByColumns), Limit, Offset);
@@ -1748,8 +2143,257 @@ ASTNode Parser::ParseInsertStatement() {
         ParseFail("No values provided in INSERT statement");
     }
 
+    std::optional<UpsertSpec> UpsertOpt;
+    if(MatchKeyword("ON")) {
+        if(!MatchKeyword("CONFLICT"))
+            ParseFail("Expected CONFLICT after ON");
+        std::vector<std::string> ConflictCols;
+        if(CurrentToken() && CurrentToken()->Value == "(") {
+            AdvanceToken();
+            while(auto TokenOpt = CurrentToken()) {
+                if(TokenOpt->Value == ")") {
+                    AdvanceToken();
+                    break;
+                }
+                if(TokenOpt->Type != TokenType::IDENTIFIER)
+                    ParseFail("ON CONFLICT column list expects identifiers");
+                ConflictCols.push_back(TokenOpt->Value);
+                AdvanceToken();
+                if(CurrentToken() && CurrentToken()->Value == ",")
+                    AdvanceToken();
+            }
+        }
+        if(!MatchKeyword("DO"))
+            ParseFail("Expected DO in ON CONFLICT clause");
+        UpsertSpec Us;
+        Us.ConflictColumns = std::move(ConflictCols);
+        if(MatchKeyword("NOTHING")) {
+            Us.Mode = UpsertSpec::OnConflict::Nothing;
+        } else if(MatchKeyword("UPDATE")) {
+            Us.Mode = UpsertSpec::OnConflict::Update;
+            if(!MatchKeyword("SET"))
+                ParseFail("Expected SET after DO UPDATE");
+            while(auto TokenOpt = CurrentToken()) {
+                if(TokenOpt->Type == TokenType::PUNCTUATION && TokenOpt->Value == ";")
+                    break;
+                if(TokenOpt->Value == "WHERE")
+                    ParseFail("ON CONFLICT UPDATE does not support WHERE");
+                std::string ColumnName = TokenOpt->Value;
+                AdvanceToken();
+                if(!MatchToken(TokenType::PUNCTUATION, "="))
+                    ParseFail("Expected '=' in ON CONFLICT UPDATE assignment");
+                UpsertAssign Asg;
+                Asg.Column = ColumnName;
+                Asg.Value = ParseSetValueExpression(std::nullopt, std::nullopt, true);
+                Us.UpdateAssignments.push_back(std::move(Asg));
+                if(CurrentToken() && CurrentToken()->Value == ",")
+                    AdvanceToken();
+            }
+        } else
+            ParseFail("Expected NOTHING or UPDATE after ON CONFLICT DO");
+        UpsertOpt = std::move(Us);
+    }
+
     auto TableAst = std::make_unique<TableAST>(TableName);
-    return std::make_unique<InsertAST>(std::move(TableAst), Columns, AllValues);
+    return std::make_unique<InsertAST>(std::move(TableAst), Columns, AllValues, std::move(UpsertOpt));
+}
+
+ASTNode Parser::ParseMergeStatement() {
+    AdvanceToken();
+    if(!MatchKeyword("INTO"))
+        ParseFail("Expected INTO after MERGE");
+    auto TTok = CurrentToken();
+    if(!TTok || TTok->Type != TokenType::IDENTIFIER)
+        ParseFail("Expected target table name in MERGE");
+    std::string TargetTable = TTok->Value;
+    AdvanceToken();
+    std::string TargetAlias = TargetTable;
+    if(MatchKeyword("AS")) {
+        auto ATok = CurrentToken();
+        if(!ATok || ATok->Type != TokenType::IDENTIFIER)
+            ParseFail("Expected alias after AS in MERGE INTO");
+        TargetAlias = ATok->Value;
+        AdvanceToken();
+    }
+    if(!MatchKeyword("USING"))
+        ParseFail("Expected USING in MERGE");
+    auto STok = CurrentToken();
+    if(!STok || STok->Type != TokenType::IDENTIFIER)
+        ParseFail("Expected source table name in MERGE");
+    std::string SourceTable = STok->Value;
+    AdvanceToken();
+    std::string SourceAlias = SourceTable;
+    if(MatchKeyword("AS")) {
+        auto BTok = CurrentToken();
+        if(!BTok || BTok->Type != TokenType::IDENTIFIER)
+            ParseFail("Expected alias after AS in MERGE USING");
+        SourceAlias = BTok->Value;
+        AdvanceToken();
+    }
+    if(!MatchKeyword("ON"))
+        ParseFail("Expected ON in MERGE");
+    std::vector<std::pair<std::string, std::string>> OnKeyPairs;
+    for(;;) {
+        auto La = CurrentToken();
+        if(!La || La->Type != TokenType::IDENTIFIER)
+            ParseFail("Expected join column qualifier in MERGE ON");
+        AdvanceToken();
+        if(!MatchToken(TokenType::PUNCTUATION, "."))
+            ParseFail("Expected '.' in MERGE ON join column");
+        auto Lc = CurrentToken();
+        if(!Lc || Lc->Type != TokenType::IDENTIFIER)
+            ParseFail("Expected join column name in MERGE ON");
+        const std::string OnLeftAlias = La->Value;
+        const std::string OnLeftCol = Lc->Value;
+        AdvanceToken();
+        if(!MatchToken(TokenType::PUNCTUATION, "="))
+            ParseFail("Expected '=' in MERGE ON");
+        auto Ra = CurrentToken();
+        if(!Ra || Ra->Type != TokenType::IDENTIFIER)
+            ParseFail("Expected join column qualifier after '=' in MERGE ON");
+        AdvanceToken();
+        if(!MatchToken(TokenType::PUNCTUATION, "."))
+            ParseFail("Expected '.' in MERGE ON join column (right)");
+        auto Rc = CurrentToken();
+        if(!Rc || Rc->Type != TokenType::IDENTIFIER)
+            ParseFail("Expected join column name in MERGE ON (right)");
+        const std::string OnRightAlias = Ra->Value;
+        const std::string OnRightCol = Rc->Value;
+        AdvanceToken();
+        std::string TgtCol;
+        std::string SrcCol;
+        if(OnLeftAlias == TargetAlias && OnRightAlias == SourceAlias) {
+            TgtCol = OnLeftCol;
+            SrcCol = OnRightCol;
+        } else if(OnLeftAlias == SourceAlias && OnRightAlias == TargetAlias) {
+            TgtCol = OnRightCol;
+            SrcCol = OnLeftCol;
+        } else
+            ParseFail("MERGE ON must compare target alias column to source alias column.");
+        OnKeyPairs.emplace_back(TgtCol, SrcCol);
+        if(CurrentToken() && CurrentToken()->Value == "AND") {
+            AdvanceToken();
+            continue;
+        }
+        break;
+    }
+    if(OnKeyPairs.empty())
+        ParseFail("MERGE ON requires at least one key equality.");
+    std::vector<MergeMatchedSet> Matched;
+    std::vector<MergeInsertField> NotMatched;
+    bool HaveMatched = false;
+    bool HaveNotMatched = false;
+    while(MatchKeyword("WHEN")) {
+        if(MatchKeyword("NOT")) {
+            if(!MatchKeyword("MATCHED"))
+                ParseFail("Expected MATCHED after NOT in MERGE");
+            if(HaveNotMatched)
+                ParseFail("Duplicate WHEN NOT MATCHED in MERGE");
+            HaveNotMatched = true;
+            if(!MatchKeyword("THEN"))
+                ParseFail("Expected THEN after WHEN NOT MATCHED");
+            if(!MatchToken(TokenType::INSERT, "INSERT"))
+                ParseFail("Expected INSERT in MERGE WHEN NOT MATCHED");
+            std::vector<std::string> InsertColumns;
+            if(!CurrentToken() || CurrentToken()->Value != "(")
+                ParseFail("Expected column list in MERGE INSERT");
+            AdvanceToken();
+            while(auto TokenOpt = CurrentToken()) {
+                if(TokenOpt->Value == ")") {
+                    AdvanceToken();
+                    break;
+                }
+                if(TokenOpt->Type != TokenType::IDENTIFIER)
+                    ParseFail("INSERT column name expected in MERGE");
+                InsertColumns.push_back(TokenOpt->Value);
+                AdvanceToken();
+                if(CurrentToken() && CurrentToken()->Value == ",")
+                    AdvanceToken();
+            }
+            if(InsertColumns.empty())
+                ParseFail("MERGE INSERT requires at least one column");
+            if(!MatchKeyword("VALUES"))
+                ParseFail("Expected VALUES in MERGE INSERT");
+            if(!CurrentToken() || CurrentToken()->Value != "(")
+                ParseFail("Expected '(' before MERGE INSERT values");
+            AdvanceToken();
+            NotMatched.reserve(InsertColumns.size());
+            for(size_t Ix = 0; Ix < InsertColumns.size(); ++Ix) {
+                if(Ix > 0) {
+                    if(!CurrentToken() || CurrentToken()->Value != ",")
+                        ParseFail("Expected ',' between MERGE INSERT values");
+                    AdvanceToken();
+                }
+                if(!CurrentToken())
+                    ParseFail("Expected value in MERGE INSERT");
+                MergeInsertField Cell;
+                Cell.Column = InsertColumns[Ix];
+                Cell.Value =
+                    ParseSetValueExpression(TargetAlias, SourceAlias, false);
+                NotMatched.push_back(std::move(Cell));
+            }
+            if(!CurrentToken() || CurrentToken()->Value != ")")
+                ParseFail("Expected ')' after MERGE INSERT values");
+            AdvanceToken();
+        } else if(MatchKeyword("MATCHED")) {
+            if(HaveMatched)
+                ParseFail("Duplicate WHEN MATCHED in MERGE");
+            HaveMatched = true;
+            if(!MatchKeyword("THEN"))
+                ParseFail("Expected THEN after WHEN MATCHED");
+            if(!MatchKeyword("UPDATE"))
+                ParseFail("Expected UPDATE in MERGE WHEN MATCHED");
+            if(!MatchKeyword("SET"))
+                ParseFail("Expected SET in MERGE WHEN MATCHED");
+            while(auto TokenOpt = CurrentToken()) {
+                if(TokenOpt->Type == TokenType::KEYWORD && TokenOpt->Value == "WHEN")
+                    break;
+                if(TokenOpt->Type == TokenType::PUNCTUATION && TokenOpt->Value == ";")
+                    break;
+                std::string TargetCol;
+                if(TokenOpt->Type != TokenType::IDENTIFIER)
+                    ParseFail("Expected target column in MERGE UPDATE SET");
+                std::string First = TokenOpt->Value;
+                AdvanceToken();
+                if(CurrentToken() && CurrentToken()->Value == ".") {
+                    AdvanceToken();
+                    auto Rest = CurrentToken();
+                    if(!Rest || Rest->Type != TokenType::IDENTIFIER)
+                        ParseFail("Expected column after '.' in MERGE UPDATE target");
+                    if(First != TargetAlias)
+                        ParseFail("MERGE UPDATE target must use the target alias");
+                    TargetCol = Rest->Value;
+                    AdvanceToken();
+                } else
+                    TargetCol = std::move(First);
+                if(!MatchToken(TokenType::PUNCTUATION, "="))
+                    ParseFail("Expected '=' in MERGE UPDATE assignment");
+                if(!CurrentToken())
+                    ParseFail("Expected value in MERGE UPDATE assignment");
+                MergeMatchedSet Cell;
+                Cell.TargetColumn = std::move(TargetCol);
+                Cell.Value = ParseSetValueExpression(TargetAlias, SourceAlias, false);
+                Matched.push_back(std::move(Cell));
+                if(CurrentToken() && CurrentToken()->Value == ",")
+                    AdvanceToken();
+            }
+        } else
+            ParseFail("MERGE WHEN expects MATCHED or NOT MATCHED");
+    }
+    if(!HaveMatched && !HaveNotMatched)
+        ParseFail("MERGE requires at least one WHEN MATCHED or WHEN NOT MATCHED branch");
+
+    auto Out = std::make_unique<MergeAST>();
+    Out->TargetTable = std::move(TargetTable);
+    Out->TargetAlias = std::move(TargetAlias);
+    Out->SourceTable = std::move(SourceTable);
+    Out->SourceAlias = std::move(SourceAlias);
+    Out->OnKeyPairs = std::move(OnKeyPairs);
+    Out->Matched = std::move(Matched);
+    Out->NotMatched = std::move(NotMatched);
+    Out->HasMatchedBranch = HaveMatched;
+    Out->HasNotMatchedBranch = HaveNotMatched;
+    return Out;
 }
 
 ASTNode Parser::ParseUpdateStatement() {
@@ -1761,7 +2405,7 @@ ASTNode Parser::ParseUpdateStatement() {
     AdvanceToken();
     if(!MatchKeyword("SET"))
         ParseFail("Expected SET in UPDATE statement");
-    std::vector<std::pair<std::string, std::string>> Assignments;
+    std::vector<std::pair<std::string, std::unique_ptr<ExpressionAST>>> Assignments;
     while(auto TokenOpt = CurrentToken()) {
         if(TokenOpt->Value == "WHERE") break;
         if(TokenOpt->Type == TokenType::PUNCTUATION && TokenOpt->Value == ";") break;
@@ -1769,12 +2413,7 @@ ASTNode Parser::ParseUpdateStatement() {
         AdvanceToken();
         if(!MatchToken(TokenType::PUNCTUATION, "="))
             ParseFail("Expected '=' in assignment of UPDATE statement");
-        auto ValueToken = CurrentToken();
-        if (!ValueToken)
-            ParseFail("Expected value in assignment of UPDATE statement");
-        std::string Value = ValueToken->Value;
-        AdvanceToken();
-        Assignments.push_back({ColumnName, Value});
+        Assignments.emplace_back(ColumnName, ParseSetValueExpression(std::nullopt, std::nullopt, false));
         if(CurrentToken() && CurrentToken()->Value == ",")
             AdvanceToken();
     }
@@ -1881,7 +2520,9 @@ ASTNode Parser::ParseGrantStatement() {
 		ParseFail("Expected grantee after TO in GRANT");
 	std::string Grantee = CurrentToken()->Value;
 	AdvanceToken();
-	return std::make_unique<GrantAST>(std::move(Grantee), Perms, TableName, std::move(Columns), GranteeIsRole);
+	bool WithGrantOption = MatchKeyword("WITH") && MatchKeyword("GRANT") && MatchKeyword("OPTION");
+	return std::make_unique<GrantAST>(std::move(Grantee), Perms, TableName, std::move(Columns), GranteeIsRole,
+	                                  WithGrantOption);
 }
 
 ASTNode Parser::ParseRevokeStatement() {
@@ -1961,6 +2602,110 @@ ASTNode Parser::ParseRevokeStatement() {
 	std::string Grantee = CurrentToken()->Value;
 	AdvanceToken();
 	return std::make_unique<RevokeAST>(std::move(Grantee), Perms, TableName, std::move(Columns), GranteeIsRole);
+}
+
+void Parser::ParseWindowOverClause(WindowSpec &Ws) {
+    if(!MatchKeyword("OVER"))
+        ParseFail("Expected OVER after window function");
+    if(!CurrentToken() || CurrentToken()->Value != "(")
+        ParseFail("Expected '(' after OVER");
+    AdvanceToken();
+    Ws.PartitionBy.clear();
+    if(MatchKeyword("PARTITION")) {
+        if(!MatchKeyword("BY"))
+            ParseFail("Expected BY after PARTITION in window OVER clause");
+        std::unordered_set<std::string> PartSeen;
+        for(;;) {
+            auto Pc = CurrentToken();
+            if(!Pc || Pc->Type != TokenType::IDENTIFIER)
+                ParseFail(
+                    "Expected PARTITION BY column (use a plain column name — reserved words belong in ORDER BY)");
+            const std::string Pname = Pc->Value;
+            if(PartSeen.count(Pname))
+                ParseFail("Duplicate column \"" + Pname + "\" in PARTITION BY");
+            if(Ws.PartitionBy.size() >= Limits::MaxWindowPartitionColumns)
+                ParseFail(
+                    "PARTITION BY column list exceeds the configured maximum "
+                    "(see Limits::MaxWindowPartitionColumns)");
+            PartSeen.insert(Pname);
+            Ws.PartitionBy.push_back(Pname);
+            AdvanceToken();
+            if(CurrentToken() && CurrentToken()->Value == ",") {
+                AdvanceToken();
+                continue;
+            }
+            break;
+        }
+        if(Ws.PartitionBy.empty())
+            ParseFail("PARTITION BY requires at least one column");
+    }
+    if(!MatchKeyword("ORDER"))
+        ParseFail(Ws.PartitionBy.empty() ? "WINDOW requires ORDER BY after OVER (" :
+                                          "WINDOW requires ORDER BY after PARTITION BY (only PARTITION BY without "
+                                          "ORDER BY is invalid)");
+    if(!MatchKeyword("BY"))
+        ParseFail("WINDOW requires ORDER BY");
+    auto OCol = CurrentToken();
+    if(!OCol)
+        ParseFail("Expected column after ORDER BY in window");
+    Ws.OrderColumn = OCol->Value;
+    AdvanceToken();
+    Ws.OrderAscending = true;
+    if(auto Ot = CurrentToken(); Ot && Ot->Value == "ASC") {
+        Ws.OrderAscending = true;
+        AdvanceToken();
+    } else if(Ot && Ot->Value == "DESC") {
+        Ws.OrderAscending = false;
+        AdvanceToken();
+    }
+    if(MatchKeyword("ROWS")) {
+        if(!MatchKeyword("BETWEEN"))
+            ParseFail("Expected BETWEEN after ROWS in window frame");
+        auto ParseRowsBound = [&]() -> WindowFrameBound {
+            WindowFrameBound B;
+            if(MatchKeyword("UNBOUNDED")) {
+                if(MatchKeyword("PRECEDING"))
+                    B.Kind = WindowFrameBoundKind::UnboundedPreceding;
+                else if(MatchKeyword("FOLLOWING"))
+                    B.Kind = WindowFrameBoundKind::UnboundedFollowing;
+                else
+                    ParseFail("Expected PRECEDING or FOLLOWING after UNBOUNDED");
+                return B;
+            }
+            if(MatchKeyword("CURRENT")) {
+                if(!MatchKeyword("ROW"))
+                    ParseFail("Expected ROW after CURRENT in window frame");
+                B.Kind = WindowFrameBoundKind::CurrentRow;
+                return B;
+            }
+            auto Nt = CurrentToken();
+            if(!Nt || Nt->Type != TokenType::LITERAL)
+                ParseFail("Expected offset, CURRENT ROW, or UNBOUNDED in window frame");
+            try {
+                B.Offset = std::stoll(Nt->Value);
+            } catch(...) {
+                ParseFail("Window frame offset must be a non-negative integer");
+            }
+            if(B.Offset < 0)
+                ParseFail("Window frame offset must be non-negative");
+            AdvanceToken();
+            if(MatchKeyword("PRECEDING"))
+                B.Kind = WindowFrameBoundKind::Preceding;
+            else if(MatchKeyword("FOLLOWING"))
+                B.Kind = WindowFrameBoundKind::Following;
+            else
+                ParseFail("Expected PRECEDING or FOLLOWING after frame offset");
+            return B;
+        };
+        Ws.FrameStart = ParseRowsBound();
+        if(!MatchKeyword("AND"))
+            ParseFail("Expected AND between window frame bounds");
+        Ws.FrameEnd = ParseRowsBound();
+        Ws.HasExplicitRowsFrame = true;
+    }
+    if(!CurrentToken() || CurrentToken()->Value != ")")
+        ParseFail("Expected ')' closing OVER clause");
+    AdvanceToken();
 }
 
 ASTNode Parser::ParseWhereClause() {
@@ -2061,8 +2806,8 @@ ASTNode Parser::ParseExistsPredicate(bool Negated) {
 
 std::unique_ptr<StatementAST> Parser::ParseWithStatement() {
 	AdvanceToken();
+	const bool Recursive = MatchKeyword("RECURSIVE");
 	const auto Saved = CteSubstitutions_;
-	CteSubstitutions_ = Saved;
 	std::vector<CteClause> Clauses;
 
 	while(true) {
@@ -2080,33 +2825,65 @@ std::unique_ptr<StatementAST> Parser::ParseWithStatement() {
 			ParseFail("WITH expects CTE name");
 		const std::string Alias = AliasTk->Value;
 		AdvanceToken();
+		if(CurrentToken() && CurrentToken()->Value == "(") {
+			AdvanceToken();
+			while(true) {
+				auto ColTok = CurrentToken();
+				if(!ColTok || (ColTok->Type != TokenType::IDENTIFIER && ColTok->Type != TokenType::KEYWORD))
+					ParseFail("WITH CTE column list expects identifiers");
+				AdvanceToken();
+				if(CurrentToken() && CurrentToken()->Value == ",") {
+					AdvanceToken();
+					continue;
+				}
+				if(CurrentToken() && CurrentToken()->Value == ")") {
+					AdvanceToken();
+					break;
+				}
+				ParseFail("WITH CTE column list must end with ')'");
+			}
+		}
 		if(!MatchKeyword("AS"))
 			ParseFail("WITH expects AS between CTE name and definition");
 		if(!CurrentToken() || CurrentToken()->Value != "(")
 			ParseFail("WITH expects '(' before CTE SELECT");
 		AdvanceToken();
+
+		const std::string Physical =
+		    "__astral_cte_" + std::to_string(Clauses.size()) + "_" + Alias;
+		CteSubstitutions_[Alias] = Physical;
+
 		if(!CurrentToken() || CurrentToken()->Type != TokenType::SELECT)
 			ParseFail("WITH CTE must be SELECT");
 		ASTNode Inner = ParseSelectStatement();
-		auto *SelDyn = dynamic_cast<SelectAST *>(Inner.get());
-		if(!SelDyn)
-			ParseFail("WITH CTE definition must be a single SELECT (not UNION / INTERSECT / EXCEPT)");
-		std::unique_ptr<SelectAST> Definition(static_cast<SelectAST *>(Inner.release()));
 
 		if(!CurrentToken() || CurrentToken()->Value != ")")
 			ParseFail("WITH CTE subquery must end with ')'");
 		AdvanceToken();
 
-		std::string Physical =
-		    "__astral_cte_" + std::to_string(Clauses.size()) + "_" + Alias;
-
 		CteClause ClauseInst;
 		ClauseInst.Alias = Alias;
 		ClauseInst.PhysicalTable = Physical;
-		ClauseInst.Definition = std::move(Definition);
-		Clauses.push_back(std::move(ClauseInst));
 
-		CteSubstitutions_[Alias] = Physical;
+		auto *Compound = dynamic_cast<CompoundSelectAST *>(Inner.get());
+		const bool UnionRecursiveForm = Compound && Compound->Arms.size() == 2 && Compound->Ops.size() == 1 &&
+		                                Compound->Ops[0] == CompoundSetOpKind::UnionAll;
+
+		if(Recursive || UnionRecursiveForm) {
+			if(!UnionRecursiveForm)
+				ParseFail("RECURSIVE requires anchor SELECT UNION ALL recursive SELECT");
+			if(!Compound->OrderByColumns.empty() || Compound->Limit >= 0 || Compound->Offset > 0)
+				ParseFail("ORDER BY / LIMIT / OFFSET are not allowed inside a recursive CTE body");
+			ClauseInst.Anchor = std::move(Compound->Arms[0]);
+			ClauseInst.RecursiveStep = std::move(Compound->Arms[1]);
+			Inner.reset();
+		} else {
+			auto *SelDyn = dynamic_cast<SelectAST *>(Inner.get());
+			if(!SelDyn)
+				ParseFail("WITH CTE definition must be a single SELECT (not UNION / INTERSECT / EXCEPT)");
+			ClauseInst.Anchor = std::unique_ptr<SelectAST>(static_cast<SelectAST *>(Inner.release()));
+		}
+		Clauses.push_back(std::move(ClauseInst));
 
 		if(CurrentToken() && CurrentToken()->Value == ",")
 			AdvanceToken();
@@ -2147,6 +2924,7 @@ std::unique_ptr<StatementAST> Parser::ParseStatement() {
         if(Token->Type == TokenType::KEYWORD && Token->Value == "ALTER")
             return ParseAlterStatement();
         if(Token->Type == TokenType::KEYWORD) {
+            if(Token->Value == "MERGE") return ParseMergeStatement();
             if(Token->Value == "UPDATE") return ParseUpdateStatement();
             if(Token->Value == "DELETE") return ParseDeleteStatement();
             if(Token->Value == "GRANT") return ParseGrantStatement();

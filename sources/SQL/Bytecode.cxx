@@ -1,5 +1,6 @@
 #include <SQL/BytecodeInterpreter.hxx>
 #include <SQL/Bytecode.hxx>
+#include <SQL/SetExprEval.hxx>
 #include <SQL/SQL.hxx>
 #include <IO/Limits.hxx>
 #include <IO/Error.hxx>
@@ -414,6 +415,242 @@ static std::optional<std::string> ReadCastProjectionSource(const Database::Item 
 	return It->second;
 }
 
+static std::optional<int> ParseIsoYmd(const std::string &S) {
+	if(S.size() < 10 || S[4] != '-' || S[7] != '-')
+		return std::nullopt;
+	auto Digit = [](char C) { return C >= '0' && C <= '9'; };
+	for(int I : {0, 1, 2, 3, 5, 6, 8, 9})
+		if(!Digit(S[static_cast<size_t>(I)]))
+			return std::nullopt;
+	const int Y = (S[0] - '0') * 1000 + (S[1] - '0') * 100 + (S[2] - '0') * 10 + (S[3] - '0');
+	const int M = (S[5] - '0') * 10 + (S[6] - '0');
+	const int D = (S[8] - '0') * 10 + (S[9] - '0');
+	if(M < 1 || M > 12 || D < 1 || D > 31)
+		return std::nullopt;
+	return (Y * 10000) + (M * 100) + D;
+}
+
+static std::string FormatIsoYmd(int Packed) {
+	const int Y = Packed / 10000;
+	const int M = (Packed / 100) % 100;
+	const int D = Packed % 100;
+	std::ostringstream O;
+	O << Y << '-' << (M < 10 ? "0" : "") << M << '-' << (D < 10 ? "0" : "") << D;
+	return std::move(O).str();
+}
+
+static bool IsLeap(int Y) { return (Y % 4 == 0 && Y % 100 != 0) || (Y % 400 == 0); }
+
+static int DaysInMonth(int Y, int M) {
+	static const int Dm[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+	if(M < 1 || M > 12)
+		return 0;
+	return Dm[M] + (M == 2 && IsLeap(Y) ? 1 : 0);
+}
+
+static std::optional<int> IsoAddDays(const std::string &Iso, int Delta) {
+	const auto Packed = ParseIsoYmd(Iso);
+	if(!Packed)
+		return std::nullopt;
+	int Y = *Packed / 10000;
+	int M = (*Packed / 100) % 100;
+	int D = *Packed % 100;
+	int Rem = Delta;
+	while(Rem != 0) {
+		if(Rem > 0) {
+			const int Dim = DaysInMonth(Y, M);
+			const int Left = Dim - D;
+			if(Rem <= Left) {
+				D += Rem;
+				Rem = 0;
+			} else {
+				Rem -= Left + 1;
+				D = 1;
+				++M;
+				if(M > 12) {
+					M = 1;
+					++Y;
+				}
+			}
+		} else {
+			if(D + Rem >= 1) {
+				D += Rem;
+				Rem = 0;
+			} else {
+				Rem += D;
+				--M;
+				if(M < 1) {
+					M = 12;
+					--Y;
+				}
+				D = DaysInMonth(Y, M);
+			}
+		}
+	}
+	return Y * 10000 + M * 100 + D;
+}
+
+static std::optional<std::string> EvalSqlSubstringCells(const std::vector<std::string> &Cells) {
+	if(Cells.empty() || Cells[0].empty())
+		return std::string();
+	const std::string &S = Cells[0];
+	if(Cells.size() == 1)
+		return S;
+	long long Start = 1;
+	try {
+		Start = std::stoll(Cells[1]);
+	} catch(...) {
+		return std::nullopt;
+	}
+	if(Start < 1)
+		return std::string();
+	const size_t Off = static_cast<size_t>(Start - 1);
+	if(Off >= S.size())
+		return std::string();
+	if(Cells.size() == 2)
+		return S.substr(Off);
+	long long Len = 0;
+	try {
+		Len = std::stoll(Cells[2]);
+	} catch(...) {
+		return std::nullopt;
+	}
+	if(Len < 0)
+		return std::string();
+	return S.substr(Off, static_cast<size_t>(Len));
+}
+
+static std::optional<std::string> EvalScalarSqlFn(ScalarSqlFn Fn, const std::vector<std::string> &Cells,
+                                                  const Database::Item &Row) {
+	switch(Fn) {
+	case ScalarSqlFn::Upper: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		std::string O;
+		O.reserve(Cells[0].size());
+		for(unsigned char C : Cells[0])
+			O.push_back(static_cast<char>(std::toupper(C)));
+		return O;
+	}
+	case ScalarSqlFn::Lower: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		std::string O;
+		O.reserve(Cells[0].size());
+		for(unsigned char C : Cells[0])
+			O.push_back(static_cast<char>(std::tolower(C)));
+		return O;
+	}
+	case ScalarSqlFn::CharLength:
+		if(Cells.size() != 1)
+			return std::nullopt;
+		return std::to_string(Cells[0].size());
+	case ScalarSqlFn::SubstringFromFor:
+		return EvalSqlSubstringCells(Cells);
+	case ScalarSqlFn::PositionIn: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		const auto Pos = Cells[1].find(Cells[0]);
+		if(Pos == std::string::npos)
+			return std::string("0");
+		return std::to_string(static_cast<unsigned long long>(Pos + 1));
+	}
+	case ScalarSqlFn::TrimBoth:
+	case ScalarSqlFn::TrimLeading:
+	case ScalarSqlFn::TrimTrailing: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		std::string_view V = Cells[0];
+		const auto IsSpace = [](char C) { return std::isspace(static_cast<unsigned char>(C)); };
+		if(Fn == ScalarSqlFn::TrimBoth || Fn == ScalarSqlFn::TrimLeading) {
+			while(!V.empty() && IsSpace(V.front()))
+				V.remove_prefix(1);
+		}
+		if(Fn == ScalarSqlFn::TrimBoth || Fn == ScalarSqlFn::TrimTrailing) {
+			while(!V.empty() && IsSpace(V.back()))
+				V.remove_suffix(1);
+		}
+		return std::string(V);
+	}
+	case ScalarSqlFn::ConcatVariadic: {
+		if(Cells.size() < 2)
+			return std::nullopt;
+		std::string O;
+		for(const auto &C : Cells)
+			O += C;
+		return O;
+	}
+	case ScalarSqlFn::ExtractYear:
+	case ScalarSqlFn::ExtractMonth:
+	case ScalarSqlFn::ExtractDay: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		const auto P = ParseIsoYmd(Cells[0]);
+		if(!P)
+			return std::nullopt;
+		if(Fn == ScalarSqlFn::ExtractYear)
+			return std::to_string(*P / 10000);
+		if(Fn == ScalarSqlFn::ExtractMonth)
+			return std::to_string((*P / 100) % 100);
+		return std::to_string(*P % 100);
+	}
+	case ScalarSqlFn::DateAddDays: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		int Delta = 0;
+		try {
+			Delta = static_cast<int>(std::stoll(Cells[1]));
+		} catch(...) {
+			return std::nullopt;
+		}
+		const auto Out = IsoAddDays(Cells[0], Delta);
+		return Out ? std::optional<std::string>(FormatIsoYmd(*Out)) : std::nullopt;
+	}
+	case ScalarSqlFn::DateSubDays: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		int Delta = 0;
+		try {
+			Delta = static_cast<int>(std::stoll(Cells[1]));
+		} catch(...) {
+			return std::nullopt;
+		}
+		const auto Out = IsoAddDays(Cells[0], -Delta);
+		return Out ? std::optional<std::string>(FormatIsoYmd(*Out)) : std::nullopt;
+	}
+	case ScalarSqlFn::DateDiffDays: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		const auto A = ParseIsoYmd(Cells[0]);
+		const auto B = ParseIsoYmd(Cells[1]);
+		if(!A || !B)
+			return std::nullopt;
+		int Y1 = *A / 10000, M1 = (*A / 100) % 100, D1 = *A % 100;
+		int Y2 = *B / 10000, M2 = (*B / 100) % 100, D2 = *B % 100;
+		auto ToDays = [](int Y, int M, int D) {
+			long long Days = static_cast<long long>(D - 1);
+			for(int Yr = 1; Yr < Y; ++Yr)
+				Days += IsLeap(Yr) ? 366 : 365;
+			for(int Mo = 1; Mo < M; ++Mo)
+				Days += DaysInMonth(Y, Mo);
+			return Days;
+		};
+		return std::to_string(ToDays(Y2, M2, D2) - ToDays(Y1, M1, D1));
+	}
+	case ScalarSqlFn::Grouping: {
+		if(Cells.size() != 1 || Cells[0].empty())
+			return std::nullopt;
+		const std::string Key = "_grouping_" + Cells[0];
+		auto It = Row.find(Key);
+		if(It == Row.end())
+			return std::string("0");
+		return It->second;
+	}
+	default:
+		return std::nullopt;
+	}
+}
+
 static std::optional<std::string> SqlApplyCast(const std::optional<std::string> &InOpt, SqlCastTarget T) {
 	if(!InOpt.has_value())
 		return std::nullopt;
@@ -513,6 +750,356 @@ static std::string GroupKeySignature(const Database::Item &Row, const std::vecto
 		Sub[K] = It == Row.end() ? "" : It->second;
 	}
 	return RowSignatureCanon(Sub);
+}
+
+static void PadOlapOutputRows(Database::Table &Tbl, const std::vector<std::string> &AllKeys,
+                              const std::vector<std::string> &ActiveKeys, int64_t OlapLevel) {
+	for(auto &Row : Tbl) {
+		for(const auto &K : AllKeys) {
+			const bool Active =
+			    std::find(ActiveKeys.begin(), ActiveKeys.end(), K) != ActiveKeys.end();
+			if(!Active)
+				Row[K] = "";
+			Row["_grouping_" + K] = Active ? "0" : "1";
+		}
+		Row["_olap_level"] = std::to_string(OlapLevel);
+	}
+}
+
+static size_t GroupByInstPayloadEnd(const Instruction &Inst);
+
+/** Single grouping pass; \a ActiveKeys may be a prefix of the keys encoded in \a Inst operands. */
+static void RunGroupByCore(Database::Table &Tbl, const Instruction &Inst,
+                           const std::vector<std::string> &ActiveKeys) {
+	const auto *Tag = std::get_if<int64_t>(&Inst.Operands[0]);
+	const auto *Nk = std::get_if<int64_t>(&Inst.Operands[1]);
+	if(!Tag || !Nk)
+		FailVm("GROUP_BY bad operands");
+	const int64_t AggMode = *Tag;
+	if(AggMode == 3) {
+		const size_t Base = static_cast<size_t>(2 + *Nk);
+		if(Inst.Operands.size() < Base + 2)
+			FailVm("GROUP_BY multi-aggregate: truncated header");
+		const auto *HCnt = std::get_if<int64_t>(&Inst.Operands[Base]);
+		const auto *Na = std::get_if<int64_t>(&Inst.Operands[Base + 1]);
+		if(!HCnt || !Na || *Na < 0 || *Na > 32 ||
+		   Inst.Operands.size() < Base + 2 + static_cast<size_t>(*Na) * 3)
+			FailVm("GROUP_BY multi-aggregate bad counts");
+		const bool IncludeCountStar = (*HCnt != 0);
+		const size_t IdxAfterSpecs = Base + 2 + static_cast<size_t>(*Na) * 3;
+		const size_t PayloadEnd = GroupByInstPayloadEnd(Inst);
+		if(PayloadEnd < IdxAfterSpecs)
+			FailVm("GROUP_BY multi-aggregate bad counts");
+		std::string CountStarCol = "cnt";
+		if(IncludeCountStar) {
+			if(PayloadEnd == IdxAfterSpecs + 1) {
+				const auto *Cn = std::get_if<std::string>(&Inst.Operands[IdxAfterSpecs]);
+				if(!Cn || Cn->empty())
+					FailVm("GROUP_BY multi-aggregate: COUNT(*) output column name must be non-empty");
+				CountStarCol = *Cn;
+			} else if(PayloadEnd != IdxAfterSpecs)
+				FailVm("GROUP_BY multi-aggregate bad counts");
+		} else if(PayloadEnd != IdxAfterSpecs)
+			FailVm("GROUP_BY multi-aggregate: unexpected trailing operands");
+		struct AggSpecVm {
+			int Kind = 0;
+			std::string SrcCol;
+			std::string OutCol;
+		};
+		std::vector<AggSpecVm> Specs;
+		Specs.reserve(static_cast<size_t>(*Na));
+		size_t Idx = Base + 2;
+		for(int64_t A = 0; A < *Na; ++A) {
+			const auto *Knd = std::get_if<int64_t>(&Inst.Operands[Idx++]);
+			const auto *Sc = std::get_if<std::string>(&Inst.Operands[Idx++]);
+			const auto *Ou = std::get_if<std::string>(&Inst.Operands[Idx++]);
+			if(!Knd || !Sc || !Ou || Sc->empty() || Ou->empty())
+				FailVm("GROUP_BY multi-aggregate bad spec");
+			Specs.push_back(AggSpecVm{static_cast<int>(*Knd), *Sc, *Ou});
+		}
+		struct Accum {
+			std::unordered_map<std::string, Database::Item> KeyTemplate;
+			std::unordered_map<std::string, int64_t> CntStar;
+			std::unordered_map<std::string, std::vector<double>> Sum;
+			std::unordered_map<std::string, std::vector<int64_t>> AvgN;
+			std::unordered_map<std::string, std::vector<bool>> HaveMinMax;
+			std::unordered_map<std::string, std::vector<std::string>> CurMin;
+			std::unordered_map<std::string, std::vector<std::string>> CurMax;
+		} Acc;
+		for(const auto &Row : Tbl) {
+			const std::string Sig = GroupKeySignature(Row, ActiveKeys);
+			if(IncludeCountStar)
+				Acc.CntStar[Sig]++;
+			if(Acc.KeyTemplate.find(Sig) == Acc.KeyTemplate.end()) {
+				Database::Item R;
+				for(const auto &K : ActiveKeys) {
+					auto It = Row.find(K);
+					R[K] = It == Row.end() ? "" : It->second;
+				}
+				Acc.KeyTemplate.emplace(Sig, std::move(R));
+			}
+			if(Acc.Sum.find(Sig) == Acc.Sum.end()) {
+				Acc.Sum[Sig] = std::vector<double>(Specs.size(), 0.0);
+				Acc.AvgN[Sig] = std::vector<int64_t>(Specs.size(), 0);
+				Acc.HaveMinMax[Sig] = std::vector<bool>(Specs.size(), false);
+				Acc.CurMin[Sig] = std::vector<std::string>(Specs.size());
+				Acc.CurMax[Sig] = std::vector<std::string>(Specs.size());
+			}
+			auto &Sv = Acc.Sum[Sig];
+			auto &Nv = Acc.AvgN[Sig];
+			auto &Hm = Acc.HaveMinMax[Sig];
+			auto &Cmin = Acc.CurMin[Sig];
+			auto &Cmax = Acc.CurMax[Sig];
+			for(size_t Si = 0; Si < Specs.size(); ++Si) {
+				const auto &Sp = Specs[Si];
+				auto It = Row.find(Sp.SrcCol);
+				const std::string Cell = It == Row.end() ? "" : It->second;
+				switch(Sp.Kind) {
+					case static_cast<int>(GroupCombAggKind::Sum):
+					case static_cast<int>(GroupCombAggKind::Avg): {
+						double X = 0;
+						bool Ok = false;
+						try {
+							X = std::stod(Cell);
+							Ok = true;
+						} catch(...) {
+						}
+						if(Ok) {
+							Sv[Si] += X;
+							if(Sp.Kind == static_cast<int>(GroupCombAggKind::Avg))
+								Nv[Si]++;
+						}
+					} break;
+					case static_cast<int>(GroupCombAggKind::Min): {
+						if(!Hm[Si]) {
+							Hm[Si] = true;
+							Cmin[Si] = Cell;
+						} else if(CompareScalars(Cell, Cmin[Si]) < 0)
+							Cmin[Si] = Cell;
+					} break;
+					case static_cast<int>(GroupCombAggKind::Max): {
+						if(!Hm[Si]) {
+							Hm[Si] = true;
+							Cmax[Si] = Cell;
+						} else if(CompareScalars(Cell, Cmax[Si]) > 0)
+							Cmax[Si] = Cell;
+					} break;
+					default:
+						break;
+				}
+			}
+		}
+		Database::Table OutTbl;
+		OutTbl.reserve(Acc.KeyTemplate.size());
+		for(auto &Ky : Acc.KeyTemplate) {
+			const std::string &Sig = Ky.first;
+			Database::Item R = Ky.second;
+			if(IncludeCountStar) {
+				const auto ItCnt = Acc.CntStar.find(Sig);
+				R[CountStarCol] = ItCnt == Acc.CntStar.end() ? "0" : std::to_string(ItCnt->second);
+			}
+			const auto &Sv = Acc.Sum.at(Sig);
+			const auto &Nv = Acc.AvgN.at(Sig);
+			const auto &Hm = Acc.HaveMinMax.at(Sig);
+			const auto &Mn = Acc.CurMin.at(Sig);
+			const auto &Mx = Acc.CurMax.at(Sig);
+			for(size_t Si = 0; Si < Specs.size(); ++Si) {
+				const auto &Sp = Specs[Si];
+				switch(Sp.Kind) {
+					case static_cast<int>(GroupCombAggKind::Sum):
+						R[Sp.OutCol] = std::to_string(static_cast<long long>(std::llround(Sv[Si])));
+						break;
+					case static_cast<int>(GroupCombAggKind::Avg): {
+						if(Nv[Si] > 0) {
+							std::ostringstream O;
+							O << (Sv[Si] / static_cast<double>(Nv[Si]));
+							R[Sp.OutCol] = O.str();
+						} else
+							R[Sp.OutCol] = "0";
+					} break;
+					case static_cast<int>(GroupCombAggKind::Min):
+						R[Sp.OutCol] = Hm[Si] ? Mn[Si] : "";
+						break;
+					case static_cast<int>(GroupCombAggKind::Max):
+						R[Sp.OutCol] = Hm[Si] ? Mx[Si] : "";
+						break;
+					default:
+						R[Sp.OutCol] = "";
+						break;
+				}
+			}
+			OutTbl.push_back(std::move(R));
+		}
+		Tbl = std::move(OutTbl);
+		std::sort(Tbl.begin(), Tbl.end(), [&](const Database::Item &A, const Database::Item &B) {
+			return GroupKeySignature(A, ActiveKeys) < GroupKeySignature(B, ActiveKeys);
+		});
+	} else if(AggMode == 1) {
+		const size_t Base = static_cast<size_t>(2 + *Nk);
+		const size_t PayloadEnd = GroupByInstPayloadEnd(Inst);
+		std::string CountStarCol = "cnt";
+		if(PayloadEnd == Base + 1) {
+			const auto *Cn = std::get_if<std::string>(&Inst.Operands[Base]);
+			if(!Cn || Cn->empty())
+				FailVm("GROUP_BY COUNT(*): bad output column name operand");
+			CountStarCol = *Cn;
+		} else if(PayloadEnd != Base)
+			FailVm("GROUP_BY COUNT(*): operand count mismatch");
+		std::unordered_map<std::string, int64_t> Cnt;
+		std::unordered_map<std::string, Database::Item> Template;
+		Cnt.reserve(Tbl.size());
+		Template.reserve(Tbl.size());
+		for(const auto &Row : Tbl) {
+			const std::string Sig = GroupKeySignature(Row, ActiveKeys);
+			Cnt[Sig]++;
+			if(Template.find(Sig) == Template.end()) {
+				Database::Item R;
+				for(const auto &K : ActiveKeys) {
+					auto It = Row.find(K);
+					R[K] = It == Row.end() ? "" : It->second;
+				}
+				R[CountStarCol] = "0";
+				Template.emplace(Sig, std::move(R));
+			}
+		}
+		Database::Table Out;
+		Out.reserve(Cnt.size());
+		for(auto &P : Cnt) {
+			Database::Item RowOut = Template[P.first];
+			RowOut[CountStarCol] = std::to_string(P.second);
+			Out.push_back(std::move(RowOut));
+		}
+		Tbl = std::move(Out);
+		std::sort(Tbl.begin(), Tbl.end(), [&](const Database::Item &A, const Database::Item &B) {
+			return GroupKeySignature(A, ActiveKeys) < GroupKeySignature(B, ActiveKeys);
+		});
+	} else if(AggMode == 0) {
+		std::unordered_map<std::string, Database::Item> First;
+		First.reserve(Tbl.size());
+		for(const auto &Row : Tbl) {
+			const std::string Sig = GroupKeySignature(Row, ActiveKeys);
+			if(First.find(Sig) == First.end())
+				First.emplace(Sig, Row);
+		}
+		Database::Table Out;
+		Out.reserve(First.size());
+		for(auto &P : First)
+			Out.push_back(std::move(P.second));
+		Tbl = std::move(Out);
+		std::sort(Tbl.begin(), Tbl.end(), [&](const Database::Item &A, const Database::Item &B) {
+			return GroupKeySignature(A, ActiveKeys) < GroupKeySignature(B, ActiveKeys);
+		});
+	} else
+		FailVm("GROUP_BY aggregate not supported for OLAP pass (use COUNT(*) or SUM/MIN/MAX/AVG)");
+}
+
+static void RunOlapModifier(Database::Table &Tbl, const Instruction &Inst,
+                            const std::vector<std::string> &AllKeys, bool Cube) {
+	const Database::Table Source = Tbl;
+	Database::Table Combined;
+	if(Cube) {
+		const size_t N = AllKeys.size();
+		if(N > 8)
+			FailVm("CUBE supports at most 8 GROUP BY columns");
+		const size_t Sets = size_t{1} << N;
+		for(size_t Mask = 0; Mask < Sets; ++Mask) {
+			std::vector<std::string> Active;
+			Active.reserve(N);
+			for(size_t I = 0; I < N; ++I) {
+				if((Mask >> I) & 1)
+					Active.push_back(AllKeys[I]);
+			}
+			Tbl = Source;
+			RunGroupByCore(Tbl, Inst, Active);
+			PadOlapOutputRows(Tbl, AllKeys, Active, static_cast<int64_t>(Mask));
+			Combined.insert(Combined.end(), std::make_move_iterator(Tbl.begin()),
+			                std::make_move_iterator(Tbl.end()));
+		}
+	} else {
+		for(int Level = static_cast<int>(AllKeys.size()); Level >= 0; --Level) {
+			std::vector<std::string> Active(AllKeys.begin(), AllKeys.begin() + Level);
+			Tbl = Source;
+			RunGroupByCore(Tbl, Inst, Active);
+			PadOlapOutputRows(Tbl, AllKeys, Active, static_cast<int64_t>(Level));
+			Combined.insert(Combined.end(), std::make_move_iterator(Tbl.begin()),
+			                std::make_move_iterator(Tbl.end()));
+		}
+	}
+	Tbl = std::move(Combined);
+}
+
+static size_t GroupByInstPayloadEnd(const Instruction &Inst) {
+	const auto *Tag = std::get_if<int64_t>(&Inst.Operands[0]);
+	const auto *Nk = std::get_if<int64_t>(&Inst.Operands[1]);
+	if(!Tag || !Nk)
+		return 0;
+	const size_t Base = static_cast<size_t>(2 + *Nk);
+	if(*Tag == 3) {
+		if(Inst.Operands.size() < Base + 2)
+			return 0;
+		const auto *Na = std::get_if<int64_t>(&Inst.Operands[Base + 1]);
+		if(!Na)
+			return 0;
+		size_t End = Base + 2 + static_cast<size_t>(*Na) * 3;
+		const auto *HCnt = std::get_if<int64_t>(&Inst.Operands[Base]);
+		if(HCnt && *HCnt != 0 && Inst.Operands.size() > End) {
+			const auto *Cn = std::get_if<std::string>(&Inst.Operands[End]);
+			if(Cn && !Cn->empty())
+				return End + 1;
+		}
+		return End;
+	}
+	if(*Tag == 4)
+		return Inst.Operands.size() >= Base + 2 ? Base + 2 : 0;
+	if(*Tag == 1) {
+		const size_t WithCount = Base + 1;
+		if(Inst.Operands.size() <= WithCount)
+			return Inst.Operands.size();
+		return WithCount;
+	}
+	if(*Tag == 0)
+		return Base;
+	return 0;
+}
+
+static void RunGroupingSetsOlap(Database::Table &Tbl, const Instruction &Inst,
+                                const std::vector<std::string> &AllKeys) {
+	const size_t PayloadEnd = GroupByInstPayloadEnd(Inst);
+	if(PayloadEnd == 0 || PayloadEnd >= Inst.Operands.size())
+		FailVm("GROUPING_SETS bad group-by payload");
+	const auto *NSetsPtr = std::get_if<int64_t>(&Inst.Operands[PayloadEnd]);
+	if(!NSetsPtr || *NSetsPtr < 0)
+		FailVm("GROUPING SETS set count invalid");
+	const size_t NSets = static_cast<size_t>(*NSetsPtr);
+	size_t Idx = PayloadEnd + 1;
+	std::vector<std::vector<std::string>> Sets;
+	Sets.reserve(NSets);
+	for(size_t S = 0; S < NSets; ++S) {
+		auto *Nc = std::get_if<int64_t>(&Inst.Operands[Idx++]);
+		if(!Nc || *Nc < 0)
+			FailVm("GROUPING_SETS column count invalid");
+		std::vector<std::string> One;
+		One.reserve(static_cast<size_t>(*Nc));
+		for(int64_t C = 0; C < *Nc; ++C) {
+			auto *Col = std::get_if<std::string>(&Inst.Operands[Idx++]);
+			if(!Col || Col->empty())
+				FailVm("GROUPING_SETS column name expected");
+			One.push_back(*Col);
+		}
+		Sets.push_back(std::move(One));
+	}
+	if(Idx != Inst.Operands.size())
+		FailVm("GROUPING_SETS trailing operands");
+	const Database::Table Source = Tbl;
+	Database::Table Combined;
+	for(size_t Si = 0; Si < Sets.size(); ++Si) {
+		Tbl = Source;
+		RunGroupByCore(Tbl, Inst, Sets[Si]);
+		PadOlapOutputRows(Tbl, AllKeys, Sets[Si], static_cast<int64_t>(Si));
+		Combined.insert(Combined.end(), std::make_move_iterator(Tbl.begin()),
+		                std::make_move_iterator(Tbl.end()));
+	}
+	Tbl = std::move(Combined);
 }
 
 static Database::Item MergeJoinRowsPreferLeft(const Database::Item &LeftPrefer, const Database::Item &RightOther) {
@@ -1248,6 +1835,149 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             ++Ic;
             break;
         }
+        case Opcode::UPSERT: {
+            if(inst.Operands.size() < 5)
+                FailVm("UPSERT malformed operands");
+            auto *KPtr = std::get_if<int64_t>(&inst.Operands[0]);
+            auto *ExplicitPtr = std::get_if<int64_t>(&inst.Operands[1]);
+            auto *DoNothingPtr = std::get_if<int64_t>(&inst.Operands[2]);
+            auto *NConflictPtr = std::get_if<int64_t>(&inst.Operands[3]);
+            if(!KPtr || !ExplicitPtr || !DoNothingPtr || !NConflictPtr)
+                FailVm("UPSERT expects int64 header operands");
+            if(*NConflictPtr < 0)
+                FailVm("UPSERT conflict column count invalid");
+            const size_t NConflict = static_cast<size_t>(*NConflictPtr);
+            if(inst.Operands.size() < 4 + NConflict + 1)
+                FailVm("UPSERT missing update assignment count");
+            const size_t SetCountIdx = 4 + NConflict;
+            auto *NSetPtr = std::get_if<int64_t>(&inst.Operands[SetCountIdx]);
+            if(!NSetPtr || *NSetPtr < 0)
+                FailVm("UPSERT SET count invalid");
+            const size_t NSet = static_cast<size_t>(*NSetPtr);
+            if(inst.Operands.size() != SetCountIdx + 1 + 2 * NSet)
+                FailVm("UPSERT operand tail size mismatch");
+            std::vector<std::string> ConflictCols;
+            ConflictCols.reserve(NConflict);
+            for(size_t i = 0; i < NConflict; ++i) {
+                if(auto *S = std::get_if<std::string>(&inst.Operands[4 + i]))
+                    ConflictCols.push_back(*S);
+                else
+                    FailVm("UPSERT conflict column name must be string");
+            }
+            std::vector<std::pair<std::string, std::string>> UpdateAssignments;
+            const size_t PairsBase = SetCountIdx + 1;
+            const int64_t K64 = *KPtr;
+            if(K64 < 0 || K64 > 100000)
+                FailVm("UPSERT value count out of range");
+            const size_t K = static_cast<size_t>(K64);
+            if(Databases_.empty())
+                Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+            Database *Db = Databases_[0].get();
+            auto PopBorrowedStr = [&]() -> std::string { return PopOwnedStringMoved("UPSERT"); };
+            std::vector<std::string> Values(K);
+            for(size_t i = K; i-- > 0;)
+                Values[i] = PopBorrowedStr();
+            Database::Item Row;
+            std::string TableName;
+            if(*ExplicitPtr) {
+                std::vector<std::string> ColKeys(K);
+                for(size_t i = K; i-- > 0;)
+                    ColKeys[i] = PopBorrowedStr();
+                TableName = PopBorrowedStr();
+                for(size_t i = 0; i < K; ++i)
+                    Row[ColKeys[i]] = Values[i];
+            } else {
+                TableName = PopBorrowedStr();
+                auto Snap = Db->TableSchemaSnapshot(TableName);
+                if(!Snap || Snap->size() != K)
+                    FailVm("UPSERT implicit columns require matching table schema");
+                for(size_t i = 0; i < K; ++i)
+                    Row[(*Snap)[i].Name] = Values[i];
+            }
+            if(*DoNothingPtr == 0 && NSet > 0) {
+                UpdateAssignments.reserve(NSet);
+                for(size_t s = 0; s < NSet; ++s) {
+                    auto *ColN = std::get_if<std::string>(&inst.Operands[PairsBase + s * 2]);
+                    auto *Blob = std::get_if<std::string>(&inst.Operands[PairsBase + s * 2 + 1]);
+                    if(!ColN || !Blob)
+                        FailVm("UPSERT DO UPDATE SET expects column/expression");
+                    UpdateAssignments.emplace_back(*ColN, *Blob);
+                }
+            }
+            Db->Upsert(TableName, Row, ConflictCols, *DoNothingPtr != 0, UpdateAssignments).get();
+            ++Ic;
+            break;
+        }
+
+        case Opcode::MERGE_INTO: {
+            if(inst.Operands.size() < 4)
+                FailVm("MERGE_INTO missing header operands");
+            auto *TgtTbl = std::get_if<std::string>(&inst.Operands[0]);
+            auto *SrcTbl = std::get_if<std::string>(&inst.Operands[1]);
+            auto *NkPtr = std::get_if<int64_t>(&inst.Operands[2]);
+            if(!TgtTbl || !SrcTbl || !NkPtr || *NkPtr < 0)
+                FailVm("MERGE_INTO table/key operands");
+            const size_t Nk = static_cast<size_t>(*NkPtr);
+            size_t Idx = 3;
+            if(inst.Operands.size() < Idx + Nk * 2 + 1)
+                FailVm("MERGE_INTO truncated key pairs");
+            std::vector<std::pair<std::string, std::string>> KeyPairs;
+            KeyPairs.reserve(Nk);
+            for(size_t i = 0; i < Nk; ++i) {
+                auto *Tcol = std::get_if<std::string>(&inst.Operands[Idx]);
+                auto *Scol = std::get_if<std::string>(&inst.Operands[Idx + 1]);
+                if(!Tcol || !Scol)
+                    FailVm("MERGE_INTO key pair expected");
+                KeyPairs.emplace_back(*Tcol, *Scol);
+                Idx += 2;
+            }
+            auto *NmPtr = std::get_if<int64_t>(&inst.Operands[Idx]);
+            if(!NmPtr || *NmPtr < 0)
+                FailVm("MERGE_INTO matched count");
+            const size_t Nm = static_cast<size_t>(*NmPtr);
+            ++Idx;
+            if(inst.Operands.size() < Idx + Nm * 2 + 1)
+                FailVm("MERGE_INTO truncated matched cells");
+            std::vector<AstralDB::MergeUpdateCell> OnMatch;
+            OnMatch.reserve(Nm);
+            for(size_t i = 0; i < Nm; ++i) {
+                auto *Tcol = std::get_if<std::string>(&inst.Operands[Idx]);
+                auto *Blob = std::get_if<std::string>(&inst.Operands[Idx + 1]);
+                if(!Tcol || !Blob)
+                    FailVm("MERGE_INTO matched cell pair");
+                AstralDB::MergeUpdateCell C;
+                C.TargetColumn = *Tcol;
+                C.ValueExpr = *Blob;
+                OnMatch.push_back(std::move(C));
+                Idx += 2;
+            }
+            auto *NiPtr = std::get_if<int64_t>(&inst.Operands[Idx]);
+            if(!NiPtr || *NiPtr < 0)
+                FailVm("MERGE_INTO insert count");
+            const size_t Ni = static_cast<size_t>(*NiPtr);
+            ++Idx;
+            if(inst.Operands.size() != Idx + Ni * 2)
+                FailVm("MERGE_INTO insert cells size mismatch");
+            std::vector<AstralDB::MergeInsertCell> OnInsert;
+            OnInsert.reserve(Ni);
+            for(size_t i = 0; i < Ni; ++i) {
+                auto *Icol = std::get_if<std::string>(&inst.Operands[Idx]);
+                auto *Blob = std::get_if<std::string>(&inst.Operands[Idx + 1]);
+                if(!Icol || !Blob)
+                    FailVm("MERGE_INTO insert cell pair");
+                AstralDB::MergeInsertCell C;
+                C.Column = *Icol;
+                C.ValueExpr = *Blob;
+                OnInsert.push_back(std::move(C));
+                Idx += 2;
+            }
+            if(Databases_.empty()) {
+                Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+            }
+            Databases_[0]->MergeUsing(*TgtTbl, *SrcTbl, KeyPairs, OnMatch, OnInsert).get();
+            ++Ic;
+            break;
+        }
         case Opcode::DELETE: {
             if (inst.Operands.empty()) FailVm("DELETE requires table name operand");
             if (auto tableName = std::get_if<std::string>(&inst.Operands[0])) {
@@ -1639,7 +2369,7 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                     return GroupKeySignature(A, Keys) < GroupKeySignature(B, Keys);
                 });
             } else
-                FailVm("GROUP_BY unknown aggregate tag");
+                RunGroupByCore(Tbl, inst, Keys);
             });
             PushOwningStringHeap(new std::string(TableName));
             ++Ic;
@@ -1667,10 +2397,25 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                static_cast<size_t>(*NpPtr) > Limits::MaxWindowPartitionColumns)
                 FailVm("WINDOW_ROW_NUMBER invalid PARTITION column count operand");
             const size_t NP = static_cast<size_t>(*NpPtr);
-            if(inst.Operands.size() != NP + size_t{4} && inst.Operands.size() != NP + size_t{5})
+            if(inst.Operands.size() != NP + size_t{4} && inst.Operands.size() != NP + size_t{5} &&
+               inst.Operands.size() != NP + size_t{8} && inst.Operands.size() != NP + size_t{12})
                 FailVm("WINDOW_ROW_NUMBER operand payload length mismatches PARTITION count");
             int OrdKind = 0;
-            if(inst.Operands.size() == NP + size_t{5}) {
+            std::string SrcCol;
+            int64_t FrameOffset = 1;
+            if(inst.Operands.size() >= NP + size_t{8}) {
+                const auto *Ok = std::get_if<int64_t>(&inst.Operands[NP + 4]);
+                const auto *Sc = std::get_if<std::string>(&inst.Operands[NP + 5]);
+                const auto *Fo = std::get_if<int64_t>(&inst.Operands[NP + 6]);
+                if(!Ok || *Ok < 0 || *Ok > 8)
+                    FailVm("WINDOW_ROW_NUMBER bad window kind operand");
+                if(!Sc || !Fo || *Fo < 0)
+                    FailVm("WINDOW_ROW_NUMBER bad source column or frame offset");
+                OrdKind = static_cast<int>(*Ok);
+                SrcCol = *Sc;
+                FrameOffset = *Fo;
+                (void)inst.Operands[NP + 7];
+            } else if(inst.Operands.size() == NP + size_t{5}) {
                 const auto *Ok = std::get_if<int64_t>(&inst.Operands[NP + 4]);
                 if(!Ok || *Ok < 0 || *Ok > 2)
                     FailVm("WINDOW_ROW_NUMBER bad ordinal kind (expected 0=ROW_NUMBER, 1=RANK, 2=DENSE_RANK)");
@@ -2053,6 +2798,55 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             ++Ic;
             break;
         }
+        case Opcode::SCALAR_FUNC_EVAL: {
+            if(inst.Operands.size() < 3)
+                FailVm("SCALAR_FUNC_EVAL expects output column, function tag, and argc");
+            const auto *OutCol = std::get_if<std::string>(&inst.Operands[0]);
+            const auto *FnTag = std::get_if<int64_t>(&inst.Operands[1]);
+            const auto *Argc = std::get_if<int64_t>(&inst.Operands[2]);
+            if(!OutCol || OutCol->empty() || !FnTag || !Argc || *Argc < 0 || *Argc > Limits::MaxScalarSqlFuncArgs)
+                FailVm("SCALAR_FUNC_EVAL: bad header operands");
+            const size_t Need = 3 + static_cast<size_t>(*Argc) * 2;
+            if(inst.Operands.size() != Need)
+                FailVm("SCALAR_FUNC_EVAL: operand count does not match argc");
+            if(*FnTag < 0 || *FnTag > static_cast<int64_t>(ScalarSqlFn::Grouping))
+                FailVm("SCALAR_FUNC_EVAL: bad function tag");
+            const ScalarSqlFn Fn = static_cast<ScalarSqlFn>(*FnTag);
+            size_t Idx = 3;
+            std::vector<std::pair<int64_t, std::string>> ArgOps;
+            ArgOps.reserve(static_cast<size_t>(*Argc));
+            for(int64_t A = 0; A < *Argc; ++A) {
+                const auto *Kind = std::get_if<int64_t>(&inst.Operands[Idx++]);
+                const auto *Pay = std::get_if<std::string>(&inst.Operands[Idx++]);
+                if(!Kind || !Pay || *Kind < 0 || *Kind > 2)
+                    FailVm("SCALAR_FUNC_EVAL: bad argument encoding");
+                ArgOps.emplace_back(*Kind, *Pay);
+            }
+            if(StackSlots_.empty())
+                FailVm("SCALAR_FUNC_EVAL: expected table name on stack");
+            std::string Tab = PopOwnedStringMoved("SCALAR_FUNC_EVAL table");
+            if(Databases_.empty())
+                Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+            Databases_[0]->WithExclusiveBytecodeLock([&]() {
+                auto &Tbl = Databases_[0]->Tables_[Tab];
+                for(Database::Item &Row : Tbl) {
+                    std::vector<std::string> Cells;
+                    Cells.reserve(ArgOps.size());
+                    for(const auto &[Kind, Pay] : ArgOps) {
+                        const auto V = ReadCastProjectionSource(Row, Kind, Pay);
+                        Cells.push_back(V.value_or(std::string()));
+                    }
+                    const std::optional<std::string> OutV = EvalScalarSqlFn(Fn, Cells, Row);
+                    if(!OutV.has_value())
+                        Row.erase(*OutCol);
+                    else
+                        Row[*OutCol] = *OutV;
+                }
+            });
+            PushOwningStringHeap(new std::string(std::move(Tab)));
+            ++Ic;
+            break;
+        }
         case Opcode::KEEP_ROWS: {
             ++Ic;
             break;
@@ -2257,13 +3051,14 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             const size_t NeedAssign = static_cast<size_t>(*Na) * 2;
             if(Oi + NeedAssign > inst.Operands.size())
                 FailVm("UPDATE_MATCHING: truncated assignments");
-            Database::Item NewVals;
+            std::vector<std::pair<std::string, std::string>> Assignments;
+            Assignments.reserve(static_cast<size_t>(*Na));
             for(size_t K = 0; K < static_cast<size_t>(*Na); ++K) {
                 auto *Cn = std::get_if<std::string>(&inst.Operands[Oi++]);
-                auto *Vn = std::get_if<std::string>(&inst.Operands[Oi++]);
-                if(!Cn || !Vn)
-                    FailVm("UPDATE_MATCHING assignment must be strings");
-                NewVals[*Cn] = *Vn;
+                auto *Blob = std::get_if<std::string>(&inst.Operands[Oi++]);
+                if(!Cn || !Blob)
+                    FailVm("UPDATE_MATCHING assignment must be column/expression");
+                Assignments.emplace_back(*Cn, *Blob);
             }
             std::vector<std::vector<RowTriple>> Branches;
             size_t End = 0;
@@ -2272,7 +3067,9 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             if(Databases_.empty())
                 Databases_.push_back(std::make_unique<Database>(DatabasePath_));
             Database *Db = Databases_[0].get();
-            Db->Update(*TableNm, [&](const Database::Item &Row) { return MatchWhereDnf(Db, Row, Branches); }, NewVals)
+            Db->UpdateWithSetExprs(*TableNm,
+                                   [&](const Database::Item &Row) { return MatchWhereDnf(Db, Row, Branches); },
+                                   Assignments)
                 .get();
             ++Ic;
             break;
@@ -2693,9 +3490,60 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
         }
         // Advanced aggregations
         case Opcode::ROLLUP:
-        case Opcode::CUBE:
+        case Opcode::CUBE: {
+            if(inst.Operands.size() < 2)
+                FailVm("ROLLUP/CUBE expects mode, key count, and key columns");
+            const auto *Nk = std::get_if<int64_t>(&inst.Operands[1]);
+            if(!Nk || *Nk < 0 || *Nk > 64 || inst.Operands.size() < static_cast<size_t>(2 + *Nk))
+                FailVm("ROLLUP/CUBE bad operand layout");
+            std::vector<std::string> Keys;
+            Keys.reserve(static_cast<size_t>(*Nk));
+            for(int64_t I = 0; I < *Nk; ++I) {
+                const auto *Ks = std::get_if<std::string>(&inst.Operands[static_cast<size_t>(2 + I)]);
+                if(!Ks || Ks->empty())
+                    FailVm("ROLLUP/CUBE key must be non-empty string");
+                Keys.push_back(*Ks);
+            }
+            if(StackSlots_.empty())
+                FailVm("ROLLUP/CUBE expects table name on stack");
+            std::string TableName = PopOwnedStringMoved("ROLLUP/CUBE table");
+            if(Databases_.empty())
+                Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+            Database *DbOlap = Databases_[0].get();
+            const bool Cube = (inst.Opcode == Opcode::CUBE);
+            DbOlap->WithExclusiveBytecodeLock([&]() {
+                auto &Tbl = DbOlap->Tables_[TableName];
+                RunOlapModifier(Tbl, inst, Keys, Cube);
+            });
+            PushOwningStringHeap(new std::string(TableName));
+            ++Ic;
+            break;
+        }
         case Opcode::GROUPING_SETS: {
-            // TODO: Implement advanced grouping operations
+            if(inst.Operands.size() < 2)
+                FailVm("GROUPING_SETS expects mode, key count, and key columns");
+            const auto *Nk = std::get_if<int64_t>(&inst.Operands[1]);
+            if(!Nk || *Nk < 0 || *Nk > 64 || inst.Operands.size() < static_cast<size_t>(2 + *Nk))
+                FailVm("GROUPING_SETS bad operand layout");
+            std::vector<std::string> Keys;
+            Keys.reserve(static_cast<size_t>(*Nk));
+            for(int64_t I = 0; I < *Nk; ++I) {
+                const auto *Ks = std::get_if<std::string>(&inst.Operands[static_cast<size_t>(2 + I)]);
+                if(!Ks || Ks->empty())
+                    FailVm("GROUPING_SETS key must be non-empty string");
+                Keys.push_back(*Ks);
+            }
+            if(StackSlots_.empty())
+                FailVm("GROUPING_SETS expects table name on stack");
+            std::string TableName = PopOwnedStringMoved("GROUPING_SETS table");
+            if(Databases_.empty())
+                Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+            Database *DbGs = Databases_[0].get();
+            DbGs->WithExclusiveBytecodeLock([&]() {
+                auto &Tbl = DbGs->Tables_[TableName];
+                RunGroupingSetsOlap(Tbl, inst, Keys);
+            });
+            PushOwningStringHeap(new std::string(TableName));
             ++Ic;
             break;
         }

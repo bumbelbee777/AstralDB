@@ -63,7 +63,9 @@ struct TableConstraintDef {
     std::string Name;
     std::vector<std::string> Columns;
     std::string RefTable;
-    std::string RefColumn;
+    std::vector<std::string> RefColumns;
+    /** 0=RESTRICT, 1=CASCADE, 2=SET NULL (ON DELETE). */
+    int OnDeleteAction = 0;
     std::string CheckSql;
 };
 
@@ -90,6 +92,14 @@ struct LiteralAST : public ExpressionAST {
 
 struct NullLiteralAST : public ExpressionAST {
     NullLiteralAST() = default;
+    void EmitBytecode(BytecodeScratch& Instructions) const override;
+};
+
+/** SQL boolean literal (\c TRUE / \c FALSE keywords). */
+struct BooleanLiteralAST : public ExpressionAST {
+    bool Value = false;
+
+    explicit BooleanLiteralAST(bool ValueIn) : Value(ValueIn) {}
     void EmitBytecode(BytecodeScratch& Instructions) const override;
 };
 
@@ -133,6 +143,27 @@ struct ExistsPredAST : public ExpressionAST {
 /** Target family for `CAST(... AS type)` (cells stay strings; selects conversion rules in the VM). */
 enum class SqlCastTarget : int8_t { Text = 0, Integer = 1, Real = 2, Boolean = 3 };
 
+/** Built-in scalar functions allowed in SELECT projections (evaluated via \c Opcode::SCALAR_FUNC_EVAL ). */
+enum class ScalarSqlFn : int8_t {
+	Upper = 0,
+	Lower = 1,
+	CharLength = 2,
+	/** SQL-99 \c SUBSTRING(expr FROM start [FOR length]) or three-argument comma form; two args = suffix from start. */
+	SubstringFromFor = 3,
+	PositionIn = 4,
+	TrimBoth = 5,
+	TrimLeading = 6,
+	TrimTrailing = 7,
+	ConcatVariadic = 8,
+	ExtractYear = 9,
+	ExtractMonth = 10,
+	ExtractDay = 11,
+	DateAddDays = 12,
+	DateSubDays = 13,
+	DateDiffDays = 14,
+	Grouping = 15,
+};
+
 /** Searched-only `CASE WHEN … THEN … [ELSE …] END` for SELECT projections (lowered via \c Opcode::CASE_EVAL ). */
 struct CaseExprAST : public ExpressionAST {
     struct Arm {
@@ -159,11 +190,40 @@ struct CastExprAST : public ExpressionAST {
     void EmitBytecode(BytecodeScratch& Instructions) const override;
 };
 
+/** SQL-99-style scalar builtin in a SELECT list (\c UPPER , \c SUBSTRING … FOR … , etc.). */
+struct ScalarFuncExprAST : public ExpressionAST {
+	ScalarSqlFn Fn = ScalarSqlFn::Upper;
+	std::vector<std::unique_ptr<ExpressionAST>> Args;
+
+	ScalarFuncExprAST(ScalarSqlFn Kind, std::vector<std::unique_ptr<ExpressionAST>> Arguments)
+	    : Fn(Kind), Args(std::move(Arguments)) {}
+
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
 struct ColumnRefAST : public ExpressionAST {
     std::string Name;
 
     explicit ColumnRefAST(std::string Name) : Name(std::move(Name)) {}
     void EmitBytecode(BytecodeScratch& Instructions) const override;
+};
+
+/** Qualified column for SET / MERGE (\c EXCLUDED.col , \c source_alias.col ). */
+struct QualifiedRefAST : public ExpressionAST {
+	enum class Role { Target, Excluded, Source };
+	Role RefRole = Role::Target;
+	std::string Column;
+
+	QualifiedRefAST(Role RefRole, std::string Column) : RefRole(RefRole), Column(std::move(Column)) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
+/** \c GROUPING(col) in SELECT (requires OLAP \c GROUP BY). */
+struct GroupingExprAST : public ExpressionAST {
+	std::string Column;
+
+	explicit GroupingExprAST(std::string Column) : Column(std::move(Column)) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
 };
 
 struct TableAST : public ExpressionAST {
@@ -227,9 +287,10 @@ struct DataExchangeAST : public StatementAST {
 struct DropAST : public StatementAST {
     std::string TableName;
     bool IfExists = false;
+	bool Cascade = false;
 
-    explicit DropAST(std::string TableName, bool IfExists = false)
-        : TableName(std::move(TableName)), IfExists(IfExists) {}
+    explicit DropAST(std::string TableName, bool IfExists = false, bool CascadeIn = false)
+        : TableName(std::move(TableName)), IfExists(IfExists), Cascade(CascadeIn) {}
     void EmitBytecode(BytecodeScratch& Instructions) const override;
 };
 
@@ -263,6 +324,9 @@ private:
 
 enum class GroupAggMode { None, CountStar, CountDistinct };
 
+/** OLAP modifier after \c GROUP BY column list (\c WITH ROLLUP / \c WITH CUBE). */
+enum class GroupOlapModifier { None, Rollup, Cube, GroupingSets };
+
 /** GROUP BY aggregates beyond COUNT(*); codegen packs into Opcode::GROUP_BY extended layout. */
 enum class GroupCombAggKind : int { Sum = 0, Min = 1, Max = 2, Avg = 3 };
 
@@ -281,6 +345,44 @@ struct JoinClause {
     std::vector<std::pair<std::string, std::string>> OnPairs;
 };
 
+enum class WindowFnKind : int8_t {
+    RowNumber = 0,
+    Rank = 1,
+    DenseRank = 2,
+    Sum = 3,
+    Min = 4,
+    Max = 5,
+    Avg = 6,
+    Lag = 7,
+    Lead = 8
+};
+
+enum class WindowFrameBoundKind : int8_t {
+    UnboundedPreceding = 0,
+    Preceding = 1,
+    CurrentRow = 2,
+    Following = 3,
+    UnboundedFollowing = 4
+};
+
+struct WindowFrameBound {
+    WindowFrameBoundKind Kind = WindowFrameBoundKind::CurrentRow;
+    int64_t Offset = 0;
+};
+
+struct WindowSpec {
+    WindowFnKind Kind = WindowFnKind::RowNumber;
+    std::string SourceColumn;
+    std::vector<std::string> PartitionBy;
+    std::string OrderColumn;
+    bool OrderAscending = true;
+    std::string OutputColumn;
+    int64_t FrameOffset = 1;
+    bool HasExplicitRowsFrame = false;
+    WindowFrameBound FrameStart{WindowFrameBoundKind::UnboundedPreceding};
+    WindowFrameBound FrameEnd{WindowFrameBoundKind::CurrentRow};
+};
+
 class SelectAST : public StatementAST {
 public:
     SelectAST(std::vector<std::string> Columns,
@@ -294,14 +396,13 @@ public:
               std::vector<std::string> GroupByColumns = {},
               GroupAggMode AggMode = GroupAggMode::None,
               std::optional<std::string> CountDistinctColumn = std::nullopt,
-              std::optional<std::pair<std::string, bool>> RowNumberOverOrderBy = {},
-              std::vector<std::string> RowNumberPartitionByColumns = {},
-              std::string RowNumberAlias = "rn",
-              int WindowOrdinalKind = 0,
+              std::vector<WindowSpec> WindowSpecs = {},
               std::vector<JoinClause> Joins = {},
               std::vector<GroupCombAgg> CombinedAggs = {},
               std::vector<std::unique_ptr<ExpressionAST>> ProjectionExprsIn = {},
-              std::string CountAggregateOutputColumn = {})
+              std::string CountAggregateOutputColumn = {},
+              GroupOlapModifier OlapModifier = GroupOlapModifier::None,
+              std::vector<std::vector<std::string>> GroupingSetsList = {})
         : Columns_(std::move(Columns))
         , Table_(std::move(Table))
         , WhereClause_(std::move(WhereClause))
@@ -313,13 +414,12 @@ public:
         , GroupByColumns_(std::move(GroupByColumns))
         , AggMode_(AggMode)
         , CountDistinctColumn_(std::move(CountDistinctColumn))
-        , RowNumberOverOrderBy_(std::move(RowNumberOverOrderBy))
-        , RowNumberPartitionByColumns_(std::move(RowNumberPartitionByColumns))
-        , RowNumberAlias_(std::move(RowNumberAlias))
-        , WindowOrdinalKind_(WindowOrdinalKind)
+        , WindowSpecs_(std::move(WindowSpecs))
         , Joins_(std::move(Joins))
         , CombinedAggs_(std::move(CombinedAggs))
-        , CountAggregateOutputColumn_(std::move(CountAggregateOutputColumn)) {
+        , CountAggregateOutputColumn_(std::move(CountAggregateOutputColumn))
+        , OlapModifier_(OlapModifier)
+        , GroupingSetsList_(std::move(GroupingSetsList)) {
         if(ProjectionExprsIn.empty()) {
             ProjectionExprs_.clear();
             ProjectionExprs_.resize(Columns_.size());
@@ -341,12 +441,7 @@ public:
     const std::vector<std::string> &GroupKeys() const { return GroupByColumns_; }
     GroupAggMode AggKind() const { return AggMode_; }
     const std::optional<std::string> &CountDistinctColumn() const { return CountDistinctColumn_; }
-    const std::optional<std::pair<std::string, bool>> &RowNumberOrderSpec() const {
-        return RowNumberOverOrderBy_;
-    }
-    int WindowOrdinalKind() const { return WindowOrdinalKind_; }
-    const std::vector<std::string> &RowNumberPartitionByColumns() const { return RowNumberPartitionByColumns_; }
-    const std::string &RowNumberOutColumn() const { return RowNumberAlias_; }
+    const std::vector<WindowSpec> &WindowSpecs() const { return WindowSpecs_; }
     bool DistinctSelected() const { return Distinct_; }
     const std::vector<std::pair<std::string, bool>> &OrderBySpecs() const { return OrderByColumns_; }
     int64_t SelectLimitValue() const { return Limit_; }
@@ -355,6 +450,8 @@ public:
     const ExpressionAST *HavingRoot() const { return HavingClause_.get(); }
     const std::vector<JoinClause> &JoinSpecs() const { return Joins_; }
     const std::vector<GroupCombAgg> &ComboAggs() const { return CombinedAggs_; }
+    GroupOlapModifier OlapKind() const { return OlapModifier_; }
+    const std::vector<std::vector<std::string>> &GroupingSets() const { return GroupingSetsList_; }
     const std::vector<std::string> &ProjectionColumns() const { return Columns_; }
     const std::vector<std::unique_ptr<ExpressionAST>> &ProjectionExprs() const { return ProjectionExprs_; }
 
@@ -387,21 +484,25 @@ private:
     GroupAggMode AggMode_;
     /** When \c AggMode_ is \c CountDistinct , the column whose distinct values are counted per group key. */
     std::optional<std::string> CountDistinctColumn_;
-    std::optional<std::pair<std::string, bool>> RowNumberOverOrderBy_;
-    /** Empty = whole table is one partition (legacy `OVER (ORDER BY …)` behavior). */
-    std::vector<std::string> RowNumberPartitionByColumns_;
-    std::string RowNumberAlias_;
-    /** With \c RowNumberOverOrderBy_ set: \c 0 = \c ROW_NUMBER() , \c 1 = \c RANK() , \c 2 = \c DENSE_RANK() . */
-    int WindowOrdinalKind_ = 0;
+    std::vector<WindowSpec> WindowSpecs_;
     std::vector<JoinClause> Joins_;
     std::vector<GroupCombAgg> CombinedAggs_;
     /** Parallel to Columns_: nullptr means a plain projected column name; otherwise CASE (etc.) lowered after pipeline. */
     std::vector<std::unique_ptr<ExpressionAST>> ProjectionExprs_;
 	/** Non-empty when \c AggMode_ is \c CountStar or \c CountDistinct : \c AS alias or default \c cnt . */
 	std::string CountAggregateOutputColumn_;
+	GroupOlapModifier OlapModifier_ = GroupOlapModifier::None;
+	std::vector<std::vector<std::string>> GroupingSetsList_;
 };
 
-enum class CompoundSetOpKind : int8_t { UnionDistinct = 0, UnionAll = 1, Intersect = 2, Except = 3 };
+enum class CompoundSetOpKind : int8_t {
+	UnionDistinct = 0,
+	UnionAll = 1,
+	Intersect = 2,
+	IntersectAll = 3,
+	Except = 4,
+	ExceptAll = 5
+};
 
 /** UNION / INTERSECT / EXCEPT: each arm is a full SELECT through HAVING (no ORDER/LIMIT on arms). */
 struct CompoundSelectAST : public StatementAST {
@@ -439,9 +540,13 @@ struct DropViewAST : public StatementAST {
 };
 
 struct CteClause {
-    std::string Alias;
-    std::string PhysicalTable;
-    std::unique_ptr<SelectAST> Definition;
+	std::string Alias;
+	std::string PhysicalTable;
+	std::unique_ptr<SelectAST> Anchor;
+	/** Non-null for \c WITH RECURSIVE … anchor \c UNION ALL recursive_step . */
+	std::unique_ptr<SelectAST> RecursiveStep;
+
+	bool IsRecursive() const { return RecursiveStep != nullptr; }
 };
 
 struct WithSelectAST : public StatementAST {
@@ -450,14 +555,53 @@ struct WithSelectAST : public StatementAST {
     void EmitBytecode(BytecodeScratch& Instructions) const override;
 };
 
+/** One \c DO UPDATE SET assignment in \c INSERT … ON CONFLICT (literal or \c EXCLUDED.col). */
+struct UpsertAssign {
+	std::string Column;
+	std::unique_ptr<ExpressionAST> Value;
+};
+
+/** INSERT … ON CONFLICT … DO UPDATE / DO NOTHING (upsert). */
+struct UpsertSpec {
+	enum class OnConflict { Update, Nothing };
+	OnConflict Mode = OnConflict::Update;
+	std::vector<std::string> ConflictColumns;
+	std::vector<UpsertAssign> UpdateAssignments;
+};
+
 struct InsertAST : public ExpressionAST {
     std::unique_ptr<TableAST> Table;
     std::vector<std::string> Columns;
     std::vector<std::vector<std::string>> Values;
+	std::optional<UpsertSpec> Upsert_;
 public:
-    InsertAST(std::unique_ptr<TableAST> Table, std::vector<std::string> Columns, std::vector<std::vector<std::string>> Values)
-        : Table(std::move(Table)), Columns(std::move(Columns)), Values(std::move(Values)) {}
+    InsertAST(std::unique_ptr<TableAST> Table, std::vector<std::string> Columns,
+              std::vector<std::vector<std::string>> Values, std::optional<UpsertSpec> Upsert = std::nullopt)
+        : Table(std::move(Table)), Columns(std::move(Columns)), Values(std::move(Values)), Upsert_(std::move(Upsert)) {}
     void EmitBytecode(BytecodeScratch& Instructions) const override;
+};
+
+struct MergeMatchedSet {
+	std::string TargetColumn;
+	std::unique_ptr<ExpressionAST> Value;
+};
+
+struct MergeInsertField {
+	std::string Column;
+	std::unique_ptr<ExpressionAST> Value;
+};
+
+struct MergeAST : public StatementAST {
+	std::string TargetTable;
+	std::string TargetAlias;
+	std::string SourceTable;
+	std::string SourceAlias;
+	std::vector<std::pair<std::string, std::string>> OnKeyPairs;
+	std::vector<MergeMatchedSet> Matched;
+	std::vector<MergeInsertField> NotMatched;
+	bool HasMatchedBranch = false;
+	bool HasNotMatchedBranch = false;
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
 };
 
 /** INSERT INTO t [ (cols) ] BULK count [ START n ] [ STEP n ] — codegen expands deterministic rows (testing / fixtures). */
@@ -475,13 +619,13 @@ struct BulkInsertAST : public ExpressionAST {
 
 struct UpdateAST : public ExpressionAST {
     std::string TableName;
-    std::vector<std::pair<std::string, std::string>> Assignments;
+    std::vector<std::pair<std::string, std::unique_ptr<ExpressionAST>>> Assignments;
     std::unique_ptr<ExpressionAST> Condition;
 
-    UpdateAST(std::string TableName, 
-              std::vector<std::pair<std::string, std::string>> Assignments,
+    UpdateAST(std::string TableName,
+              std::vector<std::pair<std::string, std::unique_ptr<ExpressionAST>>> Assignments,
               std::unique_ptr<ExpressionAST> Condition)
-        : TableName(std::move(TableName)),  Assignments(std::move(Assignments)), 
+        : TableName(std::move(TableName)), Assignments(std::move(Assignments)),
           Condition(std::move(Condition)) {}
     void EmitBytecode(BytecodeScratch& Instructions) const override;
 };
@@ -521,10 +665,13 @@ struct GrantAST : public ExpressionAST {
     std::string TableName;
 	std::vector<std::string> Columns;
 	bool GranteeIsRole = false;
-    GrantAST(std::string GranteeIn, Permissions PermsIn, std::string Table = "",
-             std::vector<std::string> ColumnsIn = {}, bool GranteeIsRoleIn = false)
+	bool WithGrantOption = false;
+    GrantAST(std::string GranteeIn, Permissions PermsIn, std::string Table = {},
+             std::vector<std::string> ColumnsIn = {}, bool GranteeIsRoleIn = false,
+             bool WithGrantOptionIn = false)
         : Grantee(std::move(GranteeIn)), Perms(PermsIn), TableName(std::move(Table)),
-          Columns(std::move(ColumnsIn)), GranteeIsRole(GranteeIsRoleIn) {}
+          Columns(std::move(ColumnsIn)), GranteeIsRole(GranteeIsRoleIn),
+          WithGrantOption(WithGrantOptionIn) {}
     void EmitBytecode(BytecodeScratch& Instructions) const override;
 };
 
@@ -608,6 +755,7 @@ class Parser {
     unsigned NextAnonCaseAlias_ = 0;
     unsigned NextAnonCastAlias_ = 0;
     unsigned NextAnonCoalesceAlias_ = 0;
+    unsigned NextAnonScalarSqlFnAlias_ = 0;
     /** During WITH ... SELECT, map logical CTE alias -> materialized table name (__astral_cte_*). */
     std::unordered_map<std::string, std::string> CteSubstitutions_;
     /** When true, \c ParsePrimary accepts \c COUNT/SUM/MIN/MAX/AVG(…) for \c HAVING only. */
@@ -683,10 +831,17 @@ class Parser {
     std::unique_ptr<CaseExprAST> ParseSearchedCaseExpression();
     std::unique_ptr<CaseExprAST> ParseCoalesceExpression();
     std::unique_ptr<ExpressionAST> ParseCaseScalarResult();
+    /** RHS for UPDATE / UPSERT / MERGE SET (literals, qualified refs, + - * /). */
+    std::unique_ptr<ExpressionAST> ParseSetValueExpression(const std::optional<std::string> &TargetAlias,
+                                                         const std::optional<std::string> &SourceAlias,
+                                                         bool AllowExcluded);
+    /** If the lookahead starts a supported scalar builtin, consumes it and leaves the cursor past ')'; else nullptr. */
+    std::unique_ptr<ScalarFuncExprAST> TryParseScalarSqlBuiltinSelectExpr();
     /** `ParseDataType()` result → cast family; \c ParseFail on unsupported `CAST` targets. */
     SqlCastTarget ParseCastTargetFromDataType(std::string ParsedType);
     ASTNode ParseExistsPredicate(bool Negated);
     ASTNode ParseInsertStatement();
+	ASTNode ParseMergeStatement();
     ASTNode ParseUpdateStatement();
     ASTNode ParseDeleteStatement();
     ASTNode ParseWhereClause();
@@ -705,6 +860,7 @@ class Parser {
     std::vector<std::string> ParseColumnConstraintList();
     TableConstraintDef ParseTableConstraint();
     ASTNode ParseUnaryOrPostfixPredicate();
+    void ParseWindowOverClause(WindowSpec &Ws);
 
 	[[noreturn]] void ParseFail(std::string Message) const;
 	[[noreturn]] void LexFail(std::size_t ByteOffset, std::string Message) const;

@@ -30,10 +30,25 @@ namespace AstralDB {
 #define PREFETCH(Address)
 #endif
 
+enum class ReferentialAction : uint8_t { Restrict = 0, Cascade = 1, SetNull = 2 };
+
 struct ForeignKey {
-    std::string ColumnName;
-    std::string ReferencedTable;
-    std::string ReferencedColumn;
+	std::string ColumnName;
+	std::string ReferencedTable;
+	std::string ReferencedColumn;
+	ReferentialAction OnDelete = ReferentialAction::Restrict;
+};
+
+/** Single assignment in \c MERGE … WHEN MATCHED THEN UPDATE (serialized SET expression). */
+struct MergeUpdateCell {
+	std::string TargetColumn;
+	std::string ValueExpr;
+};
+
+/** Single column in \c MERGE … WHEN NOT MATCHED THEN INSERT (serialized SET expression). */
+struct MergeInsertCell {
+	std::string Column;
+	std::string ValueExpr;
 };
 
 class Database {
@@ -111,8 +126,12 @@ private:
 	void AppendWalAfterRevokeRoleAcl(const std::string &RoleName, const std::string &Table, int Bits);
 	void AppendWalAfterFineGrant(const std::string &UserName, const RowColPermission &Rule);
 	void AppendWalAfterFineRevoke(const std::string &UserName, const RowColPermission &Rule);
+	void AppendWalAfterForeignKey(const std::string &TableName, const ForeignKey &Key);
 
 	void RejectRowIfChecksFailAssumeLocked(const std::string &TableName, const Item &Row) const;
+	void RejectRowIfForeignKeysFailAssumeLocked(const std::string &TableName, const Item &Row) const;
+	void RejectDeleteIfReferencedAssumeLocked(const std::string &ParentTable, const Item &ParentRow);
+	void CollectFkDependentTablesAssumeLocked(const std::string &RootTable, std::vector<std::string> &Out) const;
 	void AuditRecordAssumeLocked(const std::string &Event, const std::string &Detail, const std::string &Outcome) const;
 
 	bool AclEnforcementActiveAssumeLocked() const;
@@ -165,12 +184,29 @@ public:
     std::future<void> CreateTable(const std::string &TableName, const Schema &Columns);
     std::future<void> AddColumn(const std::string &TableName, const Column &NewColumn);
     std::future<void> DropColumn(const std::string &TableName, const std::string &ColumnName);
-    std::future<void> DropTable(const std::string &TableName);
-    std::future<void> Insert(const std::string &TableName, const Item &Row);
+    std::future<void> DropTable(const std::string &TableName, bool Cascade = false);
+	std::future<void> RenameColumn(const std::string &TableName, const std::string &FromColumn,
+	                               const std::string &ToColumn);
+	std::future<void> Insert(const std::string &TableName, const Item &Row);
+	/** \a ConflictColumns empty means all \c PRIMARY KEY columns. \a DoNothingOnConflict skips insert when keys match;
+	 *  otherwise \a UpdateValues are merged into the existing row. */
+	std::future<void> Upsert(const std::string &TableName, const Item &InsertRow,
+	                         const std::vector<std::string> &ConflictColumns, bool DoNothingOnConflict,
+	                         const std::vector<std::pair<std::string, std::string>> &UpdateAssignments);
+	/** For each row in \a SourceTable, match all \a KeyPairs (target col → source col); run \a OnMatch updates or
+	 *  build a row from \a OnInsert and insert. Assignment values are serialized SET expressions. */
+	std::future<void> MergeUsing(const std::string &TargetTable, const std::string &SourceTable,
+	                             const std::vector<std::pair<std::string, std::string>> &KeyPairs,
+	                             const std::vector<MergeUpdateCell> &OnMatch,
+	                             const std::vector<MergeInsertCell> &OnInsert);
     std::future<void> Delete(const std::string &TableName, const std::function<bool(const Item&)> &Condition);
     std::future<void> Update(const std::string &TableName,
                              const std::function<bool(const Item&)> &Condition,
                              const Item &NewValues);
+	/** Like \c Update but evaluates serialized SET expressions per matching row. */
+	std::future<void> UpdateWithSetExprs(const std::string &TableName,
+	                                     const std::function<bool(const Item &)> &Condition,
+	                                     const std::vector<std::pair<std::string, std::string>> &Assignments);
     std::future<Table> Select(const std::string &TableName, const std::function<bool(const Item&)> &Condition) const;
     std::future<bool> ValidateRow(const std::string &TableName, const Item &Row) const;
 	/** Stored compiled table CHECK list; bytecode VM invokes after CREATE. Serializes via DbMutex_. */
@@ -183,6 +219,7 @@ public:
 	/** Snapshot from \c TableSchemas_ without locking. Only call while \c DbMutex_ is already held exclusively
 	 *  (same thread as DELETE/UPDATE matchers) or from other contexts where concurrent schema mutation cannot occur. */
 	std::optional<Schema> TableSchemaAssumeDbMutexHeld(const std::string &TableName) const;
+	void SetTableSchemaAssumeDbMutexHeld(const std::string &TableName, Schema Schema);
 
     std::future<Table> JoinTables(const std::string &LeftTable, const std::string &RightTable,
                                   const std::function<bool(const Item&, const Item&)> &JoinCondition) const;
@@ -279,5 +316,6 @@ public:
 	void ReplayWalRevokeRoleAcl(const std::string &RoleName, const std::string &Table, int Bits);
 	void ReplayWalFineGrant(const std::string &UserName, RowColPermission Rule);
 	void ReplayWalFineRevoke(const std::string &UserName, RowColPermission Rule);
+	void ReplayWalAddForeignKey(const std::string &TableName, ForeignKey Key);
 };
 }

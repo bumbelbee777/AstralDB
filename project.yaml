@@ -13,7 +13,7 @@ project_dirs:
   - sources/DS
 output: bin/libastraldb.a
 compiler_flags:
-  global: "-Wall -Wextra -Werror -Isources -Ithird_party -Itests"
+  global: "-Wall -Wextra -Werror -fstack-protector-strong -fpie -Isources -Ithird_party -Itests"
   common: "-O2"
   cpp: ""
   ar: ""

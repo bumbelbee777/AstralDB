@@ -27,8 +27,14 @@ struct Limits {
 	static constexpr unsigned MaxSqlViewExpansionDepth = 16U;
 	/** `ROW_NUMBER() OVER (PARTITION BY …)` emits this many identifiers at codegen; rejects larger lists early. */
 	static constexpr std::size_t MaxWindowPartitionColumns = 16ULL;
+	/** Window functions (\c ROW_NUMBER , \c SUM() OVER , \c LAG , …) per \c SELECT list. */
+	static constexpr std::size_t MaxWindowFunctionsPerSelect = 16ULL;
 	/** Searched `CASE WHEN … THEN …` arms in one expression; rejects larger lists early. */
 	static constexpr std::size_t MaxCaseWhenArms = 32ULL;
+	/** Scalar SQL builtin arguments (`CONCAT`, etc.) per function call in a SELECT projection. */
+	static constexpr std::size_t MaxScalarSqlFuncArgs = 16ULL;
+	/** \c WITH RECURSIVE fixpoint iterations (row-growth rounds) per CTE. */
+	static constexpr std::uint64_t MaxCteRecursionDepth = 1'000'000ULL;
 };
 
 } // namespace AstralDB

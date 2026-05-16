@@ -11,3 +11,7 @@ SELECT region, COALESCE(NULL, metric, 0) AS metric_filled FROM dims ORDER BY reg
 CREATE TABLE scores (player TEXT, pts INT);
 INSERT INTO scores VALUES ('a', 10), ('b', 10), ('c', 20), ('d', 30);
 SELECT player, pts, RANK() OVER (ORDER BY pts DESC) AS rk FROM scores ORDER BY pts DESC, player ASC;
+
+CREATE TABLE sub_demo (s TEXT);
+INSERT INTO sub_demo VALUES ('abcdef');
+SELECT SUBSTRING(s FROM 3) AS tail, SUBSTRING(s FROM 2 FOR 3) AS mid FROM sub_demo;

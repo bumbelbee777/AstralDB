@@ -1,5 +1,7 @@
-/* Database before doctest so schema types are parsed before short macro names leak in. */
+﻿/* Database before doctest so schema types are parsed before short macro names leak in. */
 #include <Database/Database.hxx>
+#include <Database/WriteAheadLog.hxx>
+#include <DS/ErrorCorrection.hxx>
 #include <IO/Logger.hxx>
 #include <SQL/SQL.hxx>
 #include <SQL/BytecodeInterpreter.hxx>
@@ -12,8 +14,10 @@
 #include <fstream>
 #include <numeric>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <system_error>
+#include <unordered_map>
 
 namespace fs = std::filesystem;
 
@@ -111,6 +115,76 @@ TEST_CASE("WriteAheadLog: recover schema and row after reopen") {
 	REQUIRE(TableExists(&Db2, "hello"));
 	REQUIRE(AllRows(&Db2, "hello").size() == 1);
 	REQUIRE(AllRows(&Db2, "hello")[0].at("phrase") == "recovery-check");
+}
+
+TEST_CASE("WriteAheadLog: encrypted W1 lines decode on replay") {
+	fs::path Dir = UniqueTempDir("astral_wal_enc_");
+	fs::path DbPath = Dir / "wal_enc.db";
+	std::error_code Ec;
+	fs::remove(DbPath, Ec);
+	fs::remove(DbPath.string() + ".wal", Ec);
+	{
+		AstralDB::WriteAheadLog Wal(DbPath);
+		Wal.AppendLine("T|enc_tbl|1|x|INT|0|0|0|-|-");
+		Wal.Flush();
+		std::ifstream In(DbPath.string() + ".wal");
+		std::string Line;
+		REQUIRE(std::getline(In, Line));
+		REQUIRE(Line.size() >= 3);
+		REQUIRE(Line.compare(0, 3, "W1|") == 0);
+	}
+	AstralDB::Database Db(DbPath, nullptr);
+	REQUIRE(Db.TableSchemaSnapshot("enc_tbl").has_value());
+}
+
+TEST_CASE("DS ErrorCorrection: single-byte flip is recoverable") {
+	const std::string Msg = "T|hello|1|phrase|TEXT|0|0|0|-|-|I|hello|1|phrase|wal";
+	std::string Prot = AstralDB::DS::ErrorCorrection::Protect(Msg);
+	REQUIRE(Prot.size() > 4);
+	Prot[9] ^= 0x37;
+	const auto Rec = AstralDB::DS::ErrorCorrection::Recover(Prot);
+	REQUIRE(Rec.has_value());
+	REQUIRE(*Rec == Msg);
+}
+
+TEST_CASE("Foreign keys persist across database reopen") {
+	fs::path Dir = UniqueTempDir("astral_fk_reopen_");
+	fs::path DbPath = Dir / "fkpersist.db";
+	std::error_code Ec;
+	fs::remove(DbPath, Ec);
+	fs::remove(DbPath.string() + ".wal", Ec);
+	{
+		AstralDB::Database Db(DbPath, nullptr);
+		AstralDB::Database::Schema Par;
+		AstralDB::Database::Column Pk;
+		Pk.Name = "id";
+		Pk.DefaultValue = "INT";
+		Pk.IsPrimaryKey = true;
+		Pk.IsUnique = false;
+		Pk.IsNotNull = false;
+		Par.push_back(Pk);
+		Db.CreateTable("par_fk_persist", Par).get();
+		AstralDB::Database::Schema Chi;
+		AstralDB::Database::Column Ch;
+		Ch.Name = "pid";
+		Ch.DefaultValue = "INT";
+		Ch.IsPrimaryKey = false;
+		Ch.IsUnique = false;
+		Ch.IsNotNull = false;
+		Chi.push_back(Ch);
+		Db.CreateTable("chi_fk_persist", Chi).get();
+		AstralDB::ForeignKey Fk;
+		Fk.ColumnName = "pid";
+		Fk.ReferencedTable = "par_fk_persist";
+		Fk.ReferencedColumn = "id";
+		Fk.OnDelete = AstralDB::ReferentialAction::Restrict;
+		Db.AddForeignKey("chi_fk_persist", Fk).get();
+		Db.Insert("par_fk_persist", {{"id", "1"}}).get();
+		Db.Insert("chi_fk_persist", {{"pid", "1"}}).get();
+		Db.SyncToFile();
+	}
+	AstralDB::Database Db2(DbPath, nullptr);
+	REQUIRE_THROWS_AS(Db2.Insert("chi_fk_persist", {{"pid", "99"}}).get(), std::runtime_error);
 }
 
 TEST_CASE("SQL: CREATE TABLE and INSERT implicit columns execute") {
@@ -1521,6 +1595,392 @@ TEST_CASE("Database: users and ACLs persist across snapshot reopen") {
 		REQUIRE(Db2.HasPermission(*Db2.CurrentUser(), AstralDB::Permissions::Insert, "orders"));
 		REQUIRE(Db2.AuthenticateUser("Admin0", "admin"));
 	}
+}
+
+TEST_CASE("SQL: FOREIGN KEY ON DELETE CASCADE removes dependent rows") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_fk_cascade_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "fk_cascade.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE par_c (id INT PRIMARY KEY); "
+	    "CREATE TABLE chi_c (pid INT NOT NULL, FOREIGN KEY (pid) REFERENCES par_c(id) ON DELETE CASCADE); "
+	    "INSERT INTO par_c VALUES (1); INSERT INTO chi_c VALUES (1); DELETE FROM par_c WHERE id = 1;";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	REQUIRE(AllRows(Db, "chi_c").empty());
+}
+
+TEST_CASE("SQL: FOREIGN KEY ON DELETE SET NULL clears child pointer") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_fk_setnull_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "fk_sn.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE par_sn (id INT PRIMARY KEY); "
+	    "CREATE TABLE chi_sn (pid INT, FOREIGN KEY (pid) REFERENCES par_sn(id) ON DELETE SET NULL); "
+	    "INSERT INTO par_sn VALUES (9); INSERT INTO chi_sn VALUES (9); DELETE FROM par_sn WHERE id = 9;";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	const auto Rows = AllRows(Db, "chi_sn");
+	REQUIRE(Rows.size() == 1);
+	const auto PidIt = Rows[0].find("pid");
+	const bool PidIsNullish = (PidIt == Rows[0].end()) || PidIt->second.empty();
+	REQUIRE(PidIsNullish);
+}
+
+TEST_CASE("SQL: FOREIGN KEY RESTRICT blocks delete and bad INSERT fails") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_fk_restrict_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "fk_r.log").string(), false);
+	{
+		const char *Ok =
+		    "CREATE TABLE par_r (id INT PRIMARY KEY); "
+		    "CREATE TABLE chi_r (pid INT, FOREIGN KEY (pid) REFERENCES par_r(id) ON DELETE RESTRICT); "
+		    "INSERT INTO par_r VALUES (1); INSERT INTO chi_r VALUES (1);";
+		AstralDB::SQL::Parser P1(Ok);
+		AstralDB::SQL::Bytecode C1 =
+		    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+		AstralDB::SQL::BytecodeInterpreter I1(&Log);
+		REQUIRE_NOTHROW(I1.Execute(C1));
+		AstralDB::SQL::Parser Pdel("DELETE FROM par_r WHERE id = 1;");
+		AstralDB::SQL::Bytecode Cdel =
+		    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+		REQUIRE_THROWS_AS(I1.Execute(Cdel), std::runtime_error);
+	}
+	RemoveEphemeralDb(Dir);
+	{
+		const char *BadIns =
+		    "CREATE TABLE par2 (id INT PRIMARY KEY); "
+		    "CREATE TABLE chi2 (pid INT, FOREIGN KEY (pid) REFERENCES par2(id)); "
+		    "INSERT INTO chi2 VALUES (99);";
+		AstralDB::SQL::Parser P2(BadIns);
+		AstralDB::SQL::Bytecode C2 =
+		    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+		AstralDB::SQL::BytecodeInterpreter I2(&Log);
+		REQUIRE_THROWS_AS(I2.Execute(C2), std::runtime_error);
+	}
+}
+
+TEST_CASE("SQL: composite FOREIGN KEY insert succeeds when tuple matches parent PK") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_fk_comp_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "fk_comp.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE pcombo (a INT, b INT, CONSTRAINT pk_combo PRIMARY KEY (a, b)); "
+	    "CREATE TABLE ccombo (ca INT, cb INT, CONSTRAINT fk_combo FOREIGN KEY (ca, cb) REFERENCES pcombo (a, b)); "
+	    "INSERT INTO pcombo VALUES (1, 2); INSERT INTO ccombo VALUES (1, 2);";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	REQUIRE(AllRows(Db, "ccombo").size() == 1);
+	REQUIRE(AllRows(Db, "ccombo")[0].at("ca") == "1");
+	REQUIRE(AllRows(Db, "ccombo")[0].at("cb") == "2");
+}
+
+TEST_CASE("SQL: FETCH FIRST limits ordered rows") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_fetch_first_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "ff.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE ff_t (n INT); INSERT INTO ff_t VALUES (10), (30), (20); "
+	    "SELECT n FROM ff_t ORDER BY n DESC FETCH FIRST 2 ROWS ONLY;";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	const auto Rows = AllRows(Db, "ff_t");
+	REQUIRE(Rows.size() == 2);
+	REQUIRE(Rows[0].at("n") == "30");
+	REQUIRE(Rows[1].at("n") == "20");
+}
+
+TEST_CASE("SQL: ALTER TABLE RENAME COLUMN moves stored cells") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_rename_col_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "rn.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE rn_t (old_nm TEXT); INSERT INTO rn_t VALUES ('keep'); ALTER TABLE rn_t RENAME COLUMN old_nm TO "
+	    "new_nm;";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	const auto Rows = AllRows(Db, "rn_t");
+	REQUIRE(Rows.size() == 1);
+	REQUIRE(Rows[0].at("new_nm") == "keep");
+}
+
+TEST_CASE("SQL: DROP TABLE CASCADE removes referencing tables") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_drop_cascade_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "dc.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE dp (id INT PRIMARY KEY); "
+	    "CREATE TABLE dc (pid INT, FOREIGN KEY (pid) REFERENCES dp(id)); "
+	    "DROP TABLE dp CASCADE;";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	REQUIRE_FALSE(TableExists(Db, "dp"));
+	REQUIRE_FALSE(TableExists(Db, "dc"));
+}
+
+TEST_CASE("SQL: EXTRACT and DATE_ADD on ISO date text") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_extract_date_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "ed.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE dt_row (d TEXT); INSERT INTO dt_row VALUES ('2020-06-15'); "
+	    "SELECT EXTRACT(YEAR FROM d) AS y, DATE_ADD(d, 10) AS d2 FROM dt_row;";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	const auto Rows = AllRows(Db, "dt_row");
+	REQUIRE(Rows.size() == 1);
+	REQUIRE(Rows[0].at("y") == "2020");
+	REQUIRE(!Rows[0].at("d2").empty());
+}
+
+TEST_CASE("SQL: GRANT WITH GRANT OPTION executes") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_grant_opt_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "go.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE go_t (id INT); GRANT SELECT ON go_t TO Admin0 WITH GRANT OPTION;";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+}
+
+TEST_CASE("SQL: VARCHAR(n) does not truncate inserted text (length hint only)") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_varchar_len_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "vc.log").string(), false);
+	const char *Long = "abcdefghijklmnopqrstuvwxyz";
+	const char *Q =
+	    "CREATE TABLE vc_t (s VARCHAR(4)); "
+	    "INSERT INTO vc_t VALUES ('abcdefghijklmnopqrstuvwxyz');";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	REQUIRE(AllRows(Db, "vc_t")[0].at("s") == Long);
+}
+
+TEST_CASE("SQL: MERGE and UPSERT parse and run") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_merge_upsert_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "mu.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE tgt (id INT PRIMARY KEY, v TEXT); "
+	    "CREATE TABLE src (sk INT, v TEXT); "
+	    "INSERT INTO tgt VALUES (1, 'a'); "
+	    "INSERT INTO src VALUES (1, 'b'), (2, 'c'); "
+	    "MERGE INTO tgt AS t USING src AS s ON t.id = s.sk "
+	    "WHEN MATCHED THEN UPDATE SET v = s.v "
+	    "WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.sk, s.v); "
+	    "INSERT INTO tgt (id, v) VALUES (3, 'z'); "
+	    "INSERT INTO tgt (id, v) VALUES (3, 'nope') ON CONFLICT (id) DO UPDATE SET v = 'u'; "
+	    "INSERT INTO tgt (id, v) VALUES (3, 'w') ON CONFLICT DO NOTHING;";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	const auto T = AllRows(Db, "tgt");
+	REQUIRE(T.size() == size_t(3));
+	// id=1 updated from src, id=2 inserted
+	std::unordered_map<std::string, std::string> ById;
+	for(const auto &R : T)
+		ById[R.at("id")] = R.at("v");
+	REQUIRE(ById["1"] == "b");
+	REQUIRE(ById["2"] == "c");
+	REQUIRE(ById["3"] == "u");
+}
+
+TEST_CASE("SQL: UPSERT EXCLUDED and MERGE insert-only branch") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_upsert_excluded_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "ue.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE ex_t (id INT PRIMARY KEY, a TEXT, b TEXT); "
+	    "INSERT INTO ex_t VALUES (1, 'x', 'y'); "
+	    "INSERT INTO ex_t (id, a, b) VALUES (1, 'p', 'q') ON CONFLICT (id) DO UPDATE SET a = EXCLUDED.a, b = "
+	    "'fixed'; "
+	    "CREATE TABLE m_only (id INT PRIMARY KEY, v TEXT); "
+	    "CREATE TABLE m_src (sk INT, v TEXT); "
+	    "INSERT INTO m_src VALUES (9, 'nine'); "
+	    "MERGE INTO m_only AS t USING m_src AS s ON t.id = s.sk "
+	    "WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.sk, s.v);";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	REQUIRE(AllRows(Db, "ex_t").size() == size_t(1));
+	REQUIRE(AllRows(Db, "ex_t")[0].at("a") == "p");
+	REQUIRE(AllRows(Db, "ex_t")[0].at("b") == "fixed");
+	REQUIRE(AllRows(Db, "m_only").size() == size_t(1));
+	REQUIRE(AllRows(Db, "m_only")[0].at("id") == "9");
+}
+
+TEST_CASE("SQL: GROUP BY WITH ROLLUP produces subtotal rows") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_rollup_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "ru.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE ru (k TEXT, n INT); "
+	    "INSERT INTO ru VALUES ('a', 1), ('a', 2), ('b', 3); "
+	    "SELECT k, cnt FROM ru GROUP BY k WITH ROLLUP;";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	const auto Rows = AllRows(Db, "ru");
+	REQUIRE(Rows.size() == size_t(3));
+	std::unordered_map<std::string, std::string> Grand;
+	for(const auto &R : Rows) {
+		if(R.at("_olap_level") == "0")
+			Grand = R;
+	}
+	REQUIRE(Grand.at("k").empty());
+	REQUIRE(Grand.at("cnt") == "3");
+}
+
+TEST_CASE("SQL: GROUPING SETS and GROUPING()") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_gs_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "gs.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE gs (region TEXT, product TEXT, amt INT); "
+	    "INSERT INTO gs VALUES ('east', 'a', 10), ('east', 'b', 20), ('west', 'a', 30); "
+	    "SELECT region, product, COUNT(*) AS cnt, GROUPING(region) AS gr FROM gs "
+	    "GROUP BY region, product GROUPING SETS ((region, product), (region), ());";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	const auto Rows = AllRows(Db, "gs");
+	REQUIRE(Rows.size() == size_t(6));
+}
+
+TEST_CASE("SQL: MERGE composite ON and expression SET") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_mexpr_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "mx.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE mt (id INT PRIMARY KEY, a INT, b INT); "
+	    "CREATE TABLE ms (sk INT, x INT, y INT); "
+	    "INSERT INTO mt VALUES (1, 10, 1); "
+	    "INSERT INTO ms VALUES (1, 5, 1); "
+	    "MERGE INTO mt AS t USING ms AS s ON t.id = s.sk AND t.b = s.y "
+	    "WHEN MATCHED THEN UPDATE SET a = t.a + s.x; "
+	    "UPDATE mt SET b = b + 1 WHERE id = 1;";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	REQUIRE(AllRows(Db, "mt")[0].at("a") == "15");
+	REQUIRE(AllRows(Db, "mt")[0].at("b") == "2");
+}
+
+TEST_CASE("SQL: CREATE SEQUENCE rejected") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	REQUIRE_THROWS_AS(AstralDB::SQL::Parser("CREATE SEQUENCE seq;"), std::runtime_error);
+}
+
+TEST_CASE("SQL: INSERT into nonexistent table fails at execute") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_ins_miss_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "im.log").string(), false);
+	AstralDB::SQL::Parser P("INSERT INTO __astral_absent_relation_z VALUES (1);");
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_THROWS_AS(I.Execute(Code), std::runtime_error);
+}
+
+TEST_CASE("SQL: GENERATED AS IDENTITY column constraint rejected") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	REQUIRE_THROWS_AS(
+	    AstralDB::SQL::Parser("CREATE TABLE gid (id INT GENERATED ALWAYS AS IDENTITY);"), std::runtime_error);
 }
 
 TEST_CASE("examples: every *.sql parses, compiles, runs") {

@@ -17,6 +17,7 @@ add_library(astraldb STATIC
     sources/SQL/Codegen.cxx
     sources/SQL/Optimizer.cxx
     sources/SQL/Parser.cxx
+    sources/SQL/SetExprEval.cxx
 )
 
 target_include_directories(astraldb

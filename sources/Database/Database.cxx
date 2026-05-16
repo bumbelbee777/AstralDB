@@ -1,4 +1,6 @@
 #include <Database/Database.hxx>
+#include <Database/AtRestKey.hxx>
+#include <SQL/SetExprEval.hxx>
 #include <IO/Error.hxx>
 #include <DS/LZ4.hxx>
 #include <DS/XChaCha20.hxx>
@@ -103,11 +105,6 @@ std::string ReadPathText(const std::filesystem::path &P) {
 
 namespace {
 
-/** Fixed at-rest key for on-disk snapshots (random nonce per sync). Older snapshot files encrypted
- *  with uncorrelated random keys cannot be decrypted; WAL replay rebuilds schema when DB file absent.
- */
-constexpr std::array<uint8_t, 32> kDbFileKey = {};
-
 std::string SealAtRestPayload(std::string_view Plaintext) {
 	if(Plaintext.empty())
 		return "";
@@ -116,7 +113,7 @@ std::string SealAtRestPayload(std::string_view Plaintext) {
 	for(auto &B : Nonce)
 		B = static_cast<uint8_t>(Rd());
 	std::vector<uint8_t> In(Plaintext.begin(), Plaintext.end()), Out;
-	XChaCha20 Cipher(kDbFileKey, Nonce);
+	XChaCha20 Cipher(kAtRestXChaChaKey, Nonce);
 	Cipher.Encrypt(In, Out);
 	std::string Blob;
 	Blob.resize(24 + Out.size());
@@ -131,7 +128,7 @@ std::string UnsealAtRestPayload(std::string_view Blob) {
 	std::array<uint8_t, 24> Nonce{};
 	std::memcpy(Nonce.data(), Blob.data(), 24);
 	std::vector<uint8_t> In(Blob.begin() + 24, Blob.end()), Out;
-	XChaCha20 Cipher(kDbFileKey, Nonce);
+	XChaCha20 Cipher(kAtRestXChaChaKey, Nonce);
 	Cipher.Decrypt(In, Out);
 	return std::string(Out.begin(), Out.end());
 }
@@ -424,6 +421,100 @@ static bool StripAndParseViewSnapshotTrailer(std::string &RawData,
 			return false;
 		Tail = Tail.substr(BN + 1);
 		OutViews[std::move(Name)] = std::move(Body);
+	}
+	RawData.erase(Mp);
+	return true;
+}
+
+static constexpr std::string_view kFkSnapshotMarkerSv = "<<<ASTRAL_DB_FOREIGN_KEYS>>>\n";
+
+static void AppendForeignKeySnapshotTrailer(std::string &RawData,
+                                            const std::unordered_map<std::string, std::vector<ForeignKey>> &Fks) {
+	if(Fks.empty())
+		return;
+	std::vector<std::pair<std::string, ForeignKey>> Flat;
+	for(const auto &[Tn, Vec] : Fks)
+		for(const ForeignKey &Fk : Vec)
+			Flat.emplace_back(Tn, Fk);
+	RawData.append(kFkSnapshotMarkerSv.data(), kFkSnapshotMarkerSv.size());
+	RawData += std::to_string(Flat.size());
+	RawData.push_back('\n');
+	for(const auto &[Tn, Fk] : Flat) {
+		RawData += std::to_string(Tn.size());
+		RawData.push_back(' ');
+		RawData += std::to_string(Fk.ColumnName.size());
+		RawData.push_back(' ');
+		RawData += std::to_string(Fk.ReferencedTable.size());
+		RawData.push_back(' ');
+		RawData += std::to_string(Fk.ReferencedColumn.size());
+		RawData.push_back(' ');
+		RawData += std::to_string(static_cast<int>(Fk.OnDelete));
+		RawData.push_back('\n');
+		RawData += Tn;
+		RawData.push_back('\n');
+		RawData += Fk.ColumnName;
+		RawData.push_back('\n');
+		RawData += Fk.ReferencedTable;
+		RawData.push_back('\n');
+		RawData += Fk.ReferencedColumn;
+		RawData.push_back('\n');
+	}
+}
+
+static bool StripAndParseForeignKeySnapshotTrailer(std::string &RawData,
+                                                   std::unordered_map<std::string, std::vector<ForeignKey>> &OutFks) {
+	OutFks.clear();
+	const size_t Mp = RawData.find(kFkSnapshotMarkerSv.data(), 0, kFkSnapshotMarkerSv.size());
+	if(Mp == std::string::npos)
+		return true;
+	std::string_view Tail(RawData.data() + Mp + kFkSnapshotMarkerSv.size(),
+	                      RawData.size() - Mp - kFkSnapshotMarkerSv.size());
+	const size_t NlCnt = Tail.find('\n');
+	if(NlCnt == std::string_view::npos)
+		return false;
+	std::uint64_t NF = 0;
+	for(unsigned char Ch : Tail.substr(0, NlCnt)) {
+		if(Ch < '0' || Ch > '9')
+			return false;
+		NF = NF * 10 + static_cast<unsigned>(Ch - '0');
+	}
+	Tail = Tail.substr(NlCnt + 1);
+	for(std::uint64_t I = 0; I < NF; ++I) {
+		const size_t LnHdr = Tail.find('\n');
+		if(LnHdr == std::string_view::npos)
+			return false;
+		std::istringstream Ls(std::string(Tail.substr(0, LnHdr)));
+		Tail = Tail.substr(LnHdr + 1);
+		std::uint64_t LTn = 0, LCol = 0, LRt = 0, LRc = 0;
+		long long Act = 0;
+		if(!(Ls >> LTn >> LCol >> LRt >> LRc >> Act))
+			return false;
+		if(Act < 0 || Act > 2)
+			return false;
+		if(Tail.size() < LTn + 1 + LCol + 1 + LRt + 1 + LRc + 1)
+			return false;
+		std::string Tn(Tail.substr(0, LTn));
+		if(Tail[LTn] != '\n')
+			return false;
+		Tail = Tail.substr(LTn + 1);
+		std::string Col(Tail.substr(0, LCol));
+		if(Tail[LCol] != '\n')
+			return false;
+		Tail = Tail.substr(LCol + 1);
+		std::string Rt(Tail.substr(0, LRt));
+		if(Tail[LRt] != '\n')
+			return false;
+		Tail = Tail.substr(LRt + 1);
+		std::string Rc(Tail.substr(0, LRc));
+		if(Tail[LRc] != '\n')
+			return false;
+		Tail = Tail.substr(LRc + 1);
+		ForeignKey Fk;
+		Fk.ColumnName = std::move(Col);
+		Fk.ReferencedTable = std::move(Rt);
+		Fk.ReferencedColumn = std::move(Rc);
+		Fk.OnDelete = static_cast<ReferentialAction>(static_cast<uint8_t>(Act));
+		OutFks[Tn].push_back(std::move(Fk));
 	}
 	RawData.erase(Mp);
 	return true;
@@ -929,6 +1020,16 @@ void Database::AppendWalAfterFineRevoke(const std::string &UserName, const RowCo
 	Wal_.AppendLine(O.str());
 }
 
+void Database::AppendWalAfterForeignKey(const std::string &TableName, const ForeignKey &Key) {
+	if(WalSuspended_.load(std::memory_order_acquire))
+		return;
+	std::ostringstream O;
+	O << 'F' << '|' << WalEncodeSqlBody(TableName) << '|' << WalEncodeSqlBody(Key.ColumnName) << '|'
+	  << WalEncodeSqlBody(Key.ReferencedTable) << '|' << WalEncodeSqlBody(Key.ReferencedColumn) << '|'
+	  << static_cast<int>(Key.OnDelete);
+	Wal_.AppendLine(O.str());
+}
+
 Database::~Database() {
 	/** \c DbDispatchAsync runs \c std::async jobs holding \c this; join flush only after workers finish */
 	while(OutstandingAsyncJobs_.load(std::memory_order_acquire) != 0)
@@ -994,6 +1095,7 @@ void Database::SyncToFileUnlocked() {
 			Extras.FineGrants.emplace_back(U.Name, Rule);
 	}
 	AppendUserAclSnapshotTrailer(RawData, Users_, Acls_, Extras);
+	AppendForeignKeySnapshotTrailer(RawData, ForeignKeys_);
 	AppendViewSnapshotTrailer(RawData, ViewDefinitionSql_);
 	std::string CompressedData = CompressData(RawData);
 	std::string EncryptedData = EncryptData(CompressedData);
@@ -1241,6 +1343,17 @@ void Database::ReplayWalFineRevoke(const std::string &UserName, RowColPermission
 	}
 }
 
+void Database::ReplayWalAddForeignKey(const std::string &TableName, ForeignKey Key) {
+	std::scoped_lock Guard(DbMutex_);
+	auto &Vec = ForeignKeys_[TableName];
+	for(const ForeignKey &E : Vec) {
+		if(E.ColumnName == Key.ColumnName && E.ReferencedTable == Key.ReferencedTable &&
+		   E.ReferencedColumn == Key.ReferencedColumn && E.OnDelete == Key.OnDelete)
+			return;
+	}
+	Vec.push_back(std::move(Key));
+}
+
 void Database::ReplaceTableLevelCheckConstraints(const std::string &TableName,
                                                  std::vector<std::pair<std::string, std::string>> Checks) {
 	std::scoped_lock Guard(DbMutex_);
@@ -1474,6 +1587,97 @@ void Database::RequireSessionUpdateAssumeLocked(const std::string &Table, const 
 	}
 }
 
+static bool FkCellIsNull(const Database::Item &Row, const std::string &Col) {
+	auto It = Row.find(Col);
+	return It == Row.end() || It->second.empty();
+}
+
+static bool ParentHasFkValueAssumeLocked(const Database &Db, const std::string &ParentTable,
+                                         const std::string &ParentCol, const std::string &Val) {
+	auto Tit = Db.Tables_.find(ParentTable);
+	if(Tit == Db.Tables_.end())
+		return false;
+	for(const auto &Pr : Tit->second) {
+		auto Cit = Pr.find(ParentCol);
+		if(Cit != Pr.end() && Cit->second == Val)
+			return true;
+	}
+	return false;
+}
+
+void Database::RejectRowIfForeignKeysFailAssumeLocked(const std::string &TableName, const Item &Row) const {
+	auto FkIt = ForeignKeys_.find(TableName);
+	if(FkIt == ForeignKeys_.end())
+		return;
+	std::optional<std::string> RowPk;
+	if(auto SchIt = TableSchemas_.find(TableName); SchIt != TableSchemas_.end()) {
+		for(const Column &Co : SchIt->second) {
+			if(!Co.IsPrimaryKey)
+				continue;
+			auto Pit = Row.find(Co.Name);
+			if(Pit != Row.end() && !Pit->second.empty())
+				RowPk = Pit->second;
+			break;
+		}
+	}
+	for(const ForeignKey &Fk : FkIt->second) {
+		if(FkCellIsNull(Row, Fk.ColumnName))
+			continue;
+		const std::string &Val = Row.at(Fk.ColumnName);
+		if(Fk.ReferencedTable == TableName && RowPk && Val == *RowPk)
+			continue;
+		if(ParentHasFkValueAssumeLocked(*this, Fk.ReferencedTable, Fk.ReferencedColumn, Val))
+			continue;
+		FailStorage("FOREIGN KEY violation on \"" + TableName + "." + Fk.ColumnName +
+		            "\": value \"" + Val + "\" is not present in \"" + Fk.ReferencedTable + "." +
+		            Fk.ReferencedColumn + "\".");
+	}
+}
+
+void Database::RejectDeleteIfReferencedAssumeLocked(const std::string &ParentTable, const Item &ParentRow) {
+	std::vector<std::pair<std::string, size_t>> ChildRowsToDelete;
+	std::vector<std::tuple<std::string, size_t, std::string>> ChildNullUpdates;
+	for(const auto &[ChildTable, Fks] : ForeignKeys_) {
+		for(const ForeignKey &Fk : Fks) {
+			if(Fk.ReferencedTable != ParentTable)
+				continue;
+			if(FkCellIsNull(ParentRow, Fk.ReferencedColumn))
+				continue;
+			const std::string &RefVal = ParentRow.at(Fk.ReferencedColumn);
+			auto Cit = Tables_.find(ChildTable);
+			if(Cit == Tables_.end())
+				continue;
+			for(size_t Ix = 0; Ix < Cit->second.size(); ++Ix) {
+				const Item &ChildRow = Cit->second[Ix];
+				if(FkCellIsNull(ChildRow, Fk.ColumnName))
+					continue;
+				if(ChildRow.at(Fk.ColumnName) != RefVal)
+					continue;
+				if(Fk.OnDelete == ReferentialAction::Cascade)
+					ChildRowsToDelete.emplace_back(ChildTable, Ix);
+				else if(Fk.OnDelete == ReferentialAction::SetNull)
+					ChildNullUpdates.emplace_back(ChildTable, Ix, Fk.ColumnName);
+				else
+					FailStorage("FOREIGN KEY violation: cannot delete referenced row in \"" + ParentTable +
+					            "\" (referenced by \"" + ChildTable + "." + Fk.ColumnName + "\").");
+			}
+		}
+	}
+	for(const auto &[Tbl, Ix, Col] : ChildNullUpdates)
+		Tables_.at(Tbl)[Ix][Col] = std::string();
+	std::sort(ChildRowsToDelete.begin(), ChildRowsToDelete.end(),
+	          [](const auto &A, const auto &B) {
+		          if(A.first != B.first)
+			          return A.first > B.first;
+		          return A.second > B.second;
+	          });
+	for(const auto &[Tbl, Ix] : ChildRowsToDelete) {
+		Item Deleted = Tables_.at(Tbl)[Ix];
+		Tables_.at(Tbl).erase(Tables_.at(Tbl).begin() + static_cast<std::ptrdiff_t>(Ix));
+		RejectDeleteIfReferencedAssumeLocked(Tbl, Deleted);
+	}
+}
+
 void Database::RejectRowIfChecksFailAssumeLocked(const std::string &TableName, const Item &Row) const {
 	auto SchIt = TableSchemas_.find(TableName);
 	if(SchIt == TableSchemas_.end())
@@ -1546,17 +1750,94 @@ std::future<void> Database::CreateTable(const std::string &TableName, const Sche
 	return Fut;
 }
 
-std::future<void> Database::DropTable(const std::string &TableName) {
-	return DbDispatchAsync(this,[this, TableName]() {
+void Database::CollectFkDependentTablesAssumeLocked(const std::string &Root,
+                                                    std::vector<std::string> &Out) const {
+	for(const auto &[Child, Fks] : ForeignKeys_) {
+		if(Child == Root)
+			continue;
+		for(const ForeignKey &Fk : Fks) {
+			if(Fk.ReferencedTable != Root)
+				continue;
+			if(std::find(Out.begin(), Out.end(), Child) != Out.end())
+				continue;
+			Out.push_back(Child);
+			CollectFkDependentTablesAssumeLocked(Child, Out);
+			break;
+		}
+	}
+}
+
+std::future<void> Database::DropTable(const std::string &TableName, bool Cascade) {
+	return DbDispatchAsync(this,[this, TableName, Cascade]() {
 		{
 			std::scoped_lock Guard(DbMutex_);
 			RequireSessionDdlAssumeLocked();
-			AppendWalAfterDrop(TableName);
-			TableSchemas_.erase(TableName);
-			Tables_.erase(TableName);
-			Indexes_.erase(TableName);
-			ForeignKeys_.erase(TableName);
-			TableCheckConstraints_.erase(TableName);
+			std::vector<std::string> Order;
+			if(Cascade)
+				CollectFkDependentTablesAssumeLocked(TableName, Order);
+			Order.push_back(TableName);
+			for(const std::string &Tn : Order) {
+				if(TableSchemas_.find(Tn) == TableSchemas_.end())
+					continue;
+				AppendWalAfterDrop(Tn);
+				TableSchemas_.erase(Tn);
+				Tables_.erase(Tn);
+				Indexes_.erase(Tn);
+				ForeignKeys_.erase(Tn);
+				TableCheckConstraints_.erase(Tn);
+			}
+		}
+		Dirty_.store(true, std::memory_order_release);
+	});
+}
+
+std::future<void> Database::RenameColumn(const std::string &TableName, const std::string &FromColumn,
+                                         const std::string &ToColumn) {
+	return DbDispatchAsync(this,[this, TableName, FromColumn, ToColumn]() {
+		{
+			std::scoped_lock Guard(DbMutex_);
+			RequireSessionDdlAssumeLocked();
+			auto SchIt = TableSchemas_.find(TableName);
+			if(SchIt == TableSchemas_.end())
+				FailStorage("ALTER RENAME COLUMN: table \"" + TableName + "\" does not exist.");
+			bool Found = false;
+			for(Column &Co : SchIt->second) {
+				if(Co.Name != FromColumn)
+					continue;
+				for(const Column &Other : SchIt->second)
+					if(Other.Name == ToColumn)
+						FailStorage("ALTER RENAME COLUMN: target \"" + ToColumn + "\" already exists.");
+				Co.Name = ToColumn;
+				Found = true;
+				break;
+			}
+			if(!Found)
+				FailStorage("ALTER RENAME COLUMN: column \"" + FromColumn + "\" not found.");
+			for(Item &Row : Tables_.at(TableName)) {
+				auto It = Row.find(FromColumn);
+				if(It == Row.end())
+					continue;
+				Row[ToColumn] = std::move(It->second);
+				Row.erase(FromColumn);
+			}
+			if(auto IdxOuter = Indexes_.find(TableName); IdxOuter != Indexes_.end()) {
+				auto ColIt = IdxOuter->second.find(FromColumn);
+				if(ColIt != IdxOuter->second.end()) {
+					auto Node = IdxOuter->second.extract(ColIt);
+					Node.key() = ToColumn;
+					IdxOuter->second.insert(std::move(Node));
+				}
+			}
+			for(auto &[Child, Fks] : ForeignKeys_) {
+				for(ForeignKey &Fk : Fks) {
+					if(Fk.ReferencedTable == TableName && Fk.ReferencedColumn == FromColumn)
+						Fk.ReferencedColumn = ToColumn;
+					if(Child == TableName && Fk.ColumnName == FromColumn)
+						Fk.ColumnName = ToColumn;
+				}
+			}
+			if(!WalSuspended_.load(std::memory_order_acquire))
+				Wal_.AppendLine(std::string("RC|") + TableName + '|' + FromColumn + '|' + ToColumn);
 		}
 		Dirty_.store(true, std::memory_order_release);
 	});
@@ -1637,6 +1918,7 @@ std::future<void> Database::Insert(const std::string &TableName, const Item &Row
 				FailStorage("INSERT: table \"" + TableName + "\" does not exist.");
 			RequireSessionInsertAssumeLocked(TableName, Row);
 			RejectRowIfChecksFailAssumeLocked(TableName, Row);
+			RejectRowIfForeignKeysFailAssumeLocked(TableName, Row);
 			auto &TableRef = Tables_[TableName];
 			if(!TableRef.empty()) {
 				PREFETCH(TableRef.data());
@@ -1653,6 +1935,245 @@ std::future<void> Database::Insert(const std::string &TableName, const Item &Row
 				}
 			}
 			AppendWalAfterInsert(TableName, Row);
+		}
+		Dirty_.store(true, std::memory_order_release);
+	});
+}
+
+namespace {
+
+bool ExistingRowMatchesInsertKeys(const Database::Item &Existing, const Database::Item &InsertRow,
+                                  const std::vector<std::string> &Keys) {
+	for(const std::string &K : Keys) {
+		auto It = Existing.find(K);
+		auto Jt = InsertRow.find(K);
+		const std::string E = It != Existing.end() ? It->second : std::string();
+		const std::string I = Jt != InsertRow.end() ? Jt->second : std::string();
+		if(E != I)
+			return false;
+	}
+	return true;
+}
+
+} // namespace
+
+std::future<void> Database::Upsert(const std::string &TableName, const Database::Item &InsertRow,
+                                   const std::vector<std::string> &ConflictColumnsIn, bool DoNothingOnConflict,
+                                   const std::vector<std::pair<std::string, std::string>> &UpdateAssignments) {
+	return DbDispatchAsync(this, [=, this]() {
+		{
+			std::scoped_lock Guard(DbMutex_);
+			if(Tables_.find(TableName) == Tables_.end())
+				FailStorage("UPSERT: table \"" + TableName + "\" does not exist.");
+			std::vector<std::string> Keys = ConflictColumnsIn;
+			if(Keys.empty()) {
+				auto SchIt = TableSchemas_.find(TableName);
+				if(SchIt == TableSchemas_.end())
+					FailStorage("UPSERT: missing schema for \"" + TableName + "\".");
+				for(const Column &Co : SchIt->second) {
+					if(Co.IsPrimaryKey)
+						Keys.push_back(Co.Name);
+				}
+				if(Keys.empty())
+					FailStorage(
+					    "UPSERT: table has no PRIMARY KEY; use ON CONFLICT (col,...) or define a PK on the table.");
+			}
+			for(const std::string &K : Keys) {
+				if(InsertRow.find(K) == InsertRow.end())
+					FailStorage("UPSERT: INSERT row must include conflict column \"" + K + "\".");
+			}
+			auto &TableRef = Tables_.at(TableName);
+			size_t Found = static_cast<size_t>(-1);
+			for(size_t I = 0; I < TableRef.size(); ++I) {
+				if(ExistingRowMatchesInsertKeys(TableRef[I], InsertRow, Keys)) {
+					Found = I;
+					break;
+				}
+			}
+			if(Found != static_cast<size_t>(-1)) {
+				if(DoNothingOnConflict)
+					return;
+				Item &Ex = TableRef[Found];
+				if(!RowAllowsAssumeLocked(Permissions::Update, TableName, Ex))
+					FailStorage("UPSERT: UPDATE denied by ACL.");
+				const SQL::RowEvalContext Ctx{&Ex, &InsertRow, nullptr};
+				Item Merged = Ex;
+				for(const auto &[Col, Blob] : UpdateAssignments) {
+					auto V = SQL::EvalSerializedSetValueExpr(Blob, Ctx);
+					if(!V)
+						FailStorage("UPSERT: could not evaluate DO UPDATE SET for \"" + Col + "\".");
+					Merged[Col] = *V;
+				}
+				for(const auto &[Col, Blob] : UpdateAssignments) {
+					(void)Blob;
+					if(!ColumnAllowsAssumeLocked(Permissions::Update, TableName, Merged, Col))
+						FailStorage("UPSERT: column update denied for \"" + Col + "\".");
+				}
+				RejectRowIfChecksFailAssumeLocked(TableName, Merged);
+				RejectRowIfForeignKeysFailAssumeLocked(TableName, Merged);
+				auto IdxOuter = Indexes_.find(TableName);
+				if(IdxOuter != Indexes_.end()) {
+					for(const auto &[Col, Blob] : UpdateAssignments) {
+						auto V = SQL::EvalSerializedSetValueExpr(Blob, Ctx);
+						if(!V)
+							continue;
+						auto ColIdx = IdxOuter->second.find(Col);
+						if(ColIdx == IdxOuter->second.end())
+							continue;
+						auto &Index = ColIdx->second;
+						auto OldIt = Ex.find(Col);
+						if(OldIt != Ex.end())
+							std::get<BPlusTree<std::string, size_t>>(Index.Index()).Remove(OldIt->second);
+						std::get<BPlusTree<std::string, size_t>>(Index.Index()).Insert(*V, Found);
+					}
+				}
+				for(const auto &[Col, Blob] : UpdateAssignments) {
+					auto V = SQL::EvalSerializedSetValueExpr(Blob, Ctx);
+					if(V)
+						Ex[Col] = *V;
+				}
+			} else {
+				RequireSessionInsertAssumeLocked(TableName, InsertRow);
+				RejectRowIfChecksFailAssumeLocked(TableName, InsertRow);
+				RejectRowIfForeignKeysFailAssumeLocked(TableName, InsertRow);
+				if(!TableRef.empty()) {
+					PREFETCH(TableRef.data());
+				}
+				TableRef.push_back(InsertRow);
+				auto IdxOuter = Indexes_.find(TableName);
+				if(IdxOuter != Indexes_.end()) {
+					for(const auto &[ColumnName, Value] : InsertRow) {
+						auto ColIdx = IdxOuter->second.find(ColumnName);
+						if(ColIdx != IdxOuter->second.end()) {
+							auto &Index = ColIdx->second;
+							std::get<BPlusTree<std::string, size_t>>(Index.Index()).Insert(Value, TableRef.size() - 1);
+						}
+					}
+				}
+				AppendWalAfterInsert(TableName, TableRef.back());
+			}
+		}
+		Dirty_.store(true, std::memory_order_release);
+	});
+}
+
+std::future<void> Database::MergeUsing(const std::string &TargetTable, const std::string &SourceTable,
+                                       const std::vector<std::pair<std::string, std::string>> &KeyPairs,
+                                       const std::vector<MergeUpdateCell> &OnMatch,
+                                       const std::vector<MergeInsertCell> &OnInsert) {
+	return DbDispatchAsync(this, [=, this]() {
+		{
+			std::scoped_lock Guard(DbMutex_);
+			auto TIt = Tables_.find(TargetTable);
+			auto SIt = Tables_.find(SourceTable);
+			if(TIt == Tables_.end())
+				FailStorage("MERGE: target table \"" + TargetTable + "\" does not exist.");
+			if(SIt == Tables_.end())
+				FailStorage("MERGE: source table \"" + SourceTable + "\" does not exist.");
+			if(KeyPairs.empty())
+				FailStorage("MERGE: at least one ON key pair is required.");
+			auto &TRef = TIt->second;
+			auto &SRef = SIt->second;
+			for(const Item &SrcRow : SRef) {
+				for(const auto &[TgtKey, SrcKey] : KeyPairs) {
+					auto Sk = SrcRow.find(SrcKey);
+					if(Sk == SrcRow.end())
+						FailStorage("MERGE: source row missing join column \"" + SrcKey + "\".");
+				}
+				size_t Found = static_cast<size_t>(-1);
+				for(size_t I = 0; I < TRef.size(); ++I) {
+					bool AllMatch = true;
+					for(const auto &[TgtKey, SrcKey] : KeyPairs) {
+						auto Tk = TRef[I].find(TgtKey);
+						auto Sk = SrcRow.find(SrcKey);
+						if(Tk == TRef[I].end() || Sk == SrcRow.end() || Tk->second != Sk->second) {
+							AllMatch = false;
+							break;
+						}
+					}
+					if(AllMatch) {
+						Found = I;
+						break;
+					}
+				}
+				if(Found != static_cast<size_t>(-1)) {
+					if(OnMatch.empty())
+						continue;
+					Item &Ex = TRef[Found];
+					if(!RowAllowsAssumeLocked(Permissions::Update, TargetTable, Ex))
+						continue;
+					const SQL::RowEvalContext Ctx{&Ex, nullptr, &SrcRow};
+					Item Merged = Ex;
+					for(const MergeUpdateCell &M : OnMatch) {
+						auto V = SQL::EvalSerializedSetValueExpr(M.ValueExpr, Ctx);
+						if(!V)
+							FailStorage("MERGE: could not evaluate UPDATE SET expression for \"" + M.TargetColumn +
+							            "\".");
+						Merged[M.TargetColumn] = *V;
+					}
+					bool ColumnOk = true;
+					for(const MergeUpdateCell &M : OnMatch) {
+						if(!ColumnAllowsAssumeLocked(Permissions::Update, TargetTable, Merged, M.TargetColumn)) {
+							ColumnOk = false;
+							break;
+						}
+					}
+					if(!ColumnOk)
+						continue;
+					RejectRowIfChecksFailAssumeLocked(TargetTable, Merged);
+					RejectRowIfForeignKeysFailAssumeLocked(TargetTable, Merged);
+					auto IdxOuter = Indexes_.find(TargetTable);
+					if(IdxOuter != Indexes_.end()) {
+						for(const MergeUpdateCell &M : OnMatch) {
+							auto V = SQL::EvalSerializedSetValueExpr(M.ValueExpr, Ctx);
+							if(!V)
+								continue;
+							auto ColIdx = IdxOuter->second.find(M.TargetColumn);
+							if(ColIdx == IdxOuter->second.end())
+								continue;
+							auto &Index = ColIdx->second;
+							auto OldIt = Ex.find(M.TargetColumn);
+							if(OldIt != Ex.end())
+								std::get<BPlusTree<std::string, size_t>>(Index.Index()).Remove(OldIt->second);
+							std::get<BPlusTree<std::string, size_t>>(Index.Index()).Insert(*V, Found);
+						}
+					}
+					for(const MergeUpdateCell &M : OnMatch) {
+						auto V = SQL::EvalSerializedSetValueExpr(M.ValueExpr, Ctx);
+						if(V)
+							Ex[M.TargetColumn] = *V;
+					}
+				} else {
+					if(OnInsert.empty())
+						continue;
+					Item NewR;
+					const SQL::RowEvalContext Ctx{nullptr, nullptr, &SrcRow};
+					for(const MergeInsertCell &N : OnInsert) {
+						auto V = SQL::EvalSerializedSetValueExpr(N.ValueExpr, Ctx);
+						if(!V)
+							FailStorage("MERGE: could not evaluate INSERT value for \"" + N.Column + "\".");
+						NewR[N.Column] = *V;
+					}
+					RequireSessionInsertAssumeLocked(TargetTable, NewR);
+					RejectRowIfChecksFailAssumeLocked(TargetTable, NewR);
+					RejectRowIfForeignKeysFailAssumeLocked(TargetTable, NewR);
+					if(!TRef.empty()) {
+						PREFETCH(TRef.data());
+					}
+					TRef.push_back(NewR);
+					auto IdxOuter = Indexes_.find(TargetTable);
+					if(IdxOuter != Indexes_.end()) {
+						for(const auto &[ColumnName, Value] : NewR) {
+							auto ColIdx = IdxOuter->second.find(ColumnName);
+							if(ColIdx != IdxOuter->second.end()) {
+								auto &Index = ColIdx->second;
+								std::get<BPlusTree<std::string, size_t>>(Index.Index()).Insert(Value, TRef.size() - 1);
+							}
+						}
+					}
+					AppendWalAfterInsert(TargetTable, TRef.back());
+				}
+			}
 		}
 		Dirty_.store(true, std::memory_order_release);
 	});
@@ -1675,6 +2196,7 @@ std::future<void> Database::Delete(const std::string &TableName, const std::func
 			};
 			for(size_t i = 0; i < TableRef.size(); ++i) {
 				if(DeleteCond(TableRef[i])) {
+					RejectDeleteIfReferencedAssumeLocked(TableName, TableRef[i]);
 					if(IdxOuter != Indexes_.end()) {
 						for(const auto& [ColumnName, Value] : TableRef[i]) {
 							auto ColIdx = IdxOuter->second.find(ColumnName);
@@ -1689,6 +2211,73 @@ std::future<void> Database::Delete(const std::string &TableName, const std::func
 			TableRef.erase(std::remove_if(TableRef.begin(), TableRef.end(), DeleteCond), TableRef.end());
 		}
 		Dirty_.store(true, std::memory_order_release);
+	});
+}
+
+std::future<void> Database::UpdateWithSetExprs(const std::string &TableName,
+                                             const std::function<bool(const Item &)> &Condition,
+                                             const std::vector<std::pair<std::string, std::string>> &Assignments) {
+	return DbDispatchAsync(this, [this, TableName, Condition, Assignments]() {
+		bool Modified = false;
+		{
+			std::scoped_lock Guard(DbMutex_);
+			auto TableIt = Tables_.find(TableName);
+			if(TableIt == Tables_.end())
+				FailStorage("UPDATE: table \"" + TableName + "\" does not exist.");
+			auto &TableRef = TableIt->second;
+			auto IdxOuter = Indexes_.find(TableName);
+			RequireSessionTablePermissionAssumeLocked(Permissions::Update, TableName);
+			for(size_t i = 0; i < TableRef.size(); ++i) {
+				auto &Row = TableRef[i];
+				if(!Condition(Row))
+					continue;
+				if(!RowAllowsAssumeLocked(Permissions::Update, TableName, Row))
+					continue;
+				const SQL::RowEvalContext Ctx{&Row, nullptr, nullptr};
+				Item Merged = Row;
+				for(const auto &[Col, Blob] : Assignments) {
+					auto V = SQL::EvalSerializedSetValueExpr(Blob, Ctx);
+					if(!V)
+						FailStorage("UPDATE: could not evaluate SET expression for \"" + Col + "\".");
+					Merged[Col] = *V;
+				}
+				bool ColumnOk = true;
+				for(const auto &[Col, Blob] : Assignments) {
+					(void)Blob;
+					if(!ColumnAllowsAssumeLocked(Permissions::Update, TableName, Merged, Col)) {
+						ColumnOk = false;
+						break;
+					}
+				}
+				if(!ColumnOk)
+					continue;
+				RejectRowIfChecksFailAssumeLocked(TableName, Merged);
+				RejectRowIfForeignKeysFailAssumeLocked(TableName, Merged);
+				if(IdxOuter != Indexes_.end()) {
+					for(const auto &[Col, Blob] : Assignments) {
+						auto V = SQL::EvalSerializedSetValueExpr(Blob, Ctx);
+						if(!V)
+							continue;
+						auto ColIdx = IdxOuter->second.find(Col);
+						if(ColIdx == IdxOuter->second.end())
+							continue;
+						auto &Index = ColIdx->second;
+						auto OldIt = Row.find(Col);
+						if(OldIt != Row.end())
+							std::get<BPlusTree<std::string, size_t>>(Index.Index()).Remove(OldIt->second);
+						std::get<BPlusTree<std::string, size_t>>(Index.Index()).Insert(*V, i);
+					}
+				}
+				for(const auto &[Col, Blob] : Assignments) {
+					auto V = SQL::EvalSerializedSetValueExpr(Blob, Ctx);
+					if(V)
+						Row[Col] = *V;
+				}
+				Modified = true;
+			}
+		}
+		if(Modified)
+			Dirty_.store(true, std::memory_order_release);
 	});
 }
 
@@ -1724,6 +2313,7 @@ std::future<void> Database::Update(const std::string &TableName,
 				if(!ColumnOk)
 					continue;
 				RejectRowIfChecksFailAssumeLocked(TableName, Merged);
+				RejectRowIfForeignKeysFailAssumeLocked(TableName, Merged);
 				if(IdxOuter != Indexes_.end()) {
 					for(const auto& [ColumnName, NewValue] : NewValues) {
 						auto ColIdx = IdxOuter->second.find(ColumnName);
@@ -1850,6 +2440,10 @@ std::optional<Database::Schema> Database::TableSchemaAssumeDbMutexHeld(const std
 	return It->second;
 }
 
+void Database::SetTableSchemaAssumeDbMutexHeld(const std::string &TableName, Schema Schema) {
+	TableSchemas_[TableName] = std::move(Schema);
+}
+
 bool Database::LoadSnapshotFromDiskPathSynchronously(std::filesystem::path Path) {
 	std::ifstream File(Path, std::ios::binary);
 	if(!File) return false;
@@ -1858,6 +2452,9 @@ bool Database::LoadSnapshotFromDiskPathSynchronously(std::filesystem::path Path)
 	std::string RawData = DecompressData(CompressedData);
 	std::unordered_map<std::string, std::string> LoadedViews;
 	if(!StripAndParseViewSnapshotTrailer(RawData, LoadedViews))
+		return false;
+	std::unordered_map<std::string, std::vector<ForeignKey>> LoadedFks;
+	if(!StripAndParseForeignKeySnapshotTrailer(RawData, LoadedFks))
 		return false;
 	bool ParsedUserAclPresent = false;
 	std::vector<User> ParsedUsers;
@@ -1918,6 +2515,7 @@ bool Database::LoadSnapshotFromDiskPathSynchronously(std::filesystem::path Path)
 			Tables_[TableName] = NewTable;
 		}
 		ViewDefinitionSql_ = std::move(LoadedViews);
+		ForeignKeys_ = std::move(LoadedFks);
 		if(ParsedUserAclPresent && !ParsedUsers.empty()) {
 			Users_ = std::move(ParsedUsers);
 			Acls_ = std::move(ParsedAcls);
@@ -1984,6 +2582,8 @@ std::future<void> Database::AddForeignKey(const std::string &TableName, const Fo
 	return DbDispatchAsync(this,[this, TableName, Key]() {
 		std::scoped_lock Guard(DbMutex_);
 		ForeignKeys_[TableName].push_back(Key);
+		AppendWalAfterForeignKey(TableName, Key);
+		Dirty_.store(true, std::memory_order_release);
 	});
 }
 

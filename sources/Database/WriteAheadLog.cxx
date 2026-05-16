@@ -1,8 +1,11 @@
 #include <Database/WriteAheadLog.hxx>
 #include <Database/Database.hxx>
 #include <IO/Error.hxx>
+#include <DS/ErrorCorrection.hxx>
+#include <DS/XChaCha20.hxx>
 #include <fstream>
 #include <mutex>
+#include <random>
 #include <stdexcept>
 #include <vector>
 #include <string_view>
@@ -18,6 +21,30 @@ namespace {
 /** Batch by record count and approximate byte volume for fewer syscalls. */
 static constexpr std::size_t kWalBatchLines = 512;
 static constexpr std::size_t kWalBatchBytes = 256 * 1024;
+
+static const char *const kWalB64Enc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static std::string WalEncodeBlob(std::string_view Plain) {
+	std::string Out;
+	Out.reserve(((Plain.size() + 2) / 3) * 4);
+	uint32_t Acc = 0;
+	int Bits = 0;
+	for(unsigned char Ch : Plain) {
+		Acc = (Acc << 8) | Ch;
+		Bits += 8;
+		while(Bits >= 6) {
+			Bits -= 6;
+			Out.push_back(kWalB64Enc[(Acc >> Bits) & 63]);
+		}
+	}
+	if(Bits) {
+		Acc <<= (6 - Bits);
+		Out.push_back(kWalB64Enc[Acc & 63]);
+	}
+	while(Out.size() % 4)
+		Out.push_back('=');
+	return Out;
+}
 
 /** Base64url-safe alphabet for encoded CREATE VIEW bodies (no '|' in alphabet). */
 static std::string WalDecodeSqlBody(std::string_view In) {
@@ -52,10 +79,27 @@ static std::string WalDecodeSqlBody(std::string_view In) {
 }
 }
 
-WriteAheadLog::WriteAheadLog(std::filesystem::path DbPath) {
+WriteAheadLog::WriteAheadLog(std::filesystem::path DbPath, const std::array<uint8_t, 32> &EncryptionKey)
+	: WalKey_(EncryptionKey) {
 	std::string S = DbPath.string();
 	WalPath_ = std::filesystem::path(S + ".wal");
 	BufferedLines_.reserve(kWalBatchLines);
+}
+
+std::string WriteAheadLog::EncryptRecordToLine(std::string_view PlainLine) const {
+	const std::string Prot = DS::ErrorCorrection::Protect(PlainLine);
+	std::array<uint8_t, 24> Nonce{};
+	std::random_device Rd;
+	for(auto &B : Nonce)
+		B = static_cast<uint8_t>(Rd());
+	std::vector<uint8_t> In(Prot.begin(), Prot.end()), Out;
+	XChaCha20 Cipher(WalKey_, Nonce);
+	Cipher.Encrypt(In, Out);
+	std::string Blob;
+	Blob.resize(24 + Out.size());
+	std::memcpy(Blob.data(), Nonce.data(), 24);
+	std::memcpy(Blob.data() + 24, Out.data(), Out.size());
+	return std::string("W1|") + WalEncodeBlob(Blob);
 }
 
 void WriteAheadLog::FlushBufferedUnlocked() {
@@ -80,7 +124,8 @@ void WriteAheadLog::FlushBufferedUnlocked() {
 
 void WriteAheadLog::AppendLine(std::string_view Line) {
 	std::lock_guard<AstralDB::Mutex> Lk(Mut_);
-	std::size_t Add = Line.size() + 1;
+	const std::string Enc = EncryptRecordToLine(Line);
+	std::size_t Add = Enc.size() + 1;
 	if(!BufferedLines_.empty()) {
 		std::size_t Pending = 0;
 		for(const auto &L : BufferedLines_)
@@ -88,7 +133,7 @@ void WriteAheadLog::AppendLine(std::string_view Line) {
 		if(Pending + Add >= kWalBatchBytes || BufferedLines_.size() >= kWalBatchLines)
 			FlushBufferedUnlocked();
 	}
-	BufferedLines_.emplace_back(Line);
+	BufferedLines_.emplace_back(std::move(Enc));
 	if(BufferedLines_.size() >= kWalBatchLines)
 		FlushBufferedUnlocked();
 }
@@ -131,6 +176,21 @@ void WriteAheadLog::Replay(Database &Db) {
 			Line.pop_back();
 		if(Line.empty())
 			continue;
+		if(Line.size() >= 3 && Line[0] == 'W' && Line[1] == '1' && Line[2] == '|') {
+			const std::string Blob = WalDecodeSqlBody(std::string_view(Line).substr(3));
+			if(Blob.size() < 24)
+				FailWal("Encrypted WAL record too short - delete or repair " + WalPath_.string());
+			std::array<uint8_t, 24> Nonce{};
+			std::memcpy(Nonce.data(), Blob.data(), 24);
+			std::vector<uint8_t> Ct(Blob.begin() + 24, Blob.end()), Pt;
+			XChaCha20 Cipher(WalKey_, Nonce);
+			Cipher.Decrypt(Ct, Pt);
+			const std::string Fe(reinterpret_cast<const char *>(Pt.data()), Pt.size());
+			const auto Rec = DS::ErrorCorrection::Recover(Fe);
+			if(!Rec.has_value())
+				FailWal("WAL FEC could not correct payload - delete or repair " + WalPath_.string());
+			Line = *Rec;
+		}
 		auto Tok = SplitPipe(Line);
 		if(Tok.empty())
 			continue;
@@ -208,6 +268,11 @@ void WriteAheadLog::Replay(Database &Db) {
 				FailWal("Corrupt WAL line: ALTER DROP COLUMN (DC) record incomplete - delete or repair " +
 				        WalPath_.string());
 			Db.DropColumn(Tok[1], Tok[2]).get();
+		} else if(Tok[0] == "RC") {
+			if(Tok.size() < 4)
+				FailWal("Corrupt WAL line: ALTER RENAME COLUMN (RC) record incomplete - delete or repair " +
+				        WalPath_.string());
+			Db.RenameColumn(Tok[1], Tok[2], Tok[3]).get();
 		} else if(Tok[0] == "V") {
 			if(Tok.size() < 3)
 				FailWal("Corrupt WAL line: CREATE VIEW (V) record incomplete - delete or repair " +
@@ -289,6 +354,19 @@ void WriteAheadLog::Replay(Database &Db) {
 			Rule.Column = WalDecodeSqlBody(Tok[4]);
 			Rule.Perms = static_cast<Permissions>(std::stoi(Tok[5]));
 			Db.ReplayWalFineRevoke(WalDecodeSqlBody(Tok[1]), std::move(Rule));
+		} else if(Tok[0] == "F") {
+			if(Tok.size() < 6)
+				FailWal("Corrupt WAL line: FOREIGN KEY (F) record incomplete - delete or repair " + WalPath_.string());
+			ForeignKey Fk;
+			const std::string Tab = WalDecodeSqlBody(Tok[1]);
+			Fk.ColumnName = WalDecodeSqlBody(Tok[2]);
+			Fk.ReferencedTable = WalDecodeSqlBody(Tok[3]);
+			Fk.ReferencedColumn = WalDecodeSqlBody(Tok[4]);
+			const int Act = std::stoi(Tok[5]);
+			if(Act < 0 || Act > 2)
+				FailWal("Corrupt WAL line: FOREIGN KEY action - delete or repair " + WalPath_.string());
+			Fk.OnDelete = static_cast<ReferentialAction>(static_cast<uint8_t>(Act));
+			Db.ReplayWalAddForeignKey(Tab, std::move(Fk));
 		}
 	}
 }

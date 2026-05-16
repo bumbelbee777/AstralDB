@@ -1,4 +1,5 @@
 #include <SQL/Bytecode.hxx>
+#include <SQL/SetExprEval.hxx>
 #include <SQL/SQL.hxx>
 #include <Database/Database.hxx>
 #include <IO/Limits.hxx>
@@ -102,6 +103,8 @@ static constexpr const char kAstRhsColMarker[] = "__AST_RHS_COL__:";
 static constexpr const char *kOpIsNull = "__IS_NULL__";
 static constexpr const char *kOpIsNotNull = "__IS_NOT_NULL__";
 static constexpr const char *kOpIn = "__IN__";
+static constexpr const char *kBoolConstCol = "__ASTRAL_BOOL__";
+static constexpr const char *kOpBoolConst = "__BOOL_CONST__";
 
 static std::string MapHavingAggOutputColumn(const FuncCallExprAST &F, const SelectAST &Sel) {
 	switch(F.BuiltinKind) {
@@ -245,8 +248,10 @@ bool ExtractOneComparison(const ExpressionAST *Expr, RowTriple &Out) {
 
 	const auto *LCol = dynamic_cast<const ColumnRefAST *>(Bin->LHS.get());
 	const auto *RLit = dynamic_cast<const LiteralAST *>(Bin->RHS.get());
+	const auto *RBool = dynamic_cast<const BooleanLiteralAST *>(Bin->RHS.get());
 	const auto *RNullRhs = dynamic_cast<const NullLiteralAST *>(Bin->RHS.get());
 	const auto *LLit = dynamic_cast<const LiteralAST *>(Bin->LHS.get());
+	const auto *LBool = dynamic_cast<const BooleanLiteralAST *>(Bin->LHS.get());
 	const auto *LNullLhs = dynamic_cast<const NullLiteralAST *>(Bin->LHS.get());
 	const auto *RCol = dynamic_cast<const ColumnRefAST *>(Bin->RHS.get());
 
@@ -254,12 +259,18 @@ bool ExtractOneComparison(const ExpressionAST *Expr, RowTriple &Out) {
 	std::string Op = Bin->Op;
 	std::string Rhs;
 
-	if(LCol && (RLit || RNullRhs)) {
+	if(LCol && (RLit || RBool || RNullRhs)) {
 		Col = LCol->Name;
-		Rhs = RLit ? RLit->Value : std::string();
-	} else if((LLit || LNullLhs) && RCol) {
+		if(RBool)
+			Rhs = RBool->Value ? "1" : "0";
+		else
+			Rhs = RLit ? RLit->Value : std::string();
+	} else if((LLit || LBool || LNullLhs) && RCol) {
 		Col = RCol->Name;
-		Rhs = LLit ? LLit->Value : std::string();
+		if(LBool)
+			Rhs = LBool->Value ? "1" : "0";
+		else
+			Rhs = LLit ? LLit->Value : std::string();
 		if(Op == "<")
 			Op = ">";
 		else if(Op == "<=")
@@ -290,6 +301,11 @@ bool AtomToTriples(const ExpressionAST *Expr, std::vector<RowTriple> &Out) {
 	RowTriple One;
 	if(ExtractOneComparison(Expr, One)) {
 		Out.push_back(std::move(One));
+		return true;
+	}
+
+	if(const auto *Bl = dynamic_cast<const BooleanLiteralAST *>(Expr)) {
+		Out.emplace_back(std::string(kBoolConstCol), std::string(kOpBoolConst), Bl->Value ? "1" : "0");
 		return true;
 	}
 
@@ -418,15 +434,16 @@ Instruction MakeDeleteDnf(const std::string &Table, const std::vector<std::vecto
 	return I;
 }
 
-Instruction MakeUpdateDnf(const std::string &Table, const std::vector<std::pair<std::string, std::string>> &Assigns,
+Instruction MakeUpdateDnf(const std::string &Table,
+                            const std::vector<std::pair<std::string, std::unique_ptr<ExpressionAST>>> &Assigns,
                             const std::vector<std::vector<RowTriple>> &Dnf) {
 	Instruction I;
 	I.Opcode = Opcode::UPDATE_MATCHING;
 	I.Operands.push_back(Table);
 	I.Operands.push_back(static_cast<int64_t>(Assigns.size()));
-	for(const auto &[C, V] : Assigns) {
+	for(const auto &[C, E] : Assigns) {
 		I.Operands.push_back(C);
-		I.Operands.push_back(V);
+		I.Operands.push_back(SerializeSetValueExpr(E.get()));
 	}
 	AppendDnfOperands(I.Operands, Dnf);
 	return I;
@@ -490,6 +507,74 @@ static void EmitCastEvalInstruction(const CastExprAST &C, const std::string &Out
 	Instructions.push_back(std::move(I));
 }
 
+static void EmitScalarFuncEvalInstruction(const ScalarFuncExprAST &F, const std::string &OutCol,
+                                          BytecodeScratch &Instructions) {
+	if(F.Args.empty())
+		FailCodegen("Internal: scalar builtin missing arguments.");
+	if(F.Args.size() > Limits::MaxScalarSqlFuncArgs)
+		FailCodegen("Too many scalar function arguments (see Limits::MaxScalarSqlFuncArgs).");
+	size_t Need = 0;
+	switch(F.Fn) {
+	case ScalarSqlFn::Upper:
+	case ScalarSqlFn::Lower:
+	case ScalarSqlFn::CharLength:
+	case ScalarSqlFn::TrimBoth:
+	case ScalarSqlFn::TrimLeading:
+	case ScalarSqlFn::TrimTrailing:
+	case ScalarSqlFn::ExtractYear:
+	case ScalarSqlFn::ExtractMonth:
+	case ScalarSqlFn::ExtractDay:
+		Need = 1;
+		break;
+	case ScalarSqlFn::SubstringFromFor:
+		if(F.Args.size() != 2 && F.Args.size() != 3)
+			FailCodegen("SUBSTRING expects two or three arguments.");
+		Need = F.Args.size();
+		break;
+	case ScalarSqlFn::PositionIn:
+	case ScalarSqlFn::DateAddDays:
+	case ScalarSqlFn::DateSubDays:
+	case ScalarSqlFn::DateDiffDays:
+		Need = 2;
+		break;
+	case ScalarSqlFn::ConcatVariadic:
+		if(F.Args.size() < 2)
+			FailCodegen("CONCAT expects at least two arguments.");
+		Need = F.Args.size();
+		break;
+	case ScalarSqlFn::Grouping:
+		Need = 1;
+		break;
+	default:
+		FailCodegen("Internal: unsupported scalar SQL function.");
+	}
+	if(F.Fn != ScalarSqlFn::ConcatVariadic && F.Args.size() != Need)
+		FailCodegen("Scalar builtin argument count mismatch.");
+	Instruction I;
+	I.Opcode = Opcode::SCALAR_FUNC_EVAL;
+	I.Operands.push_back(OutCol);
+	I.Operands.push_back(static_cast<int64_t>(F.Fn));
+	I.Operands.push_back(static_cast<int64_t>(F.Args.size()));
+	for(const auto &A : F.Args) {
+		if(!A)
+			FailCodegen("Internal: scalar builtin null argument.");
+		AppendCaseScalarPayload(I, A.get());
+	}
+	Instructions.push_back(std::move(I));
+}
+
+static void EmitGroupingEvalInstruction(const GroupingExprAST &G, const std::string &OutCol,
+                                      BytecodeScratch &Instructions) {
+	Instruction I;
+	I.Opcode = Opcode::SCALAR_FUNC_EVAL;
+	I.Operands.push_back(OutCol);
+	I.Operands.push_back(static_cast<int64_t>(ScalarSqlFn::Grouping));
+	I.Operands.push_back(1LL);
+	I.Operands.push_back(0LL);
+	I.Operands.push_back(G.Column);
+	Instructions.push_back(std::move(I));
+}
+
 static void CompileCheckSqlToDnfPackedOrThrowImpl(std::string_view Sql, std::string &OutPacked) {
 	if(Sql.empty())
 		FailCodegen("CHECK constraint has an empty predicate.");
@@ -534,6 +619,10 @@ void NullLiteralAST::EmitBytecode(BytecodeScratch &) const {
 	FailCodegen("Internal: NULL literal should not emit standalone bytecode.");
 }
 
+void BooleanLiteralAST::EmitBytecode(BytecodeScratch &) const {
+	FailCodegen("Internal: boolean literal should not emit standalone bytecode.");
+}
+
 void InValuesAST::EmitBytecode(BytecodeScratch &) const {
 	FailCodegen("Internal: IN list should not emit standalone bytecode.");
 }
@@ -558,6 +647,10 @@ void CastExprAST::EmitBytecode(BytecodeScratch &) const {
 	FailCodegen("Internal: CAST projection is lowered via Opcode::CAST_EVAL, not standalone bytecode.");
 }
 
+void ScalarFuncExprAST::EmitBytecode(BytecodeScratch &) const {
+	FailCodegen("Internal: scalar builtin projection is lowered via Opcode::SCALAR_FUNC_EVAL.");
+}
+
 void LiteralAST::EmitBytecode(BytecodeScratch& Instructions) const {
 	AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Value));
 }
@@ -566,8 +659,18 @@ void ColumnRefAST::EmitBytecode(BytecodeScratch& Instructions) const {
 	AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Name));
 }
 
+void QualifiedRefAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	(void)Instructions;
+	FailCodegen("QualifiedRefAST is lowered via SET expression serialization, not standalone bytecode.");
+}
+
+void GroupingExprAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	(void)Instructions;
+	FailCodegen("GROUPING() is lowered via EmitGroupingEvalInstruction in SELECT codegen.");
+}
+
 void DropAST::EmitBytecode(BytecodeScratch& Instructions) const {
-	const int64_t Flags = static_cast<int64_t>(IfExists ? 1 : 0);
+	const int64_t Flags = static_cast<int64_t>((IfExists ? 1 : 0) | (Cascade ? 2 : 0));
 	AppendInstruction(Instructions, MakeInstruction(Opcode::DROP_TABLE, TableName, Flags));
 }
 
@@ -599,13 +702,20 @@ void CreateAST::EmitBytecode(BytecodeScratch& Instructions) const {
 			for(const auto &Cn : TC.Columns)
 				AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Cn));
 		} else if(TC.Kind == TableConstraintKind::ForeignKey) {
+			if(TC.Columns.size() != TC.RefColumns.size())
+				FailCodegen("FOREIGN KEY column count must match REFERENCES column count.");
 			AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, std::string("__FK__")));
-			AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, static_cast<int64_t>(1)));
-			if(TC.Columns.size() != 1)
-				FailCodegen("Composite FOREIGN KEY bytecode not wired yet.");
-			AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, TC.Columns.front()));
+			AppendInstruction(Instructions,
+			                   MakeInstruction(Opcode::PUSH, static_cast<int64_t>(TC.Columns.size())));
+			for(const auto &Cn : TC.Columns)
+				AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Cn));
 			AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, TC.RefTable));
-			AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, TC.RefColumn));
+			AppendInstruction(Instructions,
+			                   MakeInstruction(Opcode::PUSH, static_cast<int64_t>(TC.RefColumns.size())));
+			for(const auto &Rc : TC.RefColumns)
+				AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Rc));
+			AppendInstruction(Instructions,
+			                   MakeInstruction(Opcode::PUSH, static_cast<int64_t>(TC.OnDeleteAction)));
 		} else if(TC.Kind == TableConstraintKind::Check) {
 			std::string Blob;
 			CompileCheckSqlToDnfPackedOrThrowImpl(TC.CheckSql, Blob);
@@ -727,8 +837,17 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 		FailCodegen("COUNT(*) requires a GROUP BY clause in this SQL dialect.");
 	if(!ComboAggs().empty() && Grp.empty())
 		FailCodegen("SUM, MIN, MAX, and AVG require a GROUP BY clause when used in the SELECT list.");
+	if(OlapKind() != GroupOlapModifier::None && Grp.empty())
+		FailCodegen("ROLLUP, CUBE, and GROUPING SETS require GROUP BY columns.");
+	if(OlapKind() != GroupOlapModifier::None && AggKind() == GroupAggMode::CountDistinct)
+		FailCodegen("COUNT(DISTINCT) cannot be combined with ROLLUP, CUBE, or GROUPING SETS.");
+	if(OlapKind() == GroupOlapModifier::GroupingSets && GroupingSets().empty())
+		FailCodegen("GROUPING SETS requires at least one grouping set.");
 
 	std::string Work = ResolveRelationLogicalName(MaterializedTable, Instructions);
+	const std::string FromBase = ResolveRelationLogicalName(Table_, Instructions);
+	if(Work != FromBase)
+		AppendInstruction(Instructions, MakeInstruction(Opcode::CLONE_TABLE, Work, FromBase));
 	for(size_t Ij = 0; Ij < JoinSpecs().size(); ++Ij) {
 		const JoinClause &Jc = JoinSpecs()[Ij];
 		const std::string Dst = JoinDestPrefix + std::to_string(Ij);
@@ -744,6 +863,11 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 		}
 		Instructions.push_back(std::move(Ji));
 		Work = Dst;
+	}
+
+	if(!JoinSpecs().empty() && Work != MaterializedTable && MaterializedTable != FromBase) {
+		AppendInstruction(Instructions, MakeInstruction(Opcode::CLONE_TABLE, MaterializedTable, Work));
+		Work = MaterializedTable;
 	}
 
 	for(const auto &Column : Columns_)
@@ -763,7 +887,14 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 
 	if(!Grp.empty()) {
 		Instruction G;
-		G.Opcode = Opcode::GROUP_BY;
+		if(OlapKind() == GroupOlapModifier::Rollup)
+			G.Opcode = Opcode::ROLLUP;
+		else if(OlapKind() == GroupOlapModifier::Cube)
+			G.Opcode = Opcode::CUBE;
+		else if(OlapKind() == GroupOlapModifier::GroupingSets)
+			G.Opcode = Opcode::GROUPING_SETS;
+		else
+			G.Opcode = Opcode::GROUP_BY;
 		const auto CountStarOutCol = [&]() -> std::string {
 			return CountAggregateOutputColumn().empty() ? std::string("cnt") : CountAggregateOutputColumn();
 		};
@@ -800,6 +931,15 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 			if(AggCount)
 				G.Operands.push_back(CountStarOutCol());
 		}
+		if(OlapKind() == GroupOlapModifier::GroupingSets) {
+			const auto &Sets = GroupingSets();
+			G.Operands.push_back(static_cast<int64_t>(Sets.size()));
+			for(const auto &S : Sets) {
+				G.Operands.push_back(static_cast<int64_t>(S.size()));
+				for(const auto &C : S)
+					G.Operands.push_back(C);
+			}
+		}
 		Instructions.push_back(std::move(G));
 	}
 
@@ -812,20 +952,38 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 		Instructions.push_back(MakeFilterDnf(HBranches));
 	}
 
-	if(RowNumberOrderSpec().has_value()) {
-		const auto &[OrdCol, Asc] = *RowNumberOrderSpec();
-		const auto &Pc = RowNumberPartitionByColumns();
-		if(Pc.size() > Limits::MaxWindowPartitionColumns)
+	if(WindowSpecs().size() > Limits::MaxWindowFunctionsPerSelect)
+		FailCodegen("Window function count exceeds AstralDB limit (Limits::MaxWindowFunctionsPerSelect).");
+	for(const WindowSpec &Ws : WindowSpecs()) {
+		if(Ws.PartitionBy.size() > Limits::MaxWindowPartitionColumns)
 			FailCodegen("PARTITION BY column count exceeds AstralDB limit (Limits::MaxWindowPartitionColumns).");
+		if(Ws.OrderColumn.empty() || Ws.OutputColumn.empty())
+			FailCodegen("Internal: window spec missing ORDER BY or output column.");
+		const int64_t KindTag = static_cast<int64_t>(Ws.Kind);
+		if(KindTag < 0 || KindTag > 8)
+			FailCodegen("Internal: unsupported window function kind.");
+		if((Ws.Kind == WindowFnKind::Sum || Ws.Kind == WindowFnKind::Min || Ws.Kind == WindowFnKind::Max ||
+		    Ws.Kind == WindowFnKind::Avg || Ws.Kind == WindowFnKind::Lag || Ws.Kind == WindowFnKind::Lead) &&
+		   Ws.SourceColumn.empty())
+			FailCodegen("Internal: window aggregate/shift missing source column.");
 		Instruction WI;
 		WI.Opcode = Opcode::WINDOW_ROW_NUMBER;
-		WI.Operands.push_back(static_cast<int64_t>(Pc.size()));
-		for(const auto &K : Pc)
+		WI.Operands.push_back(static_cast<int64_t>(Ws.PartitionBy.size()));
+		for(const auto &K : Ws.PartitionBy)
 			WI.Operands.push_back(K);
-		WI.Operands.push_back(OrdCol);
-		WI.Operands.push_back(static_cast<int64_t>(Asc ? 1 : 0));
-		WI.Operands.push_back(RowNumberOutColumn());
-		WI.Operands.push_back(static_cast<int64_t>(WindowOrdinalKind()));
+		WI.Operands.push_back(Ws.OrderColumn);
+		WI.Operands.push_back(static_cast<int64_t>(Ws.OrderAscending ? 1 : 0));
+		WI.Operands.push_back(Ws.OutputColumn);
+		WI.Operands.push_back(KindTag);
+		WI.Operands.push_back(Ws.SourceColumn);
+		WI.Operands.push_back(Ws.FrameOffset);
+		WI.Operands.push_back(static_cast<int64_t>(Ws.HasExplicitRowsFrame ? 1 : 0));
+		if(Ws.HasExplicitRowsFrame) {
+			WI.Operands.push_back(static_cast<int64_t>(Ws.FrameStart.Kind));
+			WI.Operands.push_back(Ws.FrameStart.Offset);
+			WI.Operands.push_back(static_cast<int64_t>(Ws.FrameEnd.Kind));
+			WI.Operands.push_back(Ws.FrameEnd.Offset);
+		}
 		Instructions.push_back(std::move(WI));
 	}
 
@@ -837,6 +995,10 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 			EmitCastEvalInstruction(*Ca, Columns_[Pi], Instructions);
 		else if(const auto *Ce = dynamic_cast<const CaseExprAST *>(Ptr.get()))
 			EmitCaseEvalInstruction(*Ce, Columns_[Pi], Instructions);
+		else if(const auto *Sf = dynamic_cast<const ScalarFuncExprAST *>(Ptr.get()))
+			EmitScalarFuncEvalInstruction(*Sf, Columns_[Pi], Instructions);
+		else if(const auto *Gx = dynamic_cast<const GroupingExprAST *>(Ptr.get()))
+			EmitGroupingEvalInstruction(*Gx, Columns_[Pi], Instructions);
 		else
 			FailCodegen("Internal: unsupported SELECT projection expression.");
 	}
@@ -948,10 +1110,21 @@ void CompoundSelectAST::EmitBytecode(BytecodeScratch &Instructions) const {
 
 void WithSelectAST::EmitBytecode(BytecodeScratch& Instructions) const {
 	for(const auto &Ct : Clauses) {
+		const std::string &Work = Ct.PhysicalTable;
 		AppendInstruction(Instructions,
-		                   MakeInstruction(Opcode::CLONE_TABLE, Ct.PhysicalTable,
-		                                 ResolveRelationLogicalName(Ct.Definition->SourceTableName(), Instructions)));
-		Ct.Definition->EmitBytecodeForScratchTable(Ct.PhysicalTable, Instructions);
+		                   MakeInstruction(Opcode::CLONE_TABLE, Work,
+		                                 ResolveRelationLogicalName(Ct.Anchor->SourceTableName(), Instructions)));
+		Ct.Anchor->EmitBytecodeForScratchTable(Work, Instructions);
+		if(!Ct.IsRecursive())
+			continue;
+
+		const std::string Delta = Work + "_delta";
+		const size_t LoopStart = Instructions.size();
+		Ct.RecursiveStep->EmitBytecodeForScratchTable(Delta, Instructions);
+		AppendInstruction(Instructions,
+		                   MakeInstruction(Opcode::RECURSIVE_CTE_FIXPOINT, Work, Delta,
+		                                    static_cast<int64_t>(Limits::MaxCteRecursionDepth),
+		                                    static_cast<int64_t>(LoopStart)));
 	}
 	if(Main)
 		Main->EmitBytecode(Instructions);
@@ -965,9 +1138,59 @@ void InsertAST::EmitBytecode(BytecodeScratch& Instructions) const {
 		for(const auto &Val : RowValue)
 			AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Val));
 		const int64_t Explicit = Columns.empty() ? 0LL : 1LL;
-		AppendInstruction(Instructions,
-		                   MakeInstruction(Opcode::INSERT, static_cast<int64_t>(RowValue.size()), Explicit));
+		if(Upsert_) {
+			const UpsertSpec &U = *Upsert_;
+			const int64_t DoNothing = U.Mode == UpsertSpec::OnConflict::Nothing ? 1LL : 0LL;
+			std::vector<Value> Ops;
+			Ops.reserve(6 + U.ConflictColumns.size() + U.UpdateAssignments.size() * 2 + 4);
+			Ops.push_back(static_cast<int64_t>(RowValue.size()));
+			Ops.push_back(Explicit);
+			Ops.push_back(DoNothing);
+			Ops.push_back(static_cast<int64_t>(U.ConflictColumns.size()));
+			for(const auto &C : U.ConflictColumns)
+				Ops.push_back(C);
+			Ops.push_back(static_cast<int64_t>(U.UpdateAssignments.size()));
+			for(const auto &Asg : U.UpdateAssignments) {
+				Ops.push_back(Asg.Column);
+				Ops.push_back(SerializeSetValueExpr(Asg.Value.get()));
+			}
+			Instruction Up;
+			Up.Opcode = Opcode::UPSERT;
+			Up.Operands = std::move(Ops);
+			AppendInstruction(Instructions, Up);
+		} else {
+			AppendInstruction(Instructions,
+			                   MakeInstruction(Opcode::INSERT, static_cast<int64_t>(RowValue.size()), Explicit));
+		}
 	}
+}
+
+void MergeAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	if(OnKeyPairs.empty())
+		FailCodegen("MERGE requires at least one ON key pair.");
+	std::vector<Value> Ops;
+	Ops.reserve(6 + OnKeyPairs.size() * 2 + Matched.size() * 2 + NotMatched.size() * 2);
+	Ops.push_back(TargetTable);
+	Ops.push_back(SourceTable);
+	Ops.push_back(static_cast<int64_t>(OnKeyPairs.size()));
+	for(const auto &[Tc, Sc] : OnKeyPairs) {
+		Ops.push_back(Tc);
+		Ops.push_back(Sc);
+	}
+	Ops.push_back(static_cast<int64_t>(Matched.size()));
+	for(const auto &M : Matched) {
+		Ops.push_back(M.TargetColumn);
+		Ops.push_back(SerializeSetValueExpr(M.Value.get()));
+	}
+	Ops.push_back(static_cast<int64_t>(NotMatched.size()));
+	for(const auto &N : NotMatched) {
+		Ops.push_back(N.Column);
+		Ops.push_back(SerializeSetValueExpr(N.Value.get()));
+	}
+	Instruction Mg;
+	Mg.Opcode = Opcode::MERGE_INTO;
+	Mg.Operands = std::move(Ops);
+	AppendInstruction(Instructions, Mg);
 }
 
 void BulkInsertAST::EmitBytecode(BytecodeScratch& Instructions) const {
@@ -1146,8 +1369,14 @@ Bytecode BuildBytecode(Logger *Logger, OptimizationLevel OptLevel, const AstralD
 				ViewCodegen.WalReparsedBodies.erase(Dv->ViewName);
 			} else
 				Statement->Value->EmitBytecode(Instructions);
-			for(auto &Inst : Instructions)
+			const size_t BaseIp = Result.size();
+			for(auto &Inst : Instructions) {
+				if(Inst.Opcode == Opcode::RECURSIVE_CTE_FIXPOINT && Inst.Operands.size() >= 4) {
+					if(auto *LoopStart = std::get_if<int64_t>(&Inst.Operands[3]))
+						*LoopStart += static_cast<int64_t>(BaseIp);
+				}
 				Result.push_back(std::move(Inst));
+			}
 		}
 	}
 
