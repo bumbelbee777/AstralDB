@@ -141,6 +141,16 @@ enum class Opcode : uint8_t {
 	/** \c INSERT … BULK fixture rows at runtime (torture-shaped five columns). Operands: table name, count, start id,
 	 *  step (all int64 except table string). Avoids expanding millions of \c INSERT instructions at compile time. */
 	INSERT_BULK,
+	/** Operands: dataset name, kind (int64), source table, bulk count, bulk start, bulk step. */
+	REGISTER_DATASET,
+	/** Operands: dataset name, target table name, version id (0 = latest). */
+	LOAD_DATASET,
+	/** Operands: dataset name. */
+	DROP_DATASET,
+	/** Operands: optional table name (empty string = whole database). */
+	VACUUM,
+	/** Operands: table name. */
+	REPACK_CONCURRENTLY,
 };
 
 using Value = std::variant<int64_t, double, std::string>;
@@ -193,6 +203,11 @@ struct Instruction {
 			case Opcode::CALL_PROCEDURE:
             case Opcode::INSERT:
 			case Opcode::INSERT_BULK:
+			case Opcode::REGISTER_DATASET:
+			case Opcode::LOAD_DATASET:
+			case Opcode::DROP_DATASET:
+			case Opcode::VACUUM:
+			case Opcode::REPACK_CONCURRENTLY:
             case Opcode::DELETE:
             case Opcode::UPDATE:
             case Opcode::KEEP_ROWS:

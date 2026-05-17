@@ -27,3 +27,14 @@ SELECT EXTRACT(HOUR FROM ts) AS hr, TIMESTAMP_DIFF(ts, '2024-01-01T10:00:00') AS
 FROM metrics
 WHERE device = 'a'
 ORDER BY ts ASC;
+
+-- Delta-compressed series (see sources/Database/TimeSeriesCompression.*)
+WITH packed AS (
+	SELECT TS_COMPRESS_SERIES(
+		'L[3]:1704111330,1704114000,1704117600',
+		'L[3]:1,2,3'
+	) AS blob
+	FROM metrics
+	LIMIT 1
+)
+SELECT TS_DECOMPRESS(blob) AS restored FROM packed;

@@ -82,6 +82,11 @@ bool OpcodeIsDml(Opcode Op) {
 	case Opcode::DELETE_MATCHING:
 	case Opcode::UPSERT:
 	case Opcode::MERGE_INTO:
+	case Opcode::REGISTER_DATASET:
+	case Opcode::LOAD_DATASET:
+	case Opcode::DROP_DATASET:
+	case Opcode::VACUUM:
+	case Opcode::REPACK_CONCURRENTLY:
 		return true;
 	default:
 		return false;
@@ -190,6 +195,16 @@ std::string OpcodeName(Opcode Op) {
 		return "INSERT";
 	case Opcode::INSERT_BULK:
 		return "INSERT_BULK";
+	case Opcode::REGISTER_DATASET:
+		return "REGISTER_DATASET";
+	case Opcode::LOAD_DATASET:
+		return "LOAD_DATASET";
+	case Opcode::DROP_DATASET:
+		return "DROP_DATASET";
+	case Opcode::VACUUM:
+		return "VACUUM";
+	case Opcode::REPACK_CONCURRENTLY:
+		return "REPACK_CONCURRENTLY";
 	case Opcode::UPDATE:
 		return "UPDATE";
 	case Opcode::DELETE:

@@ -19,9 +19,12 @@ add_library(astraldb STATIC
     sources/Database/HybridStorageScheduler.cxx
     sources/Database/HybridTable.cxx
     sources/Database/TimeSeries.cxx
+    sources/Database/TimeSeriesCompression.cxx
+    sources/Database/GeoSpatial.cxx
     sources/Database/User.cxx
     sources/Database/WriteAheadLog.cxx
     sources/IO/SIMD.cxx
+    sources/IO/MemoryGuard.cxx
     sources/SQL/AST.cxx
     sources/SQL/Bytecode.cxx
     sources/SQL/BytecodeFormat.cxx

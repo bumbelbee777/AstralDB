@@ -145,7 +145,7 @@ bool Parser::IsKeyword(const std::string &TokenValue) {
         "GRANT", "REVOKE", "FROM", "ROLE", "TO",
         "IF", "EXISTS",
         "IS", "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME",
-        "EXPORT", "IMPORT", "CONVERT", "DATABASE", "FORMAT", "FILE",
+        "EXPORT", "IMPORT", "CONVERT", "DATABASE", "FORMAT", "FILE", "LOAD", "DATASET", "INTO",
         "WITH", "RECURSIVE", "UNION", "ALL", "INTERSECT", "EXCEPT",
         "MERGE", "USING", "MATCHED", "CONFLICT", "DO", "NOTHING", "EXCLUDED",
         "ROLLUP", "CUBE", "GROUPING", "SETS", "GROUPING_ID",
@@ -160,7 +160,7 @@ bool Parser::IsKeyword(const std::string &TokenValue) {
         "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "EPOCH",
         "GENERATED", "IDENTITY", "ALWAYS", "NEXTVAL", "INCREMENT",
         "STORAGE", "COLUMNAR", "HYBRID", "AUTO",
-        "STRUCT", "MAP", "VECTOR", "MATRIX", "COMPLEX", "LIST",
+        "STRUCT", "MAP", "VECTOR", "MATRIX", "COMPLEX", "LIST", "POINT", "GEOMETRY",
         "ABS", "SQRT", "CBRT", "POW", "EXP", "LN", "LOG10", "LOG2", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN",
         "ATAN2", "SINH", "COSH", "TANH", "FLOOR", "CEIL", "ROUND", "TRUNC", "SIGN", "MOD", "HYPOT", "DEGREES",
         "RADIANS", "LERP", "CLAMP", "MEAN", "VAR_POP", "VAR_SAMP", "STDDEV_POP", "STDDEV_SAMP", "MEDIAN", "ENTROPY",
@@ -176,8 +176,13 @@ bool Parser::IsKeyword(const std::string &TokenValue) {
         "AD_GRAD_MUL_LHS", "AD_GRAD_MUL_RHS", "AD_GRAD_RELU", "AD_GRAD_SIGMOID", "AD_GRAD_CONV1D_IN",
         "AD_GRAD_CONV1D_K", "AD_CHAIN", "AD_HESSIAN", "AD_HESSIAN_RELU", "AD_HESSIAN_SIGMOID", "AD_HESSIAN_SQUARE",
         "AD_WIRTINGER_MUL_LHS", "AD_WIRTINGER_MUL_RHS", "AD_WIRTINGER_ABS2", "AD_WIRTINGER_CHAIN", "AD_WIRTINGER_DZ",
-        "AD_WIRTINGER_DZBAR", "ODE_EULER", "ODE_RK4", "SDE_EULER", "SDE_GBM", "SDE_OU", "PDE_HEAT_STEP",
-        "PDE_POISSON_STEP",
+        "AD_WIRTINGER_DZBAR", "ODE_EULER", "ODE_RK4", "ODE_HEUN", "ODE_MIDPOINT", "ODE_IMPLICIT_EULER",
+        "SOLVE_ODE", "SDE_EULER", "SDE_GBM", "SDE_OU", "SDE_MILSTEIN", "PDE_HEAT_STEP", "PDE_POISSON_STEP",
+        "PDE_ADVECTION_STEP", "PDE_WAVE_STEP", "ST_POINT", "ST_X", "ST_Y", "ST_AS_TEXT", "ST_DISTANCE",
+        "ST_DISTANCE_SPHERICAL", "ST_WITHIN_BBOX", "ST_POINTZ", "ST_ELEVATION", "ST_DEM_SAMPLE", "ST_TERRAIN_SLOPE",
+        "TS_COMPRESS", "TS_DECOMPRESS", "TS_COMPRESS_SERIES",
+        "DATASET", "LOAD", "INTO", "VERSION", "VARIANT", "TERRAIN", "TERRAIN_POINT",
+        "VACUUM", "REPACK", "CONCURRENTLY",
         "MATCH_RECOGNIZE", "MATCH", "AGAINST", "TEXT_CONTAINS", "MATCH_AGAINST", "PATTERN", "DEFINE",
         "SYSTEM", "TIME", "INDEX", "FTS", "VECTOR", "METRIC"};
     return Keywords.find(TokenValue) != Keywords.end();
@@ -247,7 +252,7 @@ TokenStream Parser::Tokenize() {
                 if(Sign == '-')
                     Num = "-" + Num;
                 Tokens.push_back(Token{TokenType::LITERAL, std::move(Num), TokBegin});
-                if(Tokens.size() > Limits::MaxSqlTokens)
+                if((Tokens.size() & 0x1FF) == 0 && Tokens.size() > Limits::MaxSqlTokens)
                     LexFail(TokBegin,
                             "Too many SQL tokens (limit is a safety guard against malformed or hostile input).");
                 continue;
@@ -385,7 +390,13 @@ Tree<std::unique_ptr<StatementAST>> Parser::BuildAST() const {
 			Self->AdvanceToken();
 			continue;
 		}
-		Self->AdvanceToken();
+		while(Self->CurrentIndex_ < Self->Tokens_.size()) {
+			const Token &T = Self->Tokens_[Self->CurrentIndex_];
+			if(T.Type == TokenType::PUNCTUATION && T.Value == ";")
+				Self->AdvanceToken();
+			else
+				break;
+		}
 	}
 	if(Result.Empty())
 		ParseFail("No valid statements were parsed.");
@@ -617,6 +628,10 @@ std::string Parser::ParseDataType() {
 		return "TIMESTAMP";
 	if(Canon == "COMPLEX")
 		return "COMPLEX";
+	if(Canon == "VARIANT" || Canon == "ANY")
+		return "VARIANT";
+	if(Canon == "TERRAIN" || Canon == "TERRAIN_POINT")
+		return "TERRAIN";
 	if(Canon == "LIST") {
 		if(!CurrentToken() || CurrentToken()->Value != "(")
 			ParseFail("Expected '(' after LIST");
@@ -1188,6 +1203,50 @@ ASTNode Parser::ParseCreateStatement() {
 		ParseSequenceOptions(Start, Increment);
 		return std::make_unique<CreateSequenceAST>(std::move(SeqName), Start, Increment, IfNotExists);
 	}
+	if(MatchKeyword("DATASET")) {
+		auto Nt = CurrentToken();
+		if(!Nt || Nt->Type != TokenType::IDENTIFIER)
+			ParseFail("Expected dataset name after CREATE DATASET.");
+		std::string DsName = Nt->Value;
+		AdvanceToken();
+		if(!MatchKeyword("AS"))
+			ParseFail("CREATE DATASET requires AS TABLE or AS BULK.");
+		if(MatchKeyword("TABLE")) {
+			auto Tt = CurrentToken();
+			if(!Tt || Tt->Type != TokenType::IDENTIFIER)
+				ParseFail("Expected table name after CREATE DATASET AS TABLE.");
+			std::string Src = Tt->Value;
+			AdvanceToken();
+			return std::make_unique<CreateDatasetAST>(std::move(DsName), DatasetKind::TableRef, std::move(Src), 0,
+			                                          1, 1);
+		}
+		if(MatchKeyword("BULK")) {
+			auto Cnt = CurrentToken();
+			if(!Cnt || Cnt->Type != TokenType::LITERAL)
+				ParseFail("Expected integer after CREATE DATASET AS BULK.");
+			int64_t Count = std::stoll(Cnt->Value);
+			AdvanceToken();
+			int64_t Start = 1;
+			int64_t Step = 1;
+			if(MatchKeyword("START")) {
+				auto St = CurrentToken();
+				if(!St || St->Type != TokenType::LITERAL)
+					ParseFail("Expected integer after START.");
+				Start = std::stoll(St->Value);
+				AdvanceToken();
+			}
+			if(MatchKeyword("STEP")) {
+				auto Sp = CurrentToken();
+				if(!Sp || Sp->Type != TokenType::LITERAL)
+					ParseFail("Expected integer after STEP.");
+				Step = std::stoll(Sp->Value);
+				AdvanceToken();
+			}
+			return std::make_unique<CreateDatasetAST>(std::move(DsName), DatasetKind::BulkFixture, std::string(), Count,
+			                                          Start, Step);
+		}
+		ParseFail("CREATE DATASET requires AS TABLE or AS BULK.");
+	}
 	if(MatchKeyword("ROLE")) {
 		auto RoleTok = CurrentToken();
 		if(!RoleTok || RoleTok->Type != TokenType::IDENTIFIER)
@@ -1375,6 +1434,14 @@ ASTNode Parser::ParseDropStatement() {
 		std::string IdxName = Nt->Value;
 		AdvanceToken();
 		return std::make_unique<DropIndexAST>(std::move(IdxName), IfExistsIdx);
+	}
+	if(MatchKeyword("DATASET")) {
+		auto Nt = CurrentToken();
+		if(!Nt || Nt->Type != TokenType::IDENTIFIER)
+			ParseFail("Expected dataset name after DROP DATASET.");
+		std::string DsName = Nt->Value;
+		AdvanceToken();
+		return std::make_unique<DropDatasetAST>(std::move(DsName));
 	}
 	if(MatchKeyword("SEQUENCE")) {
 		bool IfExistsSeq = false;
@@ -3586,10 +3653,77 @@ std::unique_ptr<StatementAST> Parser::ParseWithStatement() {
 	return Out;
 }
 
+std::unique_ptr<StatementAST> Parser::ParseLoadStatement() {
+	AdvanceToken();
+	if(!MatchKeyword("DATASET"))
+		ParseFail("LOAD expects DATASET.");
+	auto Nt = CurrentToken();
+	if(!Nt || Nt->Type != TokenType::IDENTIFIER)
+		ParseFail("Expected dataset name after LOAD DATASET.");
+	std::string DsName = Nt->Value;
+	AdvanceToken();
+	int64_t VersionId = 0;
+	if(MatchKeyword("VERSION")) {
+		auto Vt = CurrentToken();
+		if(!Vt || Vt->Type != TokenType::LITERAL)
+			ParseFail("Expected integer after LOAD DATASET VERSION.");
+		VersionId = std::stoll(Vt->Value);
+		AdvanceToken();
+	}
+	if(!MatchKeyword("INTO"))
+		ParseFail("LOAD DATASET requires INTO table_name.");
+	auto Tt = CurrentToken();
+	if(!Tt || Tt->Type != TokenType::IDENTIFIER)
+		ParseFail("Expected table name after LOAD DATASET INTO.");
+	std::string Target = Tt->Value;
+	AdvanceToken();
+	if(VersionId == 0 && MatchKeyword("VERSION")) {
+		auto Vt = CurrentToken();
+		if(!Vt || Vt->Type != TokenType::LITERAL)
+			ParseFail("Expected integer after LOAD DATASET VERSION.");
+		VersionId = std::stoll(Vt->Value);
+		AdvanceToken();
+	}
+	return std::make_unique<LoadDatasetAST>(std::move(DsName), std::move(Target), VersionId);
+}
+
+std::unique_ptr<StatementAST> Parser::ParseVacuumStatement() {
+	AdvanceToken();
+	std::string Table;
+	if(MatchKeyword("TABLE")) {
+		auto Tt = CurrentToken();
+		if(!Tt || Tt->Type != TokenType::IDENTIFIER)
+			ParseFail("Expected table name after VACUUM TABLE.");
+		Table = Tt->Value;
+		AdvanceToken();
+	}
+	return std::make_unique<VacuumAST>(std::move(Table));
+}
+
+std::unique_ptr<StatementAST> Parser::ParseRepackStatement() {
+	AdvanceToken();
+	if(!MatchKeyword("TABLE"))
+		ParseFail("REPACK requires TABLE.");
+	auto Tt = CurrentToken();
+	if(!Tt || Tt->Type != TokenType::IDENTIFIER)
+		ParseFail("Expected table name after REPACK TABLE.");
+	std::string Table = Tt->Value;
+	AdvanceToken();
+	if(!MatchKeyword("CONCURRENTLY"))
+		ParseFail("REPACK TABLE requires CONCURRENTLY.");
+	return std::make_unique<RepackConcurrentlyAST>(std::move(Table));
+}
+
 std::unique_ptr<StatementAST> Parser::ParseStatement() {
     if (auto Token = CurrentToken()) {
         if(Token->Type == TokenType::KEYWORD && Token->Value == "WITH")
             return ParseWithStatement();
+        if(Token->Type == TokenType::KEYWORD && Token->Value == "LOAD")
+            return ParseLoadStatement();
+        if(Token->Type == TokenType::KEYWORD && Token->Value == "VACUUM")
+            return ParseVacuumStatement();
+        if(Token->Type == TokenType::KEYWORD && Token->Value == "REPACK")
+            return ParseRepackStatement();
         if(Token->Type == TokenType::KEYWORD && Token->Value == "EXPORT")
             return ParseDataExchangeStatement();
         if(Token->Type == TokenType::KEYWORD && Token->Value == "IMPORT")

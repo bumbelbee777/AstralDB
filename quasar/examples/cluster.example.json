@@ -1,0 +1,37 @@
+{
+  "shards": [
+    { "name": "shard0", "database": "data/shard0.db" },
+    { "name": "shard1", "database": "data/shard1.db" },
+    { "name": "shard2", "database": "data/shard2.db" }
+  ],
+  "virtual_nodes": 128,
+  "backup_dir": "backups",
+  "backup_retention": { "keep_last": 14, "keep_days": 30 },
+  "replicas": {
+    "shard0_mirror": {
+      "master": "data/shard0.db",
+      "slaves": ["data/shard0_replica.db"]
+    }
+  },
+  "multi_master": {
+    "shard0": {
+      "writers": ["data/shard0.db", "data/shard0_b.db"],
+      "quorum": 2
+    }
+  },
+  "failover": {
+    "enabled": true,
+    "auto_promote": true,
+    "state_file": ".quasar/failover.json",
+    "shards": {
+      "shard0": {
+        "primary": "data/shard0.db",
+        "standbys": ["data/shard0_standby.db"]
+      }
+    }
+  },
+  "rebalance": {
+    "shard_key_column": "id",
+    "auto_apply": false
+  }
+}

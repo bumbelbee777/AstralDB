@@ -1,0 +1,22 @@
+{
+  "tables": [
+    {
+      "alias": "o",
+      "sql": "SELECT * FROM orders",
+      "key_columns": ["customer_id"]
+    },
+    {
+      "alias": "c",
+      "sql": "SELECT * FROM customers",
+      "key_columns": ["id"]
+    }
+  ],
+  "joins": [
+    {
+      "left": "o",
+      "right": "c",
+      "on": [["customer_id", "id"]]
+    }
+  ],
+  "limit": 100
+}

@@ -15,7 +15,9 @@
 #include <Database/TextIndex.hxx>
 #include <IO/MathUtil.hxx>
 #include <Database/ColumnarStorage.hxx>
+#include <Database/Dataset.hxx>
 #include <Database/Database.hxx>
+#include <Database/PrefetchEngine.hxx>
 #include <Database/TimeSeries.hxx>
 #include <IO/SIMD.hxx>
 #include <iostream>
@@ -1120,7 +1122,11 @@ static void RunGroupByCore(Database::Table &Tbl, const Instruction &Inst,
 			std::unordered_map<std::string, std::vector<std::string>> CurMin;
 			std::unordered_map<std::string, std::vector<std::string>> CurMax;
 		} Acc;
-		for(const auto &Row : Tbl) {
+		PrefetchEngine::RowScanSession GbScan;
+		PrefetchEngine::BeginRowScan(Tbl, GbScan);
+		for(std::size_t Tri = 0; Tri < Tbl.size(); ++Tri) {
+			PrefetchEngine::AdvanceRowScan(Tbl, Tri, GbScan);
+			const auto &Row = Tbl[Tri];
 			const std::string Sig = GroupKeySignature(Row, ActiveKeys);
 			if(IncludeCountStar)
 				Acc.CntStar[Sig]++;
@@ -1243,7 +1249,11 @@ static void RunGroupByCore(Database::Table &Tbl, const Instruction &Inst,
 		std::unordered_map<std::string, Database::Item> Template;
 		Cnt.reserve(Tbl.size());
 		Template.reserve(Tbl.size());
-		for(const auto &Row : Tbl) {
+		PrefetchEngine::RowScanSession GbScan;
+		PrefetchEngine::BeginRowScan(Tbl, GbScan);
+		for(std::size_t Tri = 0; Tri < Tbl.size(); ++Tri) {
+			PrefetchEngine::AdvanceRowScan(Tbl, Tri, GbScan);
+			const auto &Row = Tbl[Tri];
 			const std::string Sig = GroupKeySignature(Row, ActiveKeys);
 			Cnt[Sig]++;
 			if(Template.find(Sig) == Template.end()) {
@@ -1270,7 +1280,11 @@ static void RunGroupByCore(Database::Table &Tbl, const Instruction &Inst,
 	} else if(AggMode == 0) {
 		std::unordered_map<std::string, Database::Item> First;
 		First.reserve(Tbl.size());
-		for(const auto &Row : Tbl) {
+		PrefetchEngine::RowScanSession GbScan;
+		PrefetchEngine::BeginRowScan(Tbl, GbScan);
+		for(std::size_t Tri = 0; Tri < Tbl.size(); ++Tri) {
+			PrefetchEngine::AdvanceRowScan(Tbl, Tri, GbScan);
+			const auto &Row = Tbl[Tri];
 			const std::string Sig = GroupKeySignature(Row, ActiveKeys);
 			if(First.find(Sig) == First.end())
 				First.emplace(Sig, Row);
@@ -1734,11 +1748,14 @@ void BytecodeInterpreter::Execute(const Bytecode &Code, const std::vector<std::s
 			if(DebugSession_->Report().HaltedEarly)
 				break;
 		}
-		if(++StepsExecuted_ > Limits::MaxInterpreterSteps)
+		++StepsExecuted_;
+		if((StepsExecuted_ & 63) == 0 && StepsExecuted_ > Limits::MaxInterpreterSteps)
 			FailVm("Statement exceeded the VM step limit (safety guard against infinite loops or oversized programs).");
 		if(!Step(Code))
 			break;
 	}
+	if(StepsExecuted_ > Limits::MaxInterpreterSteps)
+		FailVm("Statement exceeded the VM step limit (safety guard against infinite loops or oversized programs).");
 	if(DebugSession_)
 		DebugSession_->NotifyCompleted();
 	StringOperandPool_ = nullptr;
@@ -2329,6 +2346,85 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             ++Ic;
             break;
         }
+        case Opcode::REGISTER_DATASET: {
+            if(inst.Operands.size() != 6)
+                FailVm("REGISTER_DATASET expects six operands");
+            auto *Name = std::get_if<std::string>(&inst.Operands[0]);
+            auto *Kind = std::get_if<int64_t>(&inst.Operands[1]);
+            auto *Src = std::get_if<std::string>(&inst.Operands[2]);
+            auto *Cnt = std::get_if<int64_t>(&inst.Operands[3]);
+            auto *Start = std::get_if<int64_t>(&inst.Operands[4]);
+            auto *Step = std::get_if<int64_t>(&inst.Operands[5]);
+            if(!Name || !Kind || !Src || !Cnt || !Start || !Step)
+                FailVm("REGISTER_DATASET operand types");
+            if(Databases_.empty())
+                Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+            DatasetEntry Ent;
+            Ent.Kind = *Kind == 0 ? DatasetKind::TableRef : DatasetKind::BulkFixture;
+            Ent.SourceTable = *Src;
+            Ent.BulkCount = *Cnt;
+            Ent.BulkStart = *Start;
+            Ent.BulkStep = *Step;
+            Databases_[0]->RegisterDataset(*Name, std::move(Ent));
+            ++Ic;
+            break;
+        }
+        case Opcode::LOAD_DATASET: {
+            if(inst.Operands.size() < 2 || inst.Operands.size() > 3)
+                FailVm("LOAD_DATASET expects dataset, target table, optional version");
+            auto *Name = std::get_if<std::string>(&inst.Operands[0]);
+            auto *Tgt = std::get_if<std::string>(&inst.Operands[1]);
+            int64_t Ver = 0;
+            if(inst.Operands.size() == 3) {
+                auto *V = std::get_if<int64_t>(&inst.Operands[2]);
+                if(!V)
+                    FailVm("LOAD_DATASET version must be int64");
+                Ver = *V;
+            }
+            if(!Name || !Tgt)
+                FailVm("LOAD_DATASET operand types");
+            if(Databases_.empty())
+                Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+            Databases_[0]->LoadDatasetInto(*Name, *Tgt, Ver);
+            ++Ic;
+            break;
+        }
+        case Opcode::VACUUM: {
+            if(inst.Operands.size() != 1)
+                FailVm("VACUUM expects optional table name operand");
+            auto *Tbl = std::get_if<std::string>(&inst.Operands[0]);
+            if(!Tbl)
+                FailVm("VACUUM operand types");
+            if(Databases_.empty())
+                Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+            Databases_[0]->Vacuum(*Tbl);
+            ++Ic;
+            break;
+        }
+        case Opcode::REPACK_CONCURRENTLY: {
+            if(inst.Operands.size() != 1)
+                FailVm("REPACK_CONCURRENTLY expects table name");
+            auto *Tbl = std::get_if<std::string>(&inst.Operands[0]);
+            if(!Tbl || Tbl->empty())
+                FailVm("REPACK_CONCURRENTLY table name required");
+            if(Databases_.empty())
+                Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+            Databases_[0]->RepackTableConcurrently(*Tbl);
+            ++Ic;
+            break;
+        }
+        case Opcode::DROP_DATASET: {
+            if(inst.Operands.size() != 1)
+                FailVm("DROP_DATASET expects dataset name");
+            auto *Name = std::get_if<std::string>(&inst.Operands[0]);
+            if(!Name)
+                FailVm("DROP_DATASET operand types");
+            if(Databases_.empty())
+                Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+            Databases_[0]->DropDataset(*Name);
+            ++Ic;
+            break;
+        }
         case Opcode::UPSERT: {
             if(inst.Operands.size() < 5)
                 FailVm("UPSERT malformed operands");
@@ -2667,7 +2763,11 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                     std::unordered_map<std::string, std::vector<std::string>> CurMin;
                     std::unordered_map<std::string, std::vector<std::string>> CurMax;
                 } Acc;
-                for(const auto &Row : Tbl) {
+                PrefetchEngine::RowScanSession GbScan;
+                PrefetchEngine::BeginRowScan(Tbl, GbScan);
+                for(std::size_t Tri = 0; Tri < Tbl.size(); ++Tri) {
+                    PrefetchEngine::AdvanceRowScan(Tbl, Tri, GbScan);
+                    const auto &Row = Tbl[Tri];
                     const std::string Sig = GroupKeySignature(Row, Keys);
                     if(IncludeCountStar)
                         Acc.CntStar[Sig]++;
@@ -2792,7 +2892,11 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 std::unordered_map<std::string, Database::Item> Template;
                 std::unordered_map<std::string, std::unordered_set<std::string>> DistinctVals;
                 Template.reserve(Tbl.size());
-                for(const auto &Row : Tbl) {
+                PrefetchEngine::RowScanSession GbScan;
+                PrefetchEngine::BeginRowScan(Tbl, GbScan);
+                for(std::size_t Tri = 0; Tri < Tbl.size(); ++Tri) {
+                    PrefetchEngine::AdvanceRowScan(Tbl, Tri, GbScan);
+                    const auto &Row = Tbl[Tri];
                     const std::string Sig = GroupKeySignature(Row, Keys);
                     if(Template.find(Sig) == Template.end()) {
                         Database::Item R;
@@ -2823,7 +2927,11 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             } else if(AggMode == 0) {
                 std::unordered_map<std::string, Database::Item> First;
                 First.reserve(Tbl.size());
-                for(const auto &Row : Tbl) {
+                PrefetchEngine::RowScanSession GbScan;
+                PrefetchEngine::BeginRowScan(Tbl, GbScan);
+                for(std::size_t Tri = 0; Tri < Tbl.size(); ++Tri) {
+                    PrefetchEngine::AdvanceRowScan(Tbl, Tri, GbScan);
+                    const auto &Row = Tbl[Tri];
                     const std::string Sig = GroupKeySignature(Row, Keys);
                     if(First.find(Sig) == First.end())
                         First.emplace(Sig, Row);
@@ -2850,7 +2958,11 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 std::unordered_map<std::string, Database::Item> Template;
                 Cnt.reserve(Tbl.size());
                 Template.reserve(Tbl.size());
-                for(const auto &Row : Tbl) {
+                PrefetchEngine::RowScanSession GbScan;
+                PrefetchEngine::BeginRowScan(Tbl, GbScan);
+                for(std::size_t Tri = 0; Tri < Tbl.size(); ++Tri) {
+                    PrefetchEngine::AdvanceRowScan(Tbl, Tri, GbScan);
+                    const auto &Row = Tbl[Tri];
                     const std::string Sig = GroupKeySignature(Row, Keys);
                     Cnt[Sig]++;
                     if(Template.find(Sig) == Template.end()) {
@@ -2971,7 +3083,11 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
 			auto &Rows = Tit->second.RowStore;
 			std::vector<Database::Item> Kept;
 			Kept.reserve(Rows.size());
-			for(const auto &Row : Rows) {
+			PrefetchEngine::RowScanSession AsOfScan;
+			PrefetchEngine::BeginRowScan(Rows, AsOfScan);
+			for(std::size_t Ri = 0; Ri < Rows.size(); ++Ri) {
+				PrefetchEngine::AdvanceRowScan(Rows, Ri, AsOfScan);
+				const auto &Row = Rows[Ri];
 				auto FindKey = [&](const char *K) -> std::optional<std::string> {
 					for(const auto &[Name, Val] : Row) {
 						std::string U = Name;
@@ -3532,7 +3648,7 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             const size_t Need = 3 + static_cast<size_t>(*Argc) * 2;
             if(inst.Operands.size() != Need)
                 FailVm("SCALAR_FUNC_EVAL: operand count does not match argc");
-            if(*FnTag < 0 || *FnTag > ScalarSqlFnTag(ScalarSqlFn::PdePoissonStep))
+            if(*FnTag < 0 || *FnTag > ScalarSqlFnTag(ScalarSqlFn::StTerrainSlope))
                 FailVm("SCALAR_FUNC_EVAL: bad function tag");
             const ScalarSqlFn Fn = static_cast<ScalarSqlFn>(*FnTag);
             size_t Idx = 3;
@@ -3625,7 +3741,11 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 auto &Tbl = Databases_[0]->Tables_[TableName].RowStore;
                 std::unordered_set<std::string> Seen;
                 Database::Table Out;
-                for(const auto &Row : Tbl) {
+                PrefetchEngine::RowScanSession DedupScan;
+                PrefetchEngine::BeginRowScan(Tbl, DedupScan);
+                for(std::size_t Tri = 0; Tri < Tbl.size(); ++Tri) {
+                    PrefetchEngine::AdvanceRowScan(Tbl, Tri, DedupScan);
+                    const auto &Row = Tbl[Tri];
                     const std::string Sig = RowSignatureCanon(Row);
                     if(Seen.insert(Sig).second)
                         Out.push_back(Row);
@@ -3706,43 +3826,71 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             Database::Table Built;
             if(Mode == static_cast<int64_t>(CompoundSetOpKind::UnionAll)) {
                 Built.reserve(LT.size() + RT.size());
-                for(const auto &Row : LT)
-                    Built.push_back(MapRowByColumnList(Row, Lsrc, OutNames));
-                for(const auto &Row : RT)
-                    Built.push_back(MapRowByColumnList(Row, Rsrc, OutNames));
+                PrefetchEngine::RowScanSession LScan;
+                PrefetchEngine::BeginRowScan(LT, LScan);
+                for(std::size_t Li = 0; Li < LT.size(); ++Li) {
+                    PrefetchEngine::AdvanceRowScan(LT, Li, LScan);
+                    Built.push_back(MapRowByColumnList(LT[Li], Lsrc, OutNames));
+                }
+                PrefetchEngine::RowScanSession RScan;
+                PrefetchEngine::BeginRowScan(RT, RScan);
+                for(std::size_t Ri = 0; Ri < RT.size(); ++Ri) {
+                    PrefetchEngine::AdvanceRowScan(RT, Ri, RScan);
+                    Built.push_back(MapRowByColumnList(RT[Ri], Rsrc, OutNames));
+                }
             } else if(Mode == static_cast<int64_t>(CompoundSetOpKind::UnionDistinct)) {
                 std::unordered_set<std::string> Seen;
                 Built.reserve(LT.size() + RT.size());
-                for(const auto &Row : LT) {
-                    auto P = MapRowByColumnList(Row, Lsrc, OutNames);
+                PrefetchEngine::RowScanSession LScan;
+                PrefetchEngine::BeginRowScan(LT, LScan);
+                for(std::size_t Li = 0; Li < LT.size(); ++Li) {
+                    PrefetchEngine::AdvanceRowScan(LT, Li, LScan);
+                    auto P = MapRowByColumnList(LT[Li], Lsrc, OutNames);
                     const std::string Sig = RowSignatureCanon(P);
                     if(Seen.insert(Sig).second)
                         Built.push_back(std::move(P));
                 }
-                for(const auto &Row : RT) {
-                    auto P = MapRowByColumnList(Row, Rsrc, OutNames);
+                PrefetchEngine::RowScanSession RScan;
+                PrefetchEngine::BeginRowScan(RT, RScan);
+                for(std::size_t Ri = 0; Ri < RT.size(); ++Ri) {
+                    PrefetchEngine::AdvanceRowScan(RT, Ri, RScan);
+                    auto P = MapRowByColumnList(RT[Ri], Rsrc, OutNames);
                     const std::string Sig = RowSignatureCanon(P);
                     if(Seen.insert(Sig).second)
                         Built.push_back(std::move(P));
                 }
             } else if(Mode == static_cast<int64_t>(CompoundSetOpKind::Intersect)) {
                 std::unordered_set<std::string> RhsSigs;
-                for(const auto &Row : RT)
-                    RhsSigs.insert(RowSignatureCanon(MapRowByColumnList(Row, Rsrc, OutNames)));
+                PrefetchEngine::RowScanSession RScan;
+                PrefetchEngine::BeginRowScan(RT, RScan);
+                for(std::size_t Ri = 0; Ri < RT.size(); ++Ri) {
+                    PrefetchEngine::AdvanceRowScan(RT, Ri, RScan);
+                    RhsSigs.insert(RowSignatureCanon(MapRowByColumnList(RT[Ri], Rsrc, OutNames)));
+                }
                 std::unordered_set<std::string> OutSeen;
-                for(const auto &Row : LT) {
-                    auto P = MapRowByColumnList(Row, Lsrc, OutNames);
+                PrefetchEngine::RowScanSession LScan;
+                PrefetchEngine::BeginRowScan(LT, LScan);
+                for(std::size_t Li = 0; Li < LT.size(); ++Li) {
+                    PrefetchEngine::AdvanceRowScan(LT, Li, LScan);
+                    auto P = MapRowByColumnList(LT[Li], Lsrc, OutNames);
                     const std::string Sig = RowSignatureCanon(P);
                     if(RhsSigs.count(Sig) && OutSeen.insert(Sig).second)
                         Built.push_back(std::move(P));
                 }
             } else if(Mode == static_cast<int64_t>(CompoundSetOpKind::Except)) {
                 std::unordered_set<std::string> RhsSigs;
-                for(const auto &Row : RT)
-                    RhsSigs.insert(RowSignatureCanon(MapRowByColumnList(Row, Rsrc, OutNames)));
+                PrefetchEngine::RowScanSession RScan;
+                PrefetchEngine::BeginRowScan(RT, RScan);
+                for(std::size_t Ri = 0; Ri < RT.size(); ++Ri) {
+                    PrefetchEngine::AdvanceRowScan(RT, Ri, RScan);
+                    RhsSigs.insert(RowSignatureCanon(MapRowByColumnList(RT[Ri], Rsrc, OutNames)));
+                }
                 std::unordered_set<std::string> OutSeen;
-                for(const auto &Row : LT) {
-                    auto P = MapRowByColumnList(Row, Lsrc, OutNames);
+                PrefetchEngine::RowScanSession LScan;
+                PrefetchEngine::BeginRowScan(LT, LScan);
+                for(std::size_t Li = 0; Li < LT.size(); ++Li) {
+                    PrefetchEngine::AdvanceRowScan(LT, Li, LScan);
+                    auto P = MapRowByColumnList(LT[Li], Lsrc, OutNames);
                     const std::string Sig = RowSignatureCanon(P);
                     if(!RhsSigs.count(Sig) && OutSeen.insert(Sig).second)
                         Built.push_back(std::move(P));
@@ -4183,9 +4331,15 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 const auto RightBlank = CollectBlankColumnKeysFromSchema(RightSch, Right);
 
             if(inst.Opcode == Opcode::RIGHT_JOIN) {
-                for(const auto &Rr : Right) {
+                PrefetchEngine::JoinScanSession JoinScan;
+                PrefetchEngine::BeginJoinScan(Right, Left, JoinScan);
+                for(std::size_t Ri = 0; Ri < Right.size(); ++Ri) {
+                    PrefetchEngine::AdvanceJoinOuter(Right, Ri, JoinScan);
+                    const auto &Rr = Right[Ri];
                     bool AnyPair = false;
-                    for(const auto &Lr : Left) {
+                    for(std::size_t Li = 0; Li < Left.size(); ++Li) {
+                        PrefetchEngine::AdvanceJoinInner(Left, Li, JoinScan);
+                        const auto &Lr = Left[Li];
                         if(IsCross || JoinOnMatchPairs(Lr, Rr, Pairs)) {
                             Result.push_back(MergeJoinRowsPreferLeft(Lr, Rr));
                             AnyPair = true;
@@ -4200,9 +4354,15 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 }
             } else if(inst.Opcode == Opcode::INNER_JOIN || inst.Opcode == Opcode::LEFT_JOIN ||
                       inst.Opcode == Opcode::FULL_JOIN || inst.Opcode == Opcode::CROSS_JOIN) {
-                for(const auto &Lr : Left) {
+                PrefetchEngine::JoinScanSession JoinScan;
+                PrefetchEngine::BeginJoinScan(Left, Right, JoinScan);
+                for(std::size_t Li = 0; Li < Left.size(); ++Li) {
+                    PrefetchEngine::AdvanceJoinOuter(Left, Li, JoinScan);
+                    const auto &Lr = Left[Li];
                     bool Any = false;
-                    for(const auto &Rr : Right) {
+                    for(std::size_t Ri = 0; Ri < Right.size(); ++Ri) {
+                        PrefetchEngine::AdvanceJoinInner(Right, Ri, JoinScan);
+                        const auto &Rr = Right[Ri];
                         if(IsCross || JoinOnMatchPairs(Lr, Rr, Pairs)) {
                             Result.push_back(MergeJoinRowsPreferLeft(Lr, Rr));
                             Any = true;
@@ -4219,9 +4379,15 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 }
             }
             if(inst.Opcode == Opcode::FULL_JOIN) {
-                for(const auto &Rr : Right) {
+                PrefetchEngine::JoinScanSession FullJoinScan;
+                PrefetchEngine::BeginJoinScan(Right, Left, FullJoinScan);
+                for(std::size_t Ri = 0; Ri < Right.size(); ++Ri) {
+                    PrefetchEngine::AdvanceJoinOuter(Right, Ri, FullJoinScan);
+                    const auto &Rr = Right[Ri];
                     bool AnyInner = false;
-                    for(const auto &Lr : Left) {
+                    for(std::size_t Li = 0; Li < Left.size(); ++Li) {
+                        PrefetchEngine::AdvanceJoinInner(Left, Li, FullJoinScan);
+                        const auto &Lr = Left[Li];
                         if(IsCross || JoinOnMatchPairs(Lr, Rr, Pairs)) {
                             AnyInner = true;
                             break;

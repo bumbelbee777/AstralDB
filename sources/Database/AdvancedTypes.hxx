@@ -11,7 +11,18 @@
 namespace AstralDB {
 namespace AdvancedTypes {
 
-enum class TypeFamily : int8_t { Scalar = 0, Struct = 1, Map = 2, Vector = 3, Matrix = 4, Complex = 5, List = 6 };
+enum class TypeFamily : int8_t {
+	Scalar = 0,
+	Struct = 1,
+	Map = 2,
+	Vector = 3,
+	Matrix = 4,
+	Complex = 5,
+	List = 6,
+	Point = 7,
+	Variant = 8,
+	Terrain = 9
+};
 
 struct TypeDescriptor {
 	TypeFamily Family = TypeFamily::Scalar;
@@ -38,6 +49,9 @@ std::optional<std::vector<double>> ParseVectorCell(std::string_view Cell, std::s
 std::optional<std::vector<std::string>> ParseListCell(std::string_view Cell);
 std::optional<std::vector<double>> ParseMatrixCell(std::string_view Cell, std::size_t ExpectedRows = 0,
                                                    std::size_t ExpectedCols = 0);
+std::optional<std::pair<std::string, std::string>> ParseVariantCell(std::string_view Cell);
+
+std::string FormatVariantCell(std::string_view Tag, std::string_view Payload);
 
 struct MatrixPayload {
 	std::size_t Rows = 0;

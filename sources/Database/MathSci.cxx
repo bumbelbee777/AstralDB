@@ -4,6 +4,8 @@
 #include <Database/MathSciAutograd.hxx>
 #include <Database/MathSciSignal.hxx>
 #include <Database/MathSciSolves.hxx>
+#include <Database/GeoSpatial.hxx>
+#include <Database/TimeSeriesCompression.hxx>
 #include <IO/MathUtil.hxx>
 #include <IO/SIMD.hxx>
 #include <DS/JSONCodec.hxx>
@@ -82,7 +84,32 @@ std::optional<std::vector<double>> AsDoubles(const std::vector<std::string> &Cel
 	return Out;
 }
 
+std::optional<std::vector<double>> FastParseNumericList(std::string_view Cell) {
+	if(Cell.size() < 4 || Cell[0] != 'L' || Cell[1] != '[')
+		return std::nullopt;
+	const size_t Close = Cell.find(']');
+	if(Close == std::string::npos || Close + 2 >= Cell.size() || Cell[Close + 1] != ':')
+		return std::nullopt;
+	std::vector<double> Out;
+	Out.reserve(8);
+	std::string_view Body = Cell.substr(Close + 2);
+	size_t Pos = 0;
+	while(Pos < Body.size()) {
+		size_t End = Pos;
+		while(End < Body.size() && Body[End] != ',')
+			++End;
+		const auto N = ToNum(Body.substr(Pos, End - Pos));
+		if(!N)
+			return std::nullopt;
+		Out.push_back(*N);
+		Pos = End + (End < Body.size() ? 1 : 0);
+	}
+	return Out.empty() ? std::nullopt : std::optional<std::vector<double>>(std::move(Out));
+}
+
 std::optional<std::vector<double>> ParseSeq(std::string_view Cell) {
+	if(const auto Fast = FastParseNumericList(Cell))
+		return Fast;
 	if(const auto L = AdvancedTypes::ParseListCell(Cell))
 		return AsDoubles(*L);
 	if(const auto V = AdvancedTypes::ParseVectorCell(Cell))
@@ -330,6 +357,27 @@ const std::unordered_map<std::string, Entry> &BuiltinTable() {
 	    {"SDE_OU", {ScalarSqlFn::SdeOu, 6, 6}},
 	    {"PDE_HEAT_STEP", {ScalarSqlFn::PdeHeatStep, 4, 4}},
 	    {"PDE_POISSON_STEP", {ScalarSqlFn::PdePoissonStep, 3, 3}},
+	    {"ODE_HEUN", {ScalarSqlFn::OdeHeun, 4, 4}},
+	    {"ODE_MIDPOINT", {ScalarSqlFn::OdeMidpoint, 3, 3}},
+	    {"ODE_IMPLICIT_EULER", {ScalarSqlFn::OdeImplicitEuler, 3, 3}},
+	    {"SDE_MILSTEIN", {ScalarSqlFn::SdeMilstein, 5, 5}},
+	    {"PDE_ADVECTION_STEP", {ScalarSqlFn::PdeAdvectionStep, 4, 4}},
+	    {"PDE_WAVE_STEP", {ScalarSqlFn::PdeWaveStep, 5, 5}},
+	    {"SOLVE_ODE", {ScalarSqlFn::SolveOde, 7, 7}},
+	    {"ST_POINT", {ScalarSqlFn::StPoint, 2, 2}},
+	    {"ST_X", {ScalarSqlFn::StX, 1, 1}},
+	    {"ST_Y", {ScalarSqlFn::StY, 1, 1}},
+	    {"ST_AS_TEXT", {ScalarSqlFn::StAsText, 1, 1}},
+	    {"ST_DISTANCE", {ScalarSqlFn::StDistance, 2, 2}},
+	    {"ST_DISTANCE_SPHERICAL", {ScalarSqlFn::StDistanceSpherical, 2, 2}},
+	    {"ST_WITHIN_BBOX", {ScalarSqlFn::StWithinBbox, 5, 5}},
+	    {"ST_POINTZ", {ScalarSqlFn::StPointZ, 3, 3}},
+	    {"ST_ELEVATION", {ScalarSqlFn::StElevation, 1, 1}},
+	    {"ST_DEM_SAMPLE", {ScalarSqlFn::StDemSample, 9, 9}},
+	    {"ST_TERRAIN_SLOPE", {ScalarSqlFn::StTerrainSlope, 9, 9}},
+	    {"TS_COMPRESS", {ScalarSqlFn::TsCompress, 1, 1}},
+	    {"TS_DECOMPRESS", {ScalarSqlFn::TsDecompress, 1, 1}},
+	    {"TS_COMPRESS_SERIES", {ScalarSqlFn::TsCompressSeries, 2, 2}},
 	};
 	return T;
 }
@@ -351,7 +399,7 @@ const std::unordered_map<ScalarSqlFn, BuiltinArity> &ArityTable() {
 bool IsMathSciScalarFn(ScalarSqlFn Fn) {
 	return (Fn >= ScalarSqlFn::Abs && Fn <= ScalarSqlFn::TextMatch) ||
 	       (Fn >= ScalarSqlFn::XmlExtract && Fn <= ScalarSqlFn::VectorTopK) ||
-	       (Fn >= ScalarSqlFn::Fft && Fn <= ScalarSqlFn::PdePoissonStep);
+	       (Fn >= ScalarSqlFn::Fft && Fn <= ScalarSqlFn::StTerrainSlope);
 }
 
 BuiltinArity ArityFor(ScalarSqlFn Fn) {
@@ -1383,6 +1431,229 @@ std::optional<std::string> EvalScalar(ScalarSqlFn Fn, const std::vector<std::str
 		if(!U || !F || !Omega || U->empty())
 			return std::nullopt;
 		return FormatSeqList(MathSciSolves::PdePoisson1dFromReal(*U, *F, *Omega));
+	}
+	case ScalarSqlFn::OdeHeun: {
+		if(Cells.size() != 4)
+			return std::nullopt;
+		const auto Y = ParseSeq(Cells[0]);
+		const auto K1 = ParseSeq(Cells[1]);
+		const auto K2 = ParseSeq(Cells[2]);
+		const auto Dt = ToNum(Cells[3]);
+		if(!Y || !K1 || !K2 || !Dt || Y->empty())
+			return std::nullopt;
+		return FormatSeqList(MathSciSolves::OdeHeunFromReal(*Y, *Dt, *K1, *K2));
+	}
+	case ScalarSqlFn::OdeMidpoint: {
+		if(Cells.size() != 3)
+			return std::nullopt;
+		const auto Y = ParseSeq(Cells[0]);
+		const auto Km = ParseSeq(Cells[1]);
+		const auto Dt = ToNum(Cells[2]);
+		if(!Y || !Km || !Dt || Y->empty())
+			return std::nullopt;
+		return FormatSeqList(MathSciSolves::OdeMidpointFromReal(*Y, *Dt, *Km));
+	}
+	case ScalarSqlFn::OdeImplicitEuler: {
+		if(Cells.size() != 3)
+			return std::nullopt;
+		const auto Y = ParseSeq(Cells[0]);
+		const auto Lam = ParseSeq(Cells[1]);
+		const auto Dt = ToNum(Cells[2]);
+		if(!Y || !Lam || !Dt || Y->empty() || Y->size() != Lam->size())
+			return std::nullopt;
+		return FormatSeqList(MathSciSolves::OdeImplicitEulerFromReal(*Y, *Dt, *Lam));
+	}
+	case ScalarSqlFn::SdeMilstein: {
+		if(Cells.size() != 5)
+			return std::nullopt;
+		const auto Y = ToNum(Cells[0]);
+		const auto Mu = ToNum(Cells[1]);
+		const auto Sigma = ToNum(Cells[2]);
+		const auto Dt = ToNum(Cells[3]);
+		const auto Z = ToNum(Cells[4]);
+		if(!Y || !Mu || !Sigma || !Dt || !Z)
+			return std::nullopt;
+		return FmtNum(MathSciSolves::SdeMilsteinScalar(*Y, *Mu, *Sigma, *Dt, *Z));
+	}
+	case ScalarSqlFn::PdeAdvectionStep: {
+		if(Cells.size() != 4)
+			return std::nullopt;
+		const auto U = ParseSeq(Cells[0]);
+		const auto C = ToNum(Cells[1]);
+		const auto Dt = ToNum(Cells[2]);
+		const auto Dx = ToNum(Cells[3]);
+		if(!U || !C || !Dt || !Dx || U->empty())
+			return std::nullopt;
+		return FormatSeqList(MathSciSolves::PdeAdvection1dFromReal(*U, *C, *Dt, *Dx));
+	}
+	case ScalarSqlFn::PdeWaveStep: {
+		if(Cells.size() != 5)
+			return std::nullopt;
+		const auto Up = ParseSeq(Cells[0]);
+		const auto Uc = ParseSeq(Cells[1]);
+		const auto C = ToNum(Cells[2]);
+		const auto Dt = ToNum(Cells[3]);
+		const auto Dx = ToNum(Cells[4]);
+		if(!Up || !Uc || !C || !Dt || !Dx || Up->empty())
+			return std::nullopt;
+		return FormatSeqList(MathSciSolves::PdeWave1dFromReal(*Up, *Uc, *C, *Dt, *Dx));
+	}
+	case ScalarSqlFn::SolveOde: {
+		if(Cells.size() != 7)
+			return std::nullopt;
+		const std::string Method = Cells[0];
+		const auto Y = ParseSeq(Cells[1]);
+		const auto A = ParseSeq(Cells[2]);
+		const auto B = ParseSeq(Cells[3]);
+		const auto C = ParseSeq(Cells[4]);
+		const auto D = ParseSeq(Cells[5]);
+		const auto Dt = ToNum(Cells[6]);
+		if(!Y || !A || !B || !C || !D || !Dt || Y->empty())
+			return std::nullopt;
+		return FormatSeqList(MathSciSolves::OdeSolveFromReal(Method, *Y, *Dt, *A, *B, *C, *D));
+	}
+	case ScalarSqlFn::StPoint: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		const auto Lon = ToNum(Cells[0]);
+		const auto Lat = ToNum(Cells[1]);
+		if(!Lon || !Lat)
+			return std::nullopt;
+		return GeoSpatial::FormatPointCell(*Lon, *Lat);
+	}
+	case ScalarSqlFn::StX:
+	case ScalarSqlFn::StY: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		const auto P = GeoSpatial::ParsePointCell(Cells[0]);
+		if(!P) {
+			const auto W = GeoSpatial::ParseWktPoint(Cells[0]);
+			if(!W)
+				return std::nullopt;
+			return FmtNum(Fn == ScalarSqlFn::StX ? W->Lon : W->Lat);
+		}
+		return FmtNum(Fn == ScalarSqlFn::StX ? P->Lon : P->Lat);
+	}
+	case ScalarSqlFn::StAsText: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		if(const auto P = GeoSpatial::ParsePointCell(Cells[0]))
+			return GeoSpatial::FormatWktPoint(*P);
+		if(const auto W = GeoSpatial::ParseWktPoint(Cells[0]))
+			return GeoSpatial::FormatWktPoint(*W);
+		return std::nullopt;
+	}
+	case ScalarSqlFn::StDistance:
+	case ScalarSqlFn::StDistanceSpherical: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		auto P1 = GeoSpatial::ParsePointCell(Cells[0]);
+		if(!P1)
+			P1 = GeoSpatial::ParseWktPoint(Cells[0]);
+		auto P2 = GeoSpatial::ParsePointCell(Cells[1]);
+		if(!P2)
+			P2 = GeoSpatial::ParseWktPoint(Cells[1]);
+		if(!P1 || !P2)
+			return std::nullopt;
+		const double D = Fn == ScalarSqlFn::StDistance ? GeoSpatial::EuclideanDistance(*P1, *P2)
+		                                               : GeoSpatial::HaversineMeters(*P1, *P2);
+		return FmtNum(D);
+	}
+	case ScalarSqlFn::StWithinBbox: {
+		if(Cells.size() != 5)
+			return std::nullopt;
+		auto P = GeoSpatial::ParsePointCell(Cells[0]);
+		if(!P)
+			P = GeoSpatial::ParseWktPoint(Cells[0]);
+		const auto MinLon = ToNum(Cells[1]);
+		const auto MinLat = ToNum(Cells[2]);
+		const auto MaxLon = ToNum(Cells[3]);
+		const auto MaxLat = ToNum(Cells[4]);
+		if(!P || !MinLon || !MinLat || !MaxLon || !MaxLat)
+			return std::nullopt;
+		return GeoSpatial::WithinBbox(*P, *MinLon, *MinLat, *MaxLon, *MaxLat) ? "1" : "0";
+	}
+	case ScalarSqlFn::StPointZ: {
+		if(Cells.size() != 3)
+			return std::nullopt;
+		const auto Lon = ToNum(Cells[0]);
+		const auto Lat = ToNum(Cells[1]);
+		const auto Elev = ToNum(Cells[2]);
+		if(!Lon || !Lat || !Elev)
+			return std::nullopt;
+		return GeoSpatial::FormatTerrainCell(*Lon, *Lat, *Elev);
+	}
+	case ScalarSqlFn::StElevation: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		if(const auto T = GeoSpatial::ParseTerrainCell(Cells[0]))
+			return FmtNum(T->ElevM);
+		if(const auto W = GeoSpatial::ParseWktPointZ(Cells[0]))
+			return FmtNum(W->ElevM);
+		return std::nullopt;
+	}
+	case ScalarSqlFn::StDemSample:
+	case ScalarSqlFn::StTerrainSlope: {
+		if(Cells.size() != 9)
+			return std::nullopt;
+		const auto Dem = AdvancedTypes::DecodeMatrixCell(Cells[0]);
+		const auto Rows = ToNum(Cells[1]);
+		const auto Cols = ToNum(Cells[2]);
+		const auto MinLon = ToNum(Cells[3]);
+		const auto MinLat = ToNum(Cells[4]);
+		const auto MaxLon = ToNum(Cells[5]);
+		const auto MaxLat = ToNum(Cells[6]);
+		const auto Lon = ToNum(Cells[7]);
+		const auto Lat = ToNum(Cells[8]);
+		if(!Dem || !Rows || !Cols || !MinLon || !MinLat || !MaxLon || !MaxLat || !Lon || !Lat)
+			return std::nullopt;
+		const std::size_t R = static_cast<std::size_t>(*Rows);
+		const std::size_t C = static_cast<std::size_t>(*Cols);
+		if(Dem->Flat.size() != R * C)
+			return std::nullopt;
+		const auto Val = Fn == ScalarSqlFn::StDemSample
+		                     ? GeoSpatial::SampleDemBilinear(Dem->Flat, R, C, *MinLon, *MinLat, *MaxLon, *MaxLat, *Lon,
+		                                                     *Lat)
+		                     : GeoSpatial::TerrainSlopeDegrees(Dem->Flat, R, C, *MinLon, *MinLat, *MaxLon, *MaxLat, *Lon,
+		                                                       *Lat);
+		if(!Val)
+			return std::nullopt;
+		return FmtNum(*Val);
+	}
+	case ScalarSqlFn::TsCompress: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		const auto V = ParseSeq(Cells[0]);
+		if(!V || V->empty())
+			return std::nullopt;
+		const std::string Out = TimeSeriesCompression::CompressValues(*V);
+		return Out.empty() ? std::nullopt : std::optional<std::string>(Out);
+	}
+	case ScalarSqlFn::TsDecompress: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		if(const auto V = TimeSeriesCompression::DecompressValues(Cells[0]))
+			return FormatSeqList(*V);
+		if(const auto S = TimeSeriesCompression::DecompressSeries(Cells[0])) {
+			std::vector<double> Flat;
+			Flat.reserve(S->first.size() * 2);
+			for(size_t I = 0; I < S->first.size(); ++I) {
+				Flat.push_back(S->first[I]);
+				Flat.push_back(S->second[I]);
+			}
+			return FormatSeqList(Flat);
+		}
+		return std::nullopt;
+	}
+	case ScalarSqlFn::TsCompressSeries: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		const auto E = ParseSeq(Cells[0]);
+		const auto V = ParseSeq(Cells[1]);
+		if(!E || !V || E->empty() || E->size() != V->size())
+			return std::nullopt;
+		const std::string Out = TimeSeriesCompression::CompressSeries(*E, *V);
+		return Out.empty() ? std::nullopt : std::optional<std::string>(Out);
 	}
 	default:
 		return std::nullopt;

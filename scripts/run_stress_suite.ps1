@@ -12,7 +12,10 @@ $Map = @{
 	wal = "stress_wal_churn.sql"
 	analytics = "stress_analytics_mix.sql"
 	torture = "..\torture_test.sql"
+	advanced = "..\torture_advanced.sql"
+	unhinged = "..\torture_unhinged.sql"
 	traffic = "..\stress_traffic.sql"
+	bench = "..\benchmark_torture.sql"
 	unified = "benchmark_torture_unified.sql"
 }
 if(-not $AstralDbExe) {

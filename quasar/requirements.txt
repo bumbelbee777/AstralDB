@@ -1,0 +1,5 @@
+# Quasar runtime (gateway is optional)
+flask>=3.0
+
+# Tests
+pytest>=8.0

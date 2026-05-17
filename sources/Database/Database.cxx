@@ -1,5 +1,6 @@
 #include <Database/AdvancedTypes.hxx>
 #include <Database/Database.hxx>
+#include <IO/MemoryGuard.hxx>
 #include <cstring>
 #include <Database/AtRestKey.hxx>
 #include <SQL/SetExprEval.hxx>
@@ -2496,6 +2497,12 @@ void Database::InsertBulkSyntheticRows(const std::string &TableName, int64_t Cou
 		FailStorage("BULK INSERT row count must be a positive integer.");
 	if(static_cast<std::uint64_t>(Count) > Limits::MaxBulkInsertRows)
 		FailStorage("BULK INSERT row count exceeds the configured maximum (see server limits).");
+	const std::size_t EstBytes = static_cast<std::size_t>(Count) * 256U;
+	if(!MemoryGuard::SecureBoundsCheck(0, static_cast<std::size_t>(Count), 256U))
+		FailStorage("BULK INSERT row count exceeds safe bounds.");
+	if(!MemoryGuard::AllowAlloc(EstBytes))
+		FailStorage("BULK INSERT would exceed the session memory guard (spike protection).");
+	MemoryGuard::SpikeScope Spike;
 	std::scoped_lock Guard(DbMutex_);
 	const auto Tit = Tables_.find(TableName);
 	if(Tit == Tables_.end())
@@ -2547,6 +2554,182 @@ void Database::InsertBulkSyntheticRows(const std::string &TableName, int64_t Cou
 	Dirty_.store(true, std::memory_order_release);
 }
 
+namespace {
+
+int64_t NowEpochMs() {
+	using Clock = std::chrono::system_clock;
+	return static_cast<int64_t>(
+	    std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count());
+}
+
+const DatasetEntry *FindDatasetVersion(const DatasetCatalog &Cat, int64_t VersionId) {
+	if(Cat.Versions.empty())
+		return nullptr;
+	if(VersionId <= 0)
+		return &Cat.Versions.back();
+	for(const DatasetEntry &E : Cat.Versions)
+		if(E.VersionId == VersionId)
+			return &E;
+	return nullptr;
+}
+
+} // namespace
+
+void Database::RegisterDataset(const std::string &Name, DatasetEntry Entry) {
+	std::scoped_lock Guard(DbMutex_);
+	if(Entry.Kind == DatasetKind::TableRef) {
+		const auto SrcIt = Tables_.find(Entry.SourceTable);
+		if(SrcIt == Tables_.end())
+			FailStorage("CREATE DATASET: source table \"" + Entry.SourceTable + "\" does not exist.");
+		const Table &Live = SrcIt->second.RowsForRead(std::nullopt, false);
+		Entry.SnapshotRows.assign(Live.begin(), Live.end());
+	}
+	DatasetCatalog &Cat = Datasets_[Name];
+	const int64_t NextVer = Cat.Versions.empty() ? 1 : Cat.Versions.back().VersionId + 1;
+	Entry.VersionId = NextVer;
+	Entry.CreatedAtMs = NowEpochMs();
+	Cat.Versions.push_back(std::move(Entry));
+}
+
+void Database::DropDataset(const std::string &Name) {
+	std::scoped_lock Guard(DbMutex_);
+	Datasets_.erase(Name);
+}
+
+void Database::LoadDatasetInto(const std::string &Name, const std::string &TargetTable, const int64_t VersionId) {
+	MemoryGuard::SpikeScope Spike;
+	DatasetEntry Ent;
+	{
+		std::scoped_lock Guard(DbMutex_);
+		const auto It = Datasets_.find(Name);
+		if(It == Datasets_.end())
+			FailStorage("DATASET \"" + Name + "\" is not registered.");
+		if(Tables_.find(TargetTable) == Tables_.end())
+			FailStorage("LOAD DATASET target table \"" + TargetTable + "\" does not exist.");
+		const DatasetEntry *Found = FindDatasetVersion(It->second, VersionId);
+		if(!Found)
+			FailStorage("DATASET \"" + Name + "\" version " + std::to_string(VersionId) + " does not exist.");
+		Ent = *Found;
+	}
+	if(Ent.Kind == DatasetKind::BulkFixture) {
+		InsertBulkSyntheticRows(TargetTable, Ent.BulkCount, Ent.BulkStart, Ent.BulkStep);
+		return;
+	}
+	std::scoped_lock Guard(DbMutex_);
+	HybridTableSlot &Dst = Tables_[TargetTable];
+	DatasetEntry::Table Src = Ent.SnapshotRows;
+	if(Src.empty() && Ent.Kind == DatasetKind::TableRef) {
+		const auto SrcIt = Tables_.find(Ent.SourceTable);
+		if(SrcIt == Tables_.end())
+			FailStorage("DATASET source table \"" + Ent.SourceTable + "\" does not exist.");
+		const Table &Live = SrcIt->second.RowsForRead(std::nullopt, false);
+		Src.assign(Live.begin(), Live.end());
+	}
+	if(Src.empty())
+		FailStorage("DATASET \"" + Name + "\" has no rows to load.");
+	const std::size_t EstBytes = Src.size() * 256U;
+	if(!MemoryGuard::AllowAlloc(EstBytes))
+		FailStorage("LOAD DATASET would exceed the session memory guard.");
+	if(!MemoryGuard::SecureBoundsCheck(0, Src.size()))
+		FailStorage("LOAD DATASET row count exceeds safe bounds.");
+	Dst.RowStore.reserve(Dst.RowStore.size() + Src.size());
+	const auto IdxOuter = Indexes_.find(TargetTable);
+	for(const Item &Row : Src) {
+		RequireSessionInsertAssumeLocked(TargetTable, Row);
+		Dst.RowStore.push_back(Row);
+		const size_t RowIndex = Dst.RowStore.size() - 1;
+		const Item &Inserted = Dst.RowStore.back();
+		if(IdxOuter != Indexes_.end()) {
+			for(const auto &[ColumnName, Value] : Inserted) {
+				const auto ColIdx = IdxOuter->second.find(ColumnName);
+				if(ColIdx != IdxOuter->second.end())
+					std::get<BPlusTree<std::string, size_t>>(ColIdx->second.Index()).Insert(Value, RowIndex);
+			}
+		}
+		AppendWalAfterInsert(TargetTable, Inserted);
+		OnRowInsertedAssumeLocked(TargetTable, RowIndex, Inserted);
+	}
+	Dst.RecordWrite();
+	Dst.SyncColumnarAfterRowMutation();
+	Dirty_.store(true, std::memory_order_release);
+}
+
+void Database::Vacuum(const std::string &TableName) {
+	MemoryGuard::SpikeScope Spike;
+	std::scoped_lock Guard(DbMutex_);
+	const auto CompactOne = [](HybridTableSlot &Slot, const std::string &Name) {
+		if(!MemoryGuard::AllowAlloc(Slot.RowStore.size() * 128U))
+			FailStorage("VACUUM would exceed the session memory guard.");
+		Slot.RowStore.shrink_to_fit();
+		Slot.RebuildColumnarFromRows();
+		Slot.SyncColumnarAfterRowMutation();
+		Slot.RecordWrite();
+		(void)Name;
+	};
+	if(TableName.empty()) {
+		for(auto &[Name, Slot] : Tables_)
+			CompactOne(Slot, Name);
+	} else {
+		const auto It = Tables_.find(TableName);
+		if(It == Tables_.end())
+			FailStorage("VACUUM: table \"" + TableName + "\" does not exist.");
+		CompactOne(It->second, TableName);
+	}
+	SyncToFileUnlocked();
+	MemoryGuard::ResetSession();
+	Dirty_.store(true, std::memory_order_release);
+}
+
+void Database::RepackTableConcurrently(const std::string &TableName) {
+	if(TableName.empty())
+		FailStorage("REPACK: table name must be non-empty.");
+	MemoryGuard::SpikeScope Spike;
+	HybridTableSlot Shadow;
+	std::vector<Database::Item> RowsCopy;
+	Schema SchemaCopy;
+	{
+		std::scoped_lock Guard(DbMutex_);
+		const auto TIt = Tables_.find(TableName);
+		const auto SIt = TableSchemas_.find(TableName);
+		if(TIt == Tables_.end() || SIt == TableSchemas_.end())
+			FailStorage("REPACK: table \"" + TableName + "\" does not exist.");
+		const std::size_t N = TIt->second.RowStore.size();
+		const std::size_t EstBytes = N * 256U;
+		if(!MemoryGuard::AllowAlloc(EstBytes))
+			FailStorage("REPACK would exceed the session memory guard.");
+		RowsCopy = TIt->second.RowStore;
+		SchemaCopy = SIt->second;
+	}
+	Shadow.RowStore = std::move(RowsCopy);
+	Shadow.RowStore.shrink_to_fit();
+	Shadow.RebuildColumnarFromRows();
+	Shadow.SyncColumnarAfterRowMutation();
+	{
+		std::scoped_lock Guard(DbMutex_);
+		const auto TIt = Tables_.find(TableName);
+		if(TIt == Tables_.end())
+			FailStorage("REPACK: table \"" + TableName + "\" was dropped during repack.");
+		TIt->second = std::move(Shadow);
+		TIt->second.RecordWrite();
+		const auto IdxOuter = Indexes_.find(TableName);
+		if(IdxOuter != Indexes_.end()) {
+			for(auto &[ColName, Idx] : IdxOuter->second)
+				std::get<BPlusTree<std::string, size_t>>(Idx.Index()) = BPlusTree<std::string, size_t>{};
+			for(size_t RowIndex = 0; RowIndex < TIt->second.RowStore.size(); ++RowIndex) {
+				const Item &Row = TIt->second.RowStore[RowIndex];
+				for(const auto &[ColumnName, Value] : Row) {
+					const auto ColIdx = IdxOuter->second.find(ColumnName);
+					if(ColIdx != IdxOuter->second.end())
+						std::get<BPlusTree<std::string, size_t>>(ColIdx->second.Index()).Insert(Value, RowIndex);
+				}
+			}
+		}
+		for(size_t RowIndex = 0; RowIndex < TIt->second.RowStore.size(); ++RowIndex)
+			OnRowInsertedAssumeLocked(TableName, RowIndex, TIt->second.RowStore[RowIndex]);
+	}
+	Dirty_.store(true, std::memory_order_release);
+}
+
 std::future<void> Database::Insert(const std::string &TableName, const Item &Row) {
 	return DbDispatchAsync(this,[this, TableName, Row]() {
 		{
@@ -2563,9 +2746,7 @@ std::future<void> Database::Insert(const std::string &TableName, const Item &Row
 			RejectRowIfTypesFailAssumeLocked(TableName, MutableRow);
 			RejectRowIfForeignKeysFailAssumeLocked(TableName, MutableRow);
 			HybridTableSlot &Slot = Tables_[TableName];
-			if(!Slot.RowStore.empty()) {
-				PREFETCH(Slot.RowStore.data());
-			}
+			PrefetchEngine::PrefetchAppendTarget(Slot.RowStore);
 			Slot.RowStore.push_back(MutableRow);
 			Slot.RecordWrite();
 			Slot.SyncColumnarAfterRowMutation();
@@ -2686,9 +2867,7 @@ std::future<void> Database::Upsert(const std::string &TableName, const Database:
 				RequireSessionInsertAssumeLocked(TableName, InsertRow);
 				RejectRowIfChecksFailAssumeLocked(TableName, InsertRow);
 				RejectRowIfForeignKeysFailAssumeLocked(TableName, InsertRow);
-				if(!TableRef.empty()) {
-					PREFETCH(TableRef.data());
-				}
+				PrefetchEngine::PrefetchAppendTarget(TableRef);
 				TableRef.push_back(InsertRow);
 				auto IdxOuter = Indexes_.find(TableName);
 				if(IdxOuter != Indexes_.end()) {
@@ -2809,9 +2988,7 @@ std::future<void> Database::MergeUsing(const std::string &TargetTable, const std
 					RequireSessionInsertAssumeLocked(TargetTable, NewR);
 					RejectRowIfChecksFailAssumeLocked(TargetTable, NewR);
 					RejectRowIfForeignKeysFailAssumeLocked(TargetTable, NewR);
-					if(!TRef.empty()) {
-						PREFETCH(TRef.data());
-					}
+					PrefetchEngine::PrefetchAppendTarget(TRef);
 					TRef.push_back(NewR);
 					auto IdxOuter = Indexes_.find(TargetTable);
 					if(IdxOuter != Indexes_.end()) {
@@ -3016,9 +3193,8 @@ std::future<Database::Table> Database::Select(const std::string &TableName, cons
 			RequireSessionTablePermissionAssumeLocked(Permissions::Select, TableName);
 			const HybridTableSlot &Slot = TableIt->second;
 			const Table &TableRef = Slot.RowsForRead(std::nullopt, false);
-			if(!TableRef.empty()) {
-				PREFETCH(TableRef.data());
-			}
+			PrefetchEngine::RowScanSession Scan;
+			PrefetchEngine::BeginRowScan(TableRef, Scan);
 			auto IdxOuter = Indexes_.find(TableName);
 			if(IdxOuter != Indexes_.end() && !IdxOuter->second.empty()) {
 				for(const auto& ColumnIndexes : IdxOuter->second) {
@@ -3037,7 +3213,9 @@ std::future<Database::Table> Database::Select(const std::string &TableName, cons
 					}
 				}
 			} else {
-				for(const auto &Row : TableRef) {
+				for(std::size_t Ri = 0; Ri < TableRef.size(); ++Ri) {
+					PrefetchEngine::AdvanceRowScan(TableRef, Ri, Scan);
+					const Item &Row = TableRef[Ri];
 					if(Condition(Row) && RowAllowsAssumeLocked(Permissions::Select, TableName, Row))
 						Result.push_back(MaskRowForSelectAssumeLocked(TableName, Row));
 				}
@@ -3250,14 +3428,14 @@ std::future<Database::Table> Database::JoinTables(const std::string &LeftTable, 
 				            "\").");
 			const Table &LeftData = LeftIt->second.RowStore;
 			const Table &RightData = RightIt->second.RowStore;
-			if(!LeftData.empty()) {
-				PREFETCH(LeftData.data());
-			}
-			if(!RightData.empty()) {
-				PREFETCH(RightData.data());
-			}
-			for(const auto &LeftRow : LeftData) {
-				for(const auto &RightRow : RightData) {
+			PrefetchEngine::JoinScanSession JoinScan;
+			PrefetchEngine::BeginJoinScan(LeftData, RightData, JoinScan);
+			for(std::size_t Li = 0; Li < LeftData.size(); ++Li) {
+				PrefetchEngine::AdvanceJoinOuter(LeftData, Li, JoinScan);
+				const Item &LeftRow = LeftData[Li];
+				for(std::size_t Ri = 0; Ri < RightData.size(); ++Ri) {
+					PrefetchEngine::AdvanceJoinInner(RightData, Ri, JoinScan);
+					const Item &RightRow = RightData[Ri];
 					if(JoinCondition(LeftRow, RightRow)) {
 						Item JoinedRow = RightRow;
 						JoinedRow.insert(LeftRow.begin(), LeftRow.end());

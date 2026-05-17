@@ -1,0 +1,100 @@
+# Tagged releases (v*): build Release CLI binaries and attach them to the GitHub Release.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            os: ubuntu-24.04
+            artifact: astraldb-linux-amd64
+            configure: >-
+              cmake -S . -B build-ci
+              -G Ninja
+              -DCMAKE_BUILD_TYPE=Release
+            build: cmake --build build-ci --target astraldb_cli
+            binary: build-ci/astraldb_cli
+
+          - name: windows-amd64
+            os: windows-latest
+            artifact: astraldb-windows-amd64
+            configure: >-
+              cmake -S . -B build-ci
+              -G Ninja
+              -DCMAKE_BUILD_TYPE=Release
+              -DCMAKE_CXX_COMPILER=clang++
+            build: cmake --build build-ci --target astraldb_cli
+            binary: build-ci/astraldb_cli.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++
+
+      - name: Install toolchain (Windows)
+        if: runner.os == 'Windows'
+        run: choco install llvm ninja -y --no-progress
+
+      - name: Configure
+        run: ${{ matrix.configure }}
+
+      - name: Build CLI
+        run: ${{ matrix.build }}
+
+      - name: Stage artifact (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist
+          cp "${{ matrix.binary }}" dist/astraldb
+          chmod +x dist/astraldb
+
+      - name: Stage artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "${{ matrix.binary }}" dist/astraldb.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**
+          generate_release_notes: true

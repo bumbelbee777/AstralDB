@@ -1424,6 +1424,29 @@ void DropSequenceAST::EmitBytecode(BytecodeScratch &Instructions) const {
 	                  MakeInstruction(Opcode::DROP_SEQUENCE, SequenceName, static_cast<int64_t>(IfExists ? 1 : 0)));
 }
 
+void CreateDatasetAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions,
+	                  MakeInstruction(Opcode::REGISTER_DATASET, DatasetName,
+	                                  static_cast<int64_t>(Kind), SourceTable, BulkCount, BulkStart, BulkStep));
+}
+
+void LoadDatasetAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions,
+	                  MakeInstruction(Opcode::LOAD_DATASET, DatasetName, TargetTable, VersionId));
+}
+
+void VacuumAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions, MakeInstruction(Opcode::VACUUM, TableName));
+}
+
+void RepackConcurrentlyAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions, MakeInstruction(Opcode::REPACK_CONCURRENTLY, TableName));
+}
+
+void DropDatasetAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions, MakeInstruction(Opcode::DROP_DATASET, DatasetName));
+}
+
 void CreateIndexAST::EmitBytecode(BytecodeScratch &Instructions) const {
 	AppendInstruction(Instructions,
 	                  MakeInstruction(Opcode::CREATE_INDEX, IndexName, TableName, ColumnName,

@@ -49,5 +49,10 @@ SELECT
 	AD_HESSIAN_SIGMOID('L[2]:0.5,0.6', 'L[2]:1,1') AS hess_sig,
 	AD_WIRTINGER_DZ('L[4]:1,0,1,0') AS wdz,
 	ODE_EULER('L[2]:1,0', 'L[2]:0.1,0.2', '0.01') AS euler_step,
-	SDE_GBM(100, 0.05, 0.2, 0.01, 0) AS gbm_step
+	ODE_HEUN('L[2]:1,0', 'L[2]:0.1,0', 'L[2]:0.12,0', '0.01') AS heun_step,
+	ODE_IMPLICIT_EULER('L[2]:1,0', 'L[2]:0.5,0.5', '0.01') AS implicit_step,
+	SOLVE_ODE('RK4', 'L[2]:1,0', 'L[2]:0.1,0', 'L[2]:0.11,0', 'L[2]:0.12,0', 'L[2]:0.13,0', '0.01') AS rk4_step,
+	SDE_GBM(100, 0.05, 0.2, 0.01, 0) AS gbm_step,
+	SDE_MILSTEIN(100, 0.05, 0.2, 0.01, 0) AS milstein_step,
+	PDE_ADVECTION_STEP('L[4]:0,1,2,3', 0.5, 0.01, 1) AS adv_step
 FROM lab;

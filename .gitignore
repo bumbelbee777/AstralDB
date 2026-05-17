@@ -8,6 +8,11 @@ debug.log
 obj/
 build/
 build-cmake/
+.pytest_cache/
+__pycache__/
+app/
+*.pyc
+build-ci/
 .vscode/
 .build/
 buildtmp/

@@ -2,7 +2,9 @@
 
 #include <Database/WriteAheadLog.hxx>
 #include <Database/HybridStorageScheduler.hxx>
+#include <Database/Dataset.hxx>
 #include <Database/HybridTable.hxx>
+#include <Database/PrefetchEngine.hxx>
 #include <IO/Limits.hxx>
 #include <IO/Spinlock.hxx>
 #include <mutex>
@@ -41,12 +43,6 @@ struct VectorIndexSpec {
 	VectorMetric Metric = VectorMetric::Cosine;
 	VectorIndex Index;
 };
-
-#if defined(__GNUC__)
-#define PREFETCH(Address) __builtin_prefetch(Address)
-#else
-#define PREFETCH(Address)
-#endif
 
 enum class ReferentialAction : uint8_t { Restrict = 0, Cascade = 1, SetNull = 2 };
 
@@ -130,6 +126,7 @@ private:
 	/** Persisted CREATE PROCEDURE bodies (cached \c .abc under \c astraldb_procs_cache ). */
 	std::unordered_map<std::string, std::string> ProcedureDefinitionSql_;
 	std::unordered_map<std::string, SequenceState> Sequences_;
+	std::unordered_map<std::string, DatasetCatalog> Datasets_;
 
     std::atomic<bool> Dirty_;
 	std::atomic<bool> WalSuspended_{false};
@@ -250,6 +247,14 @@ public:
 	std::future<void> Insert(const std::string &TableName, const Item &Row);
 	/** Synchronous \c INSERT … BULK path: one lock, reserved row store, single columnar sync (VM hot path). */
 	void InsertBulkSyntheticRows(const std::string &TableName, int64_t Count, int64_t StartId, int64_t Step);
+	void RegisterDataset(const std::string &Name, DatasetEntry Entry);
+	void DropDataset(const std::string &Name);
+	/** \p VersionId 0 loads the latest version; otherwise the matching snapshot is used. */
+	void LoadDatasetInto(const std::string &Name, const std::string &TargetTable, int64_t VersionId = 0);
+	/** Compact storage, rebuild columnar replicas, sync main file, truncate WAL. */
+	void Vacuum(const std::string &TableName = std::string());
+	/** Online repack: build shadow table and swap under brief exclusive lock. */
+	void RepackTableConcurrently(const std::string &TableName);
 	/** \a ConflictColumns empty means all \c PRIMARY KEY columns. \a DoNothingOnConflict skips insert when keys match;
 	 *  otherwise \a UpdateValues are merged into the existing row. */
 	std::future<void> Upsert(const std::string &TableName, const Item &InsertRow,

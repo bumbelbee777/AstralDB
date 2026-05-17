@@ -1,6 +1,7 @@
 #pragma once
 
 #include <IO/Logger.hxx>
+#include <Database/Dataset.hxx>
 #include <Database/User.hxx>
 #include <Database/HybridStorageScheduler.hxx>
 #include <SQL/Bytecode.hxx>
@@ -304,6 +305,27 @@ enum class ScalarSqlFn : int16_t {
 	SdeOu = 153,
 	PdeHeatStep = 154,
 	PdePoissonStep = 155,
+	OdeHeun = 156,
+	OdeMidpoint = 157,
+	OdeImplicitEuler = 158,
+	SdeMilstein = 159,
+	PdeAdvectionStep = 160,
+	PdeWaveStep = 161,
+	SolveOde = 162,
+	StPoint = 163,
+	StX = 164,
+	StY = 165,
+	StAsText = 166,
+	StDistance = 167,
+	StDistanceSpherical = 168,
+	StWithinBbox = 169,
+	TsCompress = 170,
+	TsDecompress = 171,
+	TsCompressSeries = 172,
+	StPointZ = 173,
+	StElevation = 174,
+	StDemSample = 175,
+	StTerrainSlope = 176,
 };
 
 static_assert(sizeof(std::underlying_type_t<ScalarSqlFn>) >= 2,
@@ -953,6 +975,51 @@ struct DropSequenceAST : public StatementAST {
 	void EmitBytecode(BytecodeScratch &Instructions) const override;
 };
 
+struct CreateDatasetAST : public StatementAST {
+	std::string DatasetName;
+	DatasetKind Kind = DatasetKind::TableRef;
+	std::string SourceTable;
+	int64_t BulkCount = 0;
+	int64_t BulkStart = 1;
+	int64_t BulkStep = 1;
+
+	CreateDatasetAST(std::string Name, DatasetKind K, std::string Src, int64_t C, int64_t S, int64_t St)
+	    : DatasetName(std::move(Name)), Kind(K), SourceTable(std::move(Src)), BulkCount(C), BulkStart(S),
+	      BulkStep(St) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
+struct LoadDatasetAST : public StatementAST {
+	std::string DatasetName;
+	std::string TargetTable;
+	int64_t VersionId = 0;
+
+	LoadDatasetAST(std::string Name, std::string Target, int64_t Ver = 0)
+	    : DatasetName(std::move(Name)), TargetTable(std::move(Target)), VersionId(Ver) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
+struct VacuumAST : public StatementAST {
+	std::string TableName;
+
+	explicit VacuumAST(std::string Table = std::string()) : TableName(std::move(Table)) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
+struct RepackConcurrentlyAST : public StatementAST {
+	std::string TableName;
+
+	explicit RepackConcurrentlyAST(std::string Table) : TableName(std::move(Table)) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
+struct DropDatasetAST : public StatementAST {
+	std::string DatasetName;
+
+	explicit DropDatasetAST(std::string Name) : DatasetName(std::move(Name)) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
 struct CreateIndexAST : public StatementAST {
 	std::string IndexName;
 	std::string TableName;
@@ -1114,6 +1181,9 @@ class Parser {
     ASTNode ParseRevokeStatement();
     ASTNode ParseTransactionStatement();
     ASTNode ParseDropStatement();
+	std::unique_ptr<StatementAST> ParseLoadStatement();
+	std::unique_ptr<StatementAST> ParseVacuumStatement();
+	std::unique_ptr<StatementAST> ParseRepackStatement();
     ASTNode ParseAlterStatement();
     ASTNode ParseSavepointSetStatement();
     ASTNode ParseReleaseSavepointStatement();

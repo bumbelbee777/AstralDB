@@ -1,0 +1,6 @@
+{
+  "statements": [
+    { "sql": "INSERT INTO orders (id, customer_id) VALUES (1, 10);", "shard_key": "customer:10" },
+    { "sql": "INSERT INTO inventory (sku, qty) VALUES ('ABC', 1);", "shard_key": "sku:ABC" }
+  ]
+}

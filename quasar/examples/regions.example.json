@@ -1,0 +1,23 @@
+{
+  "regions_global": { "async_replicate": true },
+  "regions": {
+    "us-east": {
+      "write_primary": true,
+      "priority": 0,
+      "latency_bias_ms": 0,
+      "shards": [
+        { "name": "shard0", "database": "data/us-east/shard0.db" },
+        { "name": "shard1", "database": "data/us-east/shard1.db" }
+      ]
+    },
+    "eu-west": {
+      "write_primary": false,
+      "priority": 1,
+      "latency_bias_ms": 5,
+      "shards": [
+        { "name": "shard0", "database": "data/eu-west/shard0.db" },
+        { "name": "shard1", "database": "data/eu-west/shard1.db" }
+      ]
+    }
+  }
+}

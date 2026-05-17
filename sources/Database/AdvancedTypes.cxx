@@ -1,5 +1,6 @@
 #include <Database/AdvancedTypes.hxx>
 
+#include <Database/GeoSpatial.hxx>
 #include <IO/SIMD.hxx>
 
 #include <cctype>
@@ -90,6 +91,14 @@ bool IsAdvancedTypeSpelling(std::string_view SqlType) {
 		return true;
 	if(StartsWith(U, "LIST("))
 		return true;
+	if(U == "POINT" || U == "GEOMETRY")
+		return true;
+	if(StartsWith(U, "GEOMETRY(POINT"))
+		return true;
+	if(U == "VARIANT" || U == "ANY")
+		return true;
+	if(U == "TERRAIN" || U == "TERRAIN_POINT")
+		return true;
 	return false;
 }
 
@@ -169,7 +178,37 @@ std::optional<TypeDescriptor> ParseTypeSpelling(std::string_view SqlType) {
 			D.ElementType = ParseSimpleTypeToken(Rest);
 		return D;
 	}
+	if(U == "POINT" || StartsWith(U, "GEOMETRY(POINT")) {
+		D.Family = TypeFamily::Point;
+		return D;
+	}
+	if(U == "VARIANT" || U == "ANY") {
+		D.Family = TypeFamily::Variant;
+		return D;
+	}
+	if(U == "TERRAIN" || U == "TERRAIN_POINT") {
+		D.Family = TypeFamily::Terrain;
+		return D;
+	}
 	return std::nullopt;
+}
+
+std::optional<std::pair<std::string, std::string>> ParseVariantCell(std::string_view Cell) {
+	if(!StartsWith(Cell, "V{") || Cell.size() < 4 || Cell.back() != '}')
+		return std::nullopt;
+	const std::string Inner = std::string(Cell.substr(2, Cell.size() - 3));
+	const size_t Colon = Inner.find(':');
+	if(Colon == std::string::npos || Colon == 0)
+		return std::nullopt;
+	std::string Tag = Trim(Inner.substr(0, Colon));
+	std::string Payload = Trim(Inner.substr(Colon + 1));
+	if(Tag.empty())
+		return std::nullopt;
+	return std::pair{std::move(Tag), std::move(Payload)};
+}
+
+std::string FormatVariantCell(std::string_view Tag, std::string_view Payload) {
+	return "V{" + std::string(Tag) + ":" + std::string(Payload) + "}";
 }
 
 std::optional<std::unordered_map<std::string, std::string>> ParseStructCell(std::string_view Cell) {
@@ -419,6 +458,12 @@ bool ValidateCell(const TypeDescriptor &Type, std::string_view Cell) {
 		return ParseMatrixCell(Cell, Type.MatrixRows, Type.MatrixCols).has_value();
 	case TypeFamily::List:
 		return ParseListCell(Cell).has_value();
+	case TypeFamily::Point:
+		return GeoSpatial::ParsePointCell(Cell).has_value() || GeoSpatial::ParseWktPoint(Cell).has_value();
+	case TypeFamily::Variant:
+		return ParseVariantCell(Cell).has_value();
+	case TypeFamily::Terrain:
+		return GeoSpatial::ParseTerrainCell(Cell).has_value() || GeoSpatial::ParseWktPointZ(Cell).has_value();
 	default:
 		return true;
 	}
@@ -449,6 +494,25 @@ std::optional<std::string> NormalizeCell(const TypeDescriptor &Type, std::string
 	case TypeFamily::List: {
 		const auto P = ParseListCell(Cell);
 		return P ? std::optional<std::string>(FormatListCell(*P)) : std::nullopt;
+	}
+	case TypeFamily::Point: {
+		if(const auto P = GeoSpatial::ParsePointCell(Cell))
+			return GeoSpatial::FormatPointCell(P->Lon, P->Lat);
+		if(const auto W = GeoSpatial::ParseWktPoint(Cell))
+			return GeoSpatial::FormatPointCell(W->Lon, W->Lat);
+		return std::nullopt;
+	}
+	case TypeFamily::Variant: {
+		if(const auto P = ParseVariantCell(Cell))
+			return FormatVariantCell(P->first, P->second);
+		return std::nullopt;
+	}
+	case TypeFamily::Terrain: {
+		if(const auto T = GeoSpatial::ParseTerrainCell(Cell))
+			return GeoSpatial::FormatTerrainCell(T->Lon, T->Lat, T->ElevM);
+		if(const auto W = GeoSpatial::ParseWktPointZ(Cell))
+			return GeoSpatial::FormatTerrainCell(W->Lon, W->Lat, W->ElevM);
+		return std::nullopt;
 	}
 	default:
 		return std::string(Cell);

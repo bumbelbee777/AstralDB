@@ -6,8 +6,8 @@ DROP TABLE IF EXISTS sa_fact;
 CREATE TABLE sa_dim (id INT, a INT, b TEXT, c TEXT, d TEXT);
 CREATE TABLE sa_fact (id INT, a INT, b TEXT, c TEXT, d TEXT);
 
-INSERT INTO sa_dim BULK 4000 START 1 STEP 1;
-INSERT INTO sa_fact BULK 16000 START 1 STEP 1;
+INSERT INTO sa_dim BULK 8000 START 1 STEP 1;
+INSERT INTO sa_fact BULK 32000 START 1 STEP 1;
 
 SELECT sa_dim.id, COUNT(sa_fact.id) AS cnt, MAX(sa_fact.a) AS peak
 FROM sa_dim
@@ -19,8 +19,7 @@ LIMIT 100;
 
 SELECT sa_fact.id, sa_fact.b
 FROM sa_fact
-INNER JOIN sa_dim ON sa_fact.id = sa_dim.id
-WHERE sa_fact.c LIKE 'chk_%' AND sa_dim.a BETWEEN 10 AND 500
+WHERE a BETWEEN 10 AND 500
 ORDER BY sa_fact.id DESC
 LIMIT 300;
 
