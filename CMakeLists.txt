@@ -6,18 +6,39 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-option(ASTRALDB_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
+option(ASTRALDB_WARNINGS_AS_ERRORS "Treat warnings as errors" ON)
 
 add_library(astraldb STATIC
     sources/Database/Database.cxx
+    sources/Database/AdvancedTypes.cxx
+    sources/Database/MathSci.cxx
+    sources/Database/MathSciSignal.cxx
+    sources/Database/MathSciAutograd.cxx
+    sources/Database/MathSciSolves.cxx
+    sources/Database/ColumnarStorage.cxx
+    sources/Database/HybridStorageScheduler.cxx
+    sources/Database/HybridTable.cxx
+    sources/Database/TimeSeries.cxx
     sources/Database/User.cxx
     sources/Database/WriteAheadLog.cxx
+    sources/IO/SIMD.cxx
     sources/SQL/AST.cxx
     sources/SQL/Bytecode.cxx
+    sources/SQL/BytecodeFormat.cxx
+    sources/SQL/BytecodeInspect.cxx
+    sources/SQL/BytecodeDebug.cxx
+    sources/SQL/BytecodeProcedures.cxx
     sources/SQL/Codegen.cxx
     sources/SQL/Optimizer.cxx
     sources/SQL/Parser.cxx
     sources/SQL/SetExprEval.cxx
+    sources/SQL/JsonSql.cxx
+    sources/SQL/XmlSql.cxx
+    sources/Database/TextIndex.cxx
+    sources/Database/VectorIndex.cxx
+    sources/SQL/MatchRecognize.cxx
+    sources/SQL/TextSearch.cxx
+    sources/DS/XML.cxx
 )
 
 target_include_directories(astraldb

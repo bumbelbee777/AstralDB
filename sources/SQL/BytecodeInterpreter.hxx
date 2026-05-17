@@ -2,6 +2,7 @@
 
 #include <IO/Limits.hxx>
 #include <Database/Database.hxx>
+#include <Database/ColumnarStorage.hxx>
 #include <SQL/Bytecode.hxx>
 #include <cstdint>
 #include <vector>
@@ -15,6 +16,8 @@
 
 namespace AstralDB {
 namespace SQL {
+
+class VmDebugSession;
 
 struct VmStackSlot {
 	uint64_t Word = 0;
@@ -38,6 +41,8 @@ class BytecodeInterpreter {
 	const std::vector<std::string> *StringOperandPool_ = nullptr;
 	/** Monotonic interpreter steps for this execution slice (RESET clears). */
 	std::size_t StepsExecuted_ = 0;
+	VmDebugSession *DebugSession_ = nullptr;
+	std::optional<StorageLayout> SessionStorageHint_;
 
 	void CleanupStack();
 
@@ -57,6 +62,14 @@ public:
 	void SetLogger(Logger *Logger) { Logger_ = Logger; }
 	Logger *GetLogger() const { return Logger_; }
 
+	void SetDebugSession(VmDebugSession *Session) { DebugSession_ = Session; }
+	VmDebugSession *DebugSession() const { return DebugSession_; }
+
+	void ClearSessionStorageHint() { SessionStorageHint_.reset(); }
+	const std::optional<StorageLayout> &SessionStorageHint() const { return SessionStorageHint_; }
+
+	std::size_t StepsExecuted() const { return StepsExecuted_; }
+
 	void DatabasePath(std::filesystem::path Path) { DatabasePath_ = std::move(Path); }
 	const std::filesystem::path &DatabasePath() const { return DatabasePath_; }
 
@@ -66,6 +79,9 @@ public:
 	void Execute(const Bytecode &Code, const std::vector<std::string> *StringPool);
 
 	void Execute(const CompiledBytecode &Compiled);
+
+	/** Run a nested program without resetting session state; resumes at the next outer instruction. */
+	void RunNestedBytecode(const Bytecode &Code, const std::vector<std::string> *StringPool = nullptr);
 
 	bool Step(const Bytecode &Code);
 
@@ -77,6 +93,7 @@ public:
 		Flags = 0;
 		Registers_.assign(Registers_.size(), 0);
 		StepsExecuted_ = 0;
+		SessionStorageHint_.reset();
 	}
 
 	uintptr_t CurrentInstruction() const { return Ic; }

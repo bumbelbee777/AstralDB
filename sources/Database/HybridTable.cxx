@@ -1,0 +1,104 @@
+#include <Database/HybridTable.hxx>
+#include <algorithm>
+#include <unordered_set>
+
+namespace AstralDB {
+
+namespace {
+
+float EstimateCardinalityFromRows(const HybridTableSlot::Table &RowStore) {
+	if(RowStore.empty())
+		return 0.f;
+	std::unordered_map<std::string, std::unordered_set<std::string>> Distinct;
+	for(const auto &Row : RowStore) {
+		for(const auto &[Col, Val] : Row)
+			Distinct[Col].insert(Val);
+	}
+	float Sum = 0.f;
+	for(const auto &[Col, Set] : Distinct) {
+		(void)Col;
+		Sum += static_cast<float>(Set.size());
+	}
+	return Sum / static_cast<float>(Distinct.empty() ? 1 : Distinct.size()) / static_cast<float>(RowStore.size());
+}
+
+} // namespace
+
+void HybridTableSlot::SetDeclaredPolicy(StorageLayout Policy) {
+	DeclaredPolicy = Policy;
+	if(Policy == StorageLayout::Columnar || Policy == StorageLayout::Hybrid)
+		RebuildColumnarFromRows();
+}
+
+StorageLayout HybridTableSlot::EffectiveLayout(std::optional<StorageLayout> QueryHint,
+                                               bool AggregateQuery) const {
+	if(QueryHint.has_value() && *QueryHint != StorageLayout::Auto)
+		return *QueryHint;
+	switch(DeclaredPolicy) {
+	case StorageLayout::Row:
+		return StorageLayout::Row;
+	case StorageLayout::Columnar:
+		return StorageLayout::Columnar;
+	case StorageLayout::Hybrid:
+		if(AggregateQuery)
+			return StorageLayout::Columnar;
+		return StorageLayout::Row;
+	case StorageLayout::Auto: {
+		WorkloadFeatures F = Scheduler.BuildFeatures(Workload);
+		if(AggregateQuery)
+			F.QueryPatternScore = std::max(F.QueryPatternScore, 0.75f);
+		return Scheduler.PredictLayout(F);
+	}
+	}
+	return StorageLayout::Row;
+}
+
+void HybridTableSlot::RecordWrite() {
+	++Workload.WriteCount;
+	Workload.RowCountPeak = std::max(Workload.RowCountPeak, RowStore.size());
+	Workload.CardinalityEstimate = EstimateCardinalityFromRows(RowStore);
+}
+
+void HybridTableSlot::RecordRead(bool AggregateQuery) const {
+	++Workload.ReadCount;
+	if(AggregateQuery)
+		++Workload.AggregateReadCount;
+}
+
+void HybridTableSlot::RebuildColumnarFromRows() {
+	Columnar.RebuildFromRows(RowStore);
+	ColumnarSynced = true;
+}
+
+void HybridTableSlot::SyncColumnarAfterRowMutation() {
+	if(DeclaredPolicy == StorageLayout::Columnar || DeclaredPolicy == StorageLayout::Hybrid ||
+	   DeclaredPolicy == StorageLayout::Auto)
+		RebuildColumnarFromRows();
+	else
+		ColumnarSynced = false;
+}
+
+const HybridTableSlot::Table &HybridTableSlot::RowsForRead(std::optional<StorageLayout> QueryHint,
+                                                           bool AggregateQuery) const {
+	RecordRead(AggregateQuery);
+	const StorageLayout Eff = EffectiveLayout(QueryHint, AggregateQuery);
+	const WorkloadFeatures F = Scheduler.BuildFeatures(Workload);
+	const float CostStart = Scheduler.EstimateCost(Eff, F);
+
+	if(Eff == StorageLayout::Columnar) {
+		if(!ColumnarSynced)
+			const_cast<HybridTableSlot *>(this)->RebuildColumnarFromRows();
+		if(DeclaredPolicy == StorageLayout::Auto || DeclaredPolicy == StorageLayout::Hybrid) {
+			const_cast<HybridTableSlot *>(this)->RowStore = Columnar.MaterializeAllRows();
+			const_cast<HybridStorageScheduler &>(Scheduler)
+			    .ObserveOutcome(F, StorageLayout::Columnar, CostStart * 0.85f);
+		}
+		return RowStore;
+	}
+
+	if(DeclaredPolicy == StorageLayout::Auto)
+		const_cast<HybridStorageScheduler &>(Scheduler).ObserveOutcome(F, StorageLayout::Row, CostStart);
+	return RowStore;
+}
+
+} // namespace AstralDB

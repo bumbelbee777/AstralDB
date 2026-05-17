@@ -42,7 +42,7 @@ enum class Opcode : uint8_t {
     PUSH, POP, LOAD, STORE,
     CALL, RET, JMP, NOP, HALT,
     GRANT, REVOKE,
-	CREATE_ROLE, DROP_ROLE, GRANT_ROLE_MEMBERSHIP, REVOKE_ROLE_MEMBERSHIP,
+	CREATE_ROLE, DROP_ROLE, CREATE_SEQUENCE, DROP_SEQUENCE, GRANT_ROLE_MEMBERSHIP, REVOKE_ROLE_MEMBERSHIP,
 	GRANT_COLUMN, REVOKE_COLUMN,
 
     // Transaction control
@@ -86,6 +86,13 @@ enum class Opcode : uint8_t {
     
     // View operations
     CREATE_VIEW, DROP_VIEW,
+
+	/** Operands: procedure name, body SQL string, if-not-exists flag (int64). Compiles body, caches \c .abc beside session DB. */
+	CREATE_PROCEDURE,
+	/** Operands: procedure name, if-exists flag (int64). */
+	DROP_PROCEDURE,
+	/** Operands: procedure name. Loads cached \c .abc and runs it. */
+	CALL_PROCEDURE,
     
     // Schema operations
     CREATE_SCHEMA, DROP_SCHEMA, ALTER_SCHEMA,
@@ -102,16 +109,23 @@ enum class Opcode : uint8_t {
 
     /** Operand strings: dest name, source table (deep copy schema + rows). */
     CLONE_TABLE,
+	/** Stack: table name. Operand: AS OF timestamp string. Keeps rows where valid_from <= ts < valid_to. */
+	FILTER_AS_OF,
+	/** Stack: table name. Operands: order column, pattern, define count, (symbol, packed_dnf)* */
+	MATCH_RECOGNIZE,
 	/** Operands: work_table, delta_table, max_iterations (int64), loop_start_ip (int64). Executes bytecode
 	 *  in \c [loop_start_ip, this instruction) repeatedly, appending only new row signatures from \c delta_table
 	 *  into \c work_table until no growth or \c max_iterations exceeded. */
 	RECURSIVE_CTE_FIXPOINT,
     /** Operands: PARTITION count (int64, 0=no partition), PARTITION col names..., ORDER BY col, asc (int64), out col name,
-     *  kind (int64: 0–2 ordinals, 3–6 running SUM/MIN/MAX/AVG, 7–8 LAG/LEAD), source column, frame offset (int64).
-     *  Legacy layouts without kind/source/offset treat kind as \c ROW_NUMBER() . Table taken from stack. */
+     *  kind (int64: 0–2 ordinals, 3–6 running SUM/MIN/MAX/AVG, 7–8 LAG/LEAD), source column, frame offset (int64),
+     *  explicit ROWS flag (int64), and when set: start kind, start offset, end kind, end offset. Without an explicit
+     *  frame, aggregates use \c ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW . Table taken from stack. */
     WINDOW_ROW_NUMBER,
     /** Operands: offset rows (int64), max rows (int64). Table on stack; applies OFFSET then LIMIT in one step. */
     SLICE_RANGE,
+	/** Operand: \c StorageLayout as \e int64 . Sets per-query storage hint for subsequent table scans. */
+	STORAGE_HINT,
     /** Searched CASE on current row batch. Operand layout: output column name, arm count \e N (may be \c 0 for ELSE-only),
      *  then \e N repetitions of (WHEN predicate as FILTER_Dnf-style packed blob string, THEN kind \e int64 , THEN payload string),
      *  then ELSE kind \e int64 and ELSE payload string. THEN/ELSE kinds: 0=literal text, 1=copy from column named
@@ -124,6 +138,9 @@ enum class Opcode : uint8_t {
     /** SELECT projection: operands are output column; \c ScalarSqlFn as \e int64 ; argc; then \e argc × (scalar kind,
      *  payload) using the same scalar encoding as \c CAST_EVAL sources. Table popped/pushed like \c CAST_EVAL . */
     SCALAR_FUNC_EVAL,
+	/** \c INSERT … BULK fixture rows at runtime (torture-shaped five columns). Operands: table name, count, start id,
+	 *  step (all int64 except table string). Avoids expanding millions of \c INSERT instructions at compile time. */
+	INSERT_BULK,
 };
 
 using Value = std::variant<int64_t, double, std::string>;
@@ -171,7 +188,11 @@ struct Instruction {
             case Opcode::DROP_TABLE:
             case Opcode::CREATE_VIEW:
             case Opcode::DROP_VIEW:
+			case Opcode::CREATE_PROCEDURE:
+			case Opcode::DROP_PROCEDURE:
+			case Opcode::CALL_PROCEDURE:
             case Opcode::INSERT:
+			case Opcode::INSERT_BULK:
             case Opcode::DELETE:
             case Opcode::UPDATE:
             case Opcode::KEEP_ROWS:
@@ -185,6 +206,8 @@ struct Instruction {
             case Opcode::REVOKE:
 			case Opcode::CREATE_ROLE:
 			case Opcode::DROP_ROLE:
+			case Opcode::CREATE_SEQUENCE:
+			case Opcode::DROP_SEQUENCE:
 			case Opcode::GRANT_ROLE_MEMBERSHIP:
 			case Opcode::REVOKE_ROLE_MEMBERSHIP:
 			case Opcode::GRANT_COLUMN:

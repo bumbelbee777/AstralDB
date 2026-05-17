@@ -14,8 +14,8 @@ project_dirs:
 output: bin/libastraldb.a
 compiler_flags:
   global: "-Wall -Wextra -Werror -fstack-protector-strong -fpie -Isources -Ithird_party -Itests"
-  common: "-O2"
-  cpp: ""
+  common: "-Os"
+  cpp: "-ffunction-sections -fdata-sections"
   ar: ""
   ld: "-Wl,--stack,8388608"
 

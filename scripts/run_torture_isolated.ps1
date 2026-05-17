@@ -30,7 +30,7 @@ $Tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("astraldb_torture_" + [guid]
 New-Item -ItemType Directory -Path $Tmp | Out-Null
 try {
 	Push-Location $Tmp
-	& $AstralDbExe -O0 -s $SqlPath
+	& $AstralDbExe -O2 --time-sql $SqlPath
 	$code = $LASTEXITCODE
 } finally {
 	Pop-Location

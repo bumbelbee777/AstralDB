@@ -12,7 +12,7 @@ build-cmake/
 .build/
 buildtmp/
 bin/
-app/
+app/.build/
 build.log
 build.log.old
 astraldb.log

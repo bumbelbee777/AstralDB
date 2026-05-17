@@ -1,4 +1,5 @@
 #include <Database/WriteAheadLog.hxx>
+#include <Database/HybridStorageScheduler.hxx>
 #include <Database/Database.hxx>
 #include <IO/Error.hxx>
 #include <DS/ErrorCorrection.hxx>
@@ -170,14 +171,14 @@ void WriteAheadLog::Replay(Database &Db) {
 	std::ifstream In(WalPath_, std::ios::binary);
 	if(!In)
 		FailWal("Cannot read write-ahead log for replay: " + WalPath_.string());
-	std::string Line;
-	while(std::getline(In, Line)) {
-		if(!Line.empty() && Line.back() == '\r')
-			Line.pop_back();
-		if(Line.empty())
+	std::string WalLine;
+	while(std::getline(In, WalLine)) {
+		if(!WalLine.empty() && WalLine.back() == '\r')
+			WalLine.pop_back();
+		if(WalLine.empty())
 			continue;
-		if(Line.size() >= 3 && Line[0] == 'W' && Line[1] == '1' && Line[2] == '|') {
-			const std::string Blob = WalDecodeSqlBody(std::string_view(Line).substr(3));
+		if(WalLine.size() >= 3 && WalLine[0] == 'W' && WalLine[1] == '1' && WalLine[2] == '|') {
+			const std::string Blob = WalDecodeSqlBody(std::string_view(WalLine).substr(3));
 			if(Blob.size() < 24)
 				FailWal("Encrypted WAL record too short - delete or repair " + WalPath_.string());
 			std::array<uint8_t, 24> Nonce{};
@@ -189,9 +190,9 @@ void WriteAheadLog::Replay(Database &Db) {
 			const auto Rec = DS::ErrorCorrection::Recover(Fe);
 			if(!Rec.has_value())
 				FailWal("WAL FEC could not correct payload - delete or repair " + WalPath_.string());
-			Line = *Rec;
+			WalLine = *Rec;
 		}
-		auto Tok = SplitPipe(Line);
+		auto Tok = SplitPipe(WalLine);
 		if(Tok.empty())
 			continue;
 		if(Tok[0] == "T") {
@@ -208,11 +209,14 @@ void WriteAheadLog::Replay(Database &Db) {
 				FailWal("Corrupt WAL line: CREATE TABLE declares zero columns - delete or repair " +
 				        WalPath_.string());
 			if(ColCount > 0) {
-				if(Rem != ColCount * 5 && Rem != ColCount * 7)
+				if(Rem != ColCount * 5 && Rem != ColCount * 7 && Rem != ColCount * 9)
 					FailWal("Corrupt WAL line: CREATE TABLE column field count mismatch (expected legacy "
-					        "T| rows with 5 or extended with 7 fields per column): " +
+					        "T| rows with 5, 7, or 9 fields per column): " +
 					        WalPath_.string());
-				Wide = (Rem == ColCount * 7) ? 7 : 5;
+				if(Rem == ColCount * 9)
+					Wide = 9;
+				else
+					Wide = (Rem == ColCount * 7) ? 7 : 5;
 			}
 			for(size_t c = 0; c < ColCount; ++c) {
 				if(Idx + Wide > Tok.size())
@@ -232,9 +236,26 @@ void WriteAheadLog::Replay(Database &Db) {
 					if(!Df.empty() && Df != "-")
 						Col.CheckConstraintDnfPacked = WalDecodeSqlBody(Df);
 				}
+				if(Wide >= 9) {
+					const std::string &IdA = Tok[Idx++];
+					const std::string &IdS = Tok[Idx++];
+					if(IdA == "1" || IdA == "0") {
+						Col.IsIdentity = true;
+						Col.IdentityAlways = IdA == "1";
+						if(!IdS.empty() && IdS != "-")
+							Col.IdentitySequenceName = IdS;
+					}
+				}
 				Schema.push_back(std::move(Col));
 			}
 			Db.CreateTable(TableName, Schema).get();
+		} else if(Tok[0] == "ST") {
+			if(Tok.size() < 3)
+				FailWal("Corrupt WAL line: SET STORAGE (ST) record incomplete - delete or repair " +
+				        WalPath_.string());
+			const std::string TableName = WalDecodeSqlBody(Tok[1]);
+			const int Pol = std::stoi(Tok[2]);
+			Db.ReplayWalSetTableStorage(TableName, static_cast<StorageLayout>(Pol));
 		} else if(Tok[0] == "I") {
 			if(Tok.size() < 3)
 				FailWal("Corrupt WAL line: INSERT (I) record has too few fields - delete or repair " +
@@ -283,6 +304,16 @@ void WriteAheadLog::Replay(Database &Db) {
 				FailWal("Corrupt WAL line: DROP VIEW (DV) record incomplete - delete or repair " +
 				        WalPath_.string());
 			Db.ReplayWalDropView(Tok[1]);
+		} else if(Tok[0] == "PR") {
+			if(Tok.size() < 3)
+				FailWal("Corrupt WAL line: CREATE PROCEDURE (PR) record incomplete - delete or repair " +
+				        WalPath_.string());
+			Db.ReplayWalDefineProcedure(Tok[1], WalDecodeSqlBody(Tok[2]));
+		} else if(Tok[0] == "PD") {
+			if(Tok.size() < 2)
+				FailWal("Corrupt WAL line: DROP PROCEDURE (PD) record incomplete - delete or repair " +
+				        WalPath_.string());
+			Db.ReplayWalDropProcedure(Tok[1]);
 		} else if(Tok[0] == "UU") {
 			if(Tok.size() < 4)
 				FailWal("Corrupt WAL line: ADD USER (UU) record incomplete - delete or repair " + WalPath_.string());
@@ -308,6 +339,15 @@ void WriteAheadLog::Replay(Database &Db) {
 				FailWal("Corrupt WAL line: REVOKE ACL (UR) record incomplete - delete or repair " + WalPath_.string());
 			const int Bits = std::stoi(Tok[3]);
 			Db.ReplayWalRevokeAcl(WalDecodeSqlBody(Tok[1]), WalDecodeSqlBody(Tok[2]), Bits);
+		} else if(Tok[0] == "SQ") {
+			if(Tok.size() < 4)
+				FailWal("Corrupt WAL line: CREATE SEQUENCE (SQ) record incomplete - delete or repair " +
+				        WalPath_.string());
+			Db.ReplayWalCreateSequence(WalDecodeSqlBody(Tok[1]), std::stoll(Tok[2]), std::stoll(Tok[3]));
+		} else if(Tok[0] == "SD") {
+			if(Tok.size() < 2)
+				FailWal("Corrupt WAL line: DROP SEQUENCE (SD) record incomplete - delete or repair " + WalPath_.string());
+			Db.ReplayWalDropSequence(WalDecodeSqlBody(Tok[1]));
 		} else if(Tok[0] == "CR") {
 			if(Tok.size() < 2)
 				FailWal("Corrupt WAL line: CREATE ROLE (CR) record incomplete - delete or repair " + WalPath_.string());

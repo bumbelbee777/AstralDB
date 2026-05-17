@@ -1,9 +1,12 @@
--- Small batch: parse + INSERT + ORDER BY + UPDATE.
+-- Parse + BULK insert + ORDER BY + UPDATE (timing: astraldb --time-sql examples/performance_test.sql)
 
-CREATE TABLE perf_row (id INTEGER, val1 INTEGER, val2 INTEGER, label VARCHAR);
-INSERT INTO perf_row VALUES (1, 10, 20, 'a');
-INSERT INTO perf_row VALUES (2, 11, 21, 'b');
-INSERT INTO perf_row VALUES (3, 12, 22, 'c');
+DROP TABLE IF EXISTS perf_row;
+CREATE TABLE perf_row (id INT, a INT, b TEXT, c TEXT, d TEXT);
 
-SELECT id, val1, val2, label FROM perf_row ORDER BY id ASC;
-UPDATE perf_row SET val2 = 99 WHERE id = 3;
+INSERT INTO perf_row BULK 800 START 1 STEP 1;
+
+SELECT id, a, b, c FROM perf_row ORDER BY id ASC LIMIT 100;
+UPDATE perf_row SET b = 'hot' WHERE id BETWEEN 700 AND 799;
+SELECT id, b FROM perf_row WHERE b = 'hot' ORDER BY id ASC;
+
+DROP TABLE IF EXISTS perf_row;

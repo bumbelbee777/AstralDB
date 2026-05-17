@@ -1,4 +1,6 @@
+#include <Database/AdvancedTypes.hxx>
 #include <Database/Database.hxx>
+#include <cstring>
 #include <Database/AtRestKey.hxx>
 #include <SQL/SetExprEval.hxx>
 #include <IO/Error.hxx>
@@ -30,6 +32,7 @@
 #include <DS/TabularData.hxx>
 #include <DS/JSONCodec.hxx>
 #include <SQL/Bytecode.hxx>
+#include <SQL/BytecodeProcedures.hxx>
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -64,11 +67,11 @@ std::optional<std::string> ParseTableMarkerLine(const std::string &Line) {
 	return Line.substr(kTableMarkerPrefix.size(), Line.size() - kTableMarkerPrefix.size() - 3);
 }
 
-DS::Table BuildTabularForExport(const Database::Schema &Sch, const Database::Table &Rows) {
+DS::Table BuildTabularForExport(const Database::Schema &Sch, const Database::Table &RowStore) {
 	DS::Table T;
 	for(const auto &Col : Sch)
 		T.Headers.push_back(Col.Name);
-	for(const auto &Item : Rows) {
+	for(const auto &Item : RowStore) {
 		DS::Row R;
 		for(const auto &Col : Sch) {
 			auto It = Item.find(Col.Name);
@@ -239,7 +242,7 @@ Database::Database(const std::filesystem::path &DbPath, Logger* Logger)
 	, Dirty_(false)
 	, StopFlushWorker_(false)
 	, DbPath_(DbPath) {
-	FlushWorkerThread_ = std::thread([this]() { this->FlushWorker(); });
+	/** Replay / first SyncToFile must finish before the flush worker can call SyncToFileUnlocked. */
 	if(std::filesystem::exists(DbPath_)) {
 		std::filesystem::path SnapshotPath = DbPath_;
 		if(!LoadSnapshotFromDiskPathSynchronously(std::move(SnapshotPath)) && Logger_)
@@ -259,6 +262,7 @@ Database::Database(const std::filesystem::path &DbPath, Logger* Logger)
 		std::scoped_lock Guard(DbMutex_);
 		EnsureBootstrapAdminAclAssumeLocked();
 	}
+	FlushWorkerThread_ = std::thread([this]() { this->FlushWorker(); });
 	if(Logger_) Logger_->Info("Database initialized at " + DbPath.string());
 }
 
@@ -348,6 +352,101 @@ static void TryReadTrailingConstraintColumns(std::istringstream &In, Database::C
 		return;
 	ApplyWalDecodedConstraintTok(Co, true, EncSql);
 	ApplyWalDecodedConstraintTok(Co, false, EncDnf);
+	std::string IdAlwaysTok;
+	std::string IdSeqTok;
+	if(!(In >> IdAlwaysTok >> IdSeqTok))
+		return;
+	if(IdAlwaysTok == "1" || IdAlwaysTok == "0") {
+		Co.IsIdentity = true;
+		Co.IdentityAlways = IdAlwaysTok == "1";
+		if(IdSeqTok != "-")
+			Co.IdentitySequenceName = IdSeqTok;
+	}
+}
+
+static constexpr std::string_view kStorageSnapshotMarkerSv = "<<<ASTRAL_DB_STORAGE>>>\n";
+
+static void AppendStorageSnapshotTrailer(std::string &RawData,
+                                         const std::unordered_map<std::string, HybridTableSlot> &Tables) {
+	std::size_t Count = 0;
+	for(const auto &Pr : Tables) {
+		if(Pr.second.DeclaredPolicy != StorageLayout::Row || Pr.second.Workload.ReadCount > 0 ||
+		   Pr.second.Workload.WriteCount > 0)
+			++Count;
+	}
+	if(Count == 0)
+		return;
+	RawData.append(kStorageSnapshotMarkerSv.data(), kStorageSnapshotMarkerSv.size());
+	RawData += std::to_string(Count);
+	RawData.push_back('\n');
+	for(const auto &Pr : Tables) {
+		const HybridTableSlot &Slot = Pr.second;
+		if(Slot.DeclaredPolicy == StorageLayout::Row && Slot.Workload.ReadCount == 0 &&
+		   Slot.Workload.WriteCount == 0)
+			continue;
+		const std::string Weights = Slot.Scheduler.SerializeWeights();
+		RawData += std::to_string(Pr.first.size());
+		RawData.push_back(' ');
+		RawData += std::to_string(static_cast<unsigned>(Slot.DeclaredPolicy));
+		RawData.push_back(' ');
+		RawData += std::to_string(Weights.size());
+		RawData.push_back('\n');
+		RawData += Pr.first;
+		RawData.push_back('\n');
+		RawData += Weights;
+		RawData.push_back('\n');
+	}
+}
+
+struct StorageSnapshotEntry {
+	StorageLayout Policy = StorageLayout::Row;
+	std::string Weights;
+};
+
+static bool StripAndParseStorageSnapshotTrailer(std::string &RawData,
+                                                std::unordered_map<std::string, StorageSnapshotEntry> &Out) {
+	Out.clear();
+	const size_t Mp = RawData.find(kStorageSnapshotMarkerSv.data(), 0, kStorageSnapshotMarkerSv.size());
+	if(Mp == std::string::npos)
+		return true;
+	std::string_view Tail(RawData.data() + Mp + kStorageSnapshotMarkerSv.size(),
+	                      RawData.size() - Mp - kStorageSnapshotMarkerSv.size());
+	const size_t Nl = Tail.find('\n');
+	if(Nl == std::string_view::npos)
+		return false;
+	std::uint64_t NT = 0;
+	for(unsigned char Ch : Tail.substr(0, Nl)) {
+		if(Ch < '0' || Ch > '9')
+			return false;
+		NT = NT * 10 + static_cast<unsigned>(Ch - '0');
+	}
+	Tail = Tail.substr(Nl + 1);
+	for(std::uint64_t I = 0; I < NT; ++I) {
+		const size_t Ln = Tail.find('\n');
+		if(Ln == std::string_view::npos)
+			return false;
+		const std::string_view LenLine = Tail.substr(0, Ln);
+		Tail = Tail.substr(Ln + 1);
+		std::istringstream MetaParseStream{std::string(LenLine)};
+		std::uint64_t NameLen = 0, PolicyVal = 0, WeightsLen = 0;
+		if(!(MetaParseStream >> NameLen >> PolicyVal >> WeightsLen))
+			return false;
+		if(Tail.size() < NameLen + 1 + WeightsLen + 1)
+			return false;
+		std::string TName(Tail.substr(0, NameLen));
+		if(Tail[NameLen] != '\n')
+			return false;
+		Tail = Tail.substr(NameLen + 1);
+		StorageSnapshotEntry Entry;
+		Entry.Policy = static_cast<StorageLayout>(PolicyVal);
+		Entry.Weights.assign(Tail.substr(0, WeightsLen));
+		if(Tail[WeightsLen] != '\n')
+			return false;
+		Tail = Tail.substr(WeightsLen + 1);
+		Out[std::move(TName)] = std::move(Entry);
+	}
+	RawData.erase(Mp);
+	return true;
 }
 
 static constexpr std::string_view kViewSnapshotMarkerSv = "<<<ASTRAL_DB_VIEWS>>>\n";
@@ -421,6 +520,87 @@ static bool StripAndParseViewSnapshotTrailer(std::string &RawData,
 			return false;
 		Tail = Tail.substr(BN + 1);
 		OutViews[std::move(Name)] = std::move(Body);
+	}
+	RawData.erase(Mp);
+	return true;
+}
+
+static constexpr std::string_view kSeqSnapshotMarkerSv = "<<<ASTRAL_DB_SEQUENCES>>>\n";
+
+static void AppendSequenceSnapshotTrailer(std::string &RawData,
+                                          const std::unordered_map<std::string, SequenceState> &Seqs) {
+	if(Seqs.empty())
+		return;
+	RawData.append(kSeqSnapshotMarkerSv.data(), kSeqSnapshotMarkerSv.size());
+	RawData += std::to_string(Seqs.size());
+	RawData.push_back('\n');
+	for(const auto &[Name, St] : Seqs) {
+		RawData += std::to_string(Name.size());
+		RawData.push_back(' ');
+		RawData += std::to_string(4);
+		RawData.push_back('\n');
+		RawData += Name;
+		RawData.push_back('\n');
+		RawData += std::to_string(St.Start);
+		RawData.push_back(' ');
+		RawData += std::to_string(St.Increment);
+		RawData.push_back(' ');
+		RawData += std::to_string(St.Current);
+		RawData.push_back('\n');
+	}
+}
+
+static bool StripAndParseSequenceSnapshotTrailer(std::string &RawData,
+                                                 std::unordered_map<std::string, SequenceState> &Out) {
+	Out.clear();
+	const size_t Mp = RawData.find(kSeqSnapshotMarkerSv.data(), 0, kSeqSnapshotMarkerSv.size());
+	if(Mp == std::string::npos)
+		return true;
+	std::string_view Tail(RawData.data() + Mp + kSeqSnapshotMarkerSv.size(),
+	                     RawData.size() - Mp - kSeqSnapshotMarkerSv.size());
+	const size_t NL = Tail.find('\n');
+	if(NL == std::string_view::npos)
+		return false;
+	std::uint64_t NV = 0;
+	for(unsigned char Ch : Tail.substr(0, NL)) {
+		if(Ch < '0' || Ch > '9')
+			return false;
+		NV = NV * 10 + static_cast<unsigned>(Ch - '0');
+	}
+	Tail = Tail.substr(NL + 1);
+	for(std::uint64_t I = 0; I < NV; ++I) {
+		const size_t NL1 = Tail.find('\n');
+		if(NL1 == std::string_view::npos)
+			return false;
+		const std::string_view LenLine = Tail.substr(0, NL1);
+		Tail = Tail.substr(NL1 + 1);
+		const size_t Sp = LenLine.find(' ');
+		if(Sp == std::string_view::npos)
+			return false;
+		std::uint64_t LN = 0;
+		for(unsigned char Ch : LenLine.substr(0, Sp)) {
+			if(Ch < '0' || Ch > '9')
+				return false;
+			LN = LN * 10 + static_cast<unsigned>(Ch - '0');
+		}
+		if(Tail.size() < LN + 1)
+			return false;
+		std::string Name(Tail.substr(0, LN));
+		if(Tail[LN] != '\n')
+			return false;
+		Tail = Tail.substr(LN + 1);
+		const size_t NL2 = Tail.find('\n');
+		if(NL2 == std::string_view::npos)
+			return false;
+		SequenceState St;
+		{
+			std::istringstream RowIn(std::string(Tail.substr(0, NL2)));
+			RowIn >> St.Start >> St.Increment >> St.Current;
+			if(RowIn.fail())
+				return false;
+		}
+		Tail = Tail.substr(NL2 + 1);
+		Out[std::move(Name)] = St;
 	}
 	RawData.erase(Mp);
 	return true;
@@ -876,6 +1056,14 @@ static bool StripAndParseUserAclSnapshotTrailer(std::string &RawData, bool &OutP
 
 } // namespace
 
+void Database::AppendWalAfterSetTableStorage(const std::string &TableName, StorageLayout Layout) {
+	if(WalSuspended_.load(std::memory_order_acquire))
+		return;
+	std::ostringstream O;
+	O << "ST|" << WalEncodeSqlBody(TableName) << '|' << static_cast<int>(Layout);
+	Wal_.AppendLine(O.str());
+}
+
 void Database::AppendWalAfterCreate(const std::string &TableName, const Schema &Columns) {
 	if(WalSuspended_.load(std::memory_order_acquire))
 		return;
@@ -886,9 +1074,25 @@ void Database::AppendWalAfterCreate(const std::string &TableName, const Schema &
 		  << (Col.IsPrimaryKey ? "1" : "0") << '|'
 		  << (Col.IsUnique ? "1" : "0") << '|'
 		  << (Col.IsNotNull ? "1" : "0") << '|' << WalEncodeOptionalConstraintB64(Col.CheckConstraintSql) << '|'
-		  << WalEncodeOptionalConstraintB64(Col.CheckConstraintDnfPacked);
+		  << WalEncodeOptionalConstraintB64(Col.CheckConstraintDnfPacked) << '|'
+		  << (Col.IsIdentity ? (Col.IdentityAlways ? "1" : "0") : "-") << '|'
+		  << (Col.IsIdentity && !Col.IdentitySequenceName.empty() ? Col.IdentitySequenceName : "-");
 	}
 	Wal_.AppendLine(O.str());
+}
+
+void Database::AppendWalAfterCreateSequence(const std::string &Name, int64_t Start, int64_t Increment) {
+	if(WalSuspended_.load(std::memory_order_acquire))
+		return;
+	std::ostringstream O;
+	O << "SQ|" << Name << '|' << Start << '|' << Increment;
+	Wal_.AppendLine(O.str());
+}
+
+void Database::AppendWalAfterDropSequence(const std::string &Name) {
+	if(WalSuspended_.load(std::memory_order_acquire))
+		return;
+	Wal_.AppendLine(std::string("SD|") + Name);
 }
 
 void Database::AppendWalAfterInsert(const std::string &TableName, const Item &Row) {
@@ -919,6 +1123,20 @@ void Database::AppendWalAfterDropView(const std::string &ViewName) {
 	if(WalSuspended_.load(std::memory_order_acquire))
 		return;
 	Wal_.AppendLine(std::string("DV|") + ViewName);
+}
+
+void Database::AppendWalAfterDefineProcedure(const std::string &Name, const std::string &SqlBody) {
+	if(WalSuspended_.load(std::memory_order_acquire))
+		return;
+	std::ostringstream O;
+	O << "PR|" << Name << '|' << WalEncodeSqlBody(SqlBody);
+	Wal_.AppendLine(O.str());
+}
+
+void Database::AppendWalAfterDropProcedure(const std::string &Name) {
+	if(WalSuspended_.load(std::memory_order_acquire))
+		return;
+	Wal_.AppendLine(std::string("PD|") + Name);
 }
 
 void Database::AppendWalAfterAddUser(const User &U) {
@@ -1070,14 +1288,20 @@ void Database::SyncToFileUnlocked() {
 			OutputStream << Column.Name << " " << Column.IsPrimaryKey << " " << Column.IsUnique << " "
 			             << Column.IsNotNull << " " << Column.DefaultValue << " "
 			             << WalEncodeOptionalConstraintB64(Column.CheckConstraintSql) << " "
-			             << WalEncodeOptionalConstraintB64(Column.CheckConstraintDnfPacked) << "\n";
+			             << WalEncodeOptionalConstraintB64(Column.CheckConstraintDnfPacked) << " ";
+			if(Column.IsIdentity)
+				OutputStream << (Column.IdentityAlways ? "1" : "0") << " "
+				             << (Column.IdentitySequenceName.empty() ? "-" : Column.IdentitySequenceName);
+			else
+				OutputStream << "- -";
+			OutputStream << "\n";
 		}
 	}
 	OutputStream << Tables_.size() << "\n";
 	for(const auto &TablePair : Tables_) {
 		OutputStream << TablePair.first << "\n";  // Table name
-		OutputStream << TablePair.second.size() << "\n";  // Row count
-		for(const auto &Row : TablePair.second) {
+		OutputStream << TablePair.second.RowStore.size() << "\n";  // Row count
+		for(const auto &Row : TablePair.second.RowStore) {
 			OutputStream << Row.size() << "\n";  // Column count per row
 			for (const auto &Column : Row) {
 				OutputStream << Column.first << "\n";  // Column name
@@ -1096,6 +1320,8 @@ void Database::SyncToFileUnlocked() {
 	}
 	AppendUserAclSnapshotTrailer(RawData, Users_, Acls_, Extras);
 	AppendForeignKeySnapshotTrailer(RawData, ForeignKeys_);
+	AppendSequenceSnapshotTrailer(RawData, Sequences_);
+	AppendStorageSnapshotTrailer(RawData, Tables_);
 	AppendViewSnapshotTrailer(RawData, ViewDefinitionSql_);
 	std::string CompressedData = CompressData(RawData);
 	std::string EncryptedData = EncryptData(CompressedData);
@@ -1180,6 +1406,7 @@ void Database::CloneTable(const std::string &Dest, const std::string &Src) {
 			FailStorage("CLONE TABLE: source and destination names must be non-empty.");
 	TableSchemas_[Dest] = SIt->second;
 	Tables_[Dest] = TIt->second;
+	Tables_[Dest].ColumnarSynced = false;
 	Indexes_.erase(Dest);
 	ForeignKeys_.erase(Dest);
 	auto Ck = TableCheckConstraints_.find(Src);
@@ -1238,6 +1465,90 @@ void Database::ReplayWalDefineView(const std::string &ViewName, std::string SqlB
 void Database::ReplayWalDropView(const std::string &ViewName) {
 	std::scoped_lock Guard(DbMutex_);
 	ViewDefinitionSql_.erase(ViewName);
+}
+
+std::unordered_map<std::string, std::string> Database::ProcedureDefinitionsSnapshot() const {
+	std::scoped_lock Guard(DbMutex_);
+	return ProcedureDefinitionSql_;
+}
+
+void Database::DefineProcedure(const std::string &ProcedureName, std::string SqlBody, bool IfNotExists) {
+	std::string BodyForCache;
+	{
+		std::scoped_lock Guard(DbMutex_);
+		if(ProcedureName.empty())
+			FailStorage("CREATE PROCEDURE: name must be non-empty.");
+		if(ProcedureDefinitionSql_.find(ProcedureName) != ProcedureDefinitionSql_.end()) {
+			if(IfNotExists)
+				return;
+			FailStorage("CREATE PROCEDURE: \"" + ProcedureName + "\" already exists.");
+		}
+		ProcedureDefinitionSql_[ProcedureName] = SqlBody;
+		BodyForCache = ProcedureDefinitionSql_[ProcedureName];
+		AppendWalAfterDefineProcedure(ProcedureName, BodyForCache);
+		Dirty_.store(true, std::memory_order_release);
+	}
+	SQL::ProcedureCatalog Catalog;
+	const auto CatPath = SQL::DefaultProcedureCatalogPath(DbPath_);
+	Catalog.CatalogPath = CatPath;
+	Catalog = SQL::LoadProcedureCatalog(CatPath);
+	SQL::UnregisterProcedure(Catalog, ProcedureName);
+	SQL::CacheProcedureFromSql(Catalog, DbPath_, ProcedureName, std::move(BodyForCache), Logger_,
+	                           SQL::OptimizationLevel::Basic, this, true);
+	SQL::SaveProcedureCatalog(Catalog);
+}
+
+void Database::DropProcedureDefinition(const std::string &ProcedureName, bool IfExists) {
+	{
+		std::scoped_lock Guard(DbMutex_);
+		auto It = ProcedureDefinitionSql_.find(ProcedureName);
+		if(It == ProcedureDefinitionSql_.end()) {
+			if(!IfExists)
+				FailStorage("DROP PROCEDURE: \"" + ProcedureName + "\" does not exist.");
+		} else {
+			ProcedureDefinitionSql_.erase(It);
+			AppendWalAfterDropProcedure(ProcedureName);
+			Dirty_.store(true, std::memory_order_release);
+		}
+	}
+	SQL::ProcedureCatalog Catalog;
+	const auto CatPath = SQL::DefaultProcedureCatalogPath(DbPath_);
+	Catalog = SQL::LoadProcedureCatalog(CatPath);
+	if(Catalog.CatalogPath.empty())
+		Catalog.CatalogPath = CatPath;
+	if(!SQL::UnregisterProcedure(Catalog, ProcedureName) && !IfExists)
+		FailStorage("DROP PROCEDURE: \"" + ProcedureName + "\" does not exist.");
+	SQL::SaveProcedureCatalog(Catalog);
+}
+
+void Database::ReplayWalDefineProcedure(const std::string &ProcedureName, std::string SqlBody) {
+	{
+		std::scoped_lock Guard(DbMutex_);
+		if(ProcedureName.empty())
+			FailStorage("WAL replay CREATE PROCEDURE: empty name.");
+		ProcedureDefinitionSql_[ProcedureName] = SqlBody;
+	}
+	SQL::ProcedureCatalog Catalog;
+	const auto CatPath = SQL::DefaultProcedureCatalogPath(DbPath_);
+	Catalog.CatalogPath = CatPath;
+	Catalog = SQL::LoadProcedureCatalog(CatPath);
+	SQL::CacheProcedureFromSql(Catalog, DbPath_, ProcedureName, std::move(SqlBody), Logger_, SQL::OptimizationLevel::Basic,
+	                           this, true);
+	SQL::SaveProcedureCatalog(Catalog);
+}
+
+void Database::ReplayWalDropProcedure(const std::string &ProcedureName) {
+	{
+		std::scoped_lock Guard(DbMutex_);
+		ProcedureDefinitionSql_.erase(ProcedureName);
+	}
+	SQL::ProcedureCatalog Catalog;
+	const auto CatPath = SQL::DefaultProcedureCatalogPath(DbPath_);
+	Catalog = SQL::LoadProcedureCatalog(CatPath);
+	if(Catalog.CatalogPath.empty())
+		Catalog.CatalogPath = CatPath;
+	SQL::UnregisterProcedure(Catalog, ProcedureName);
+	SQL::SaveProcedureCatalog(Catalog);
 }
 
 void Database::ReplayWalAddUser(std::string Name, std::string EncryptedBlob, std::array<uint8_t, 32> KeyMaterial) {
@@ -1597,11 +1908,43 @@ static bool ParentHasFkValueAssumeLocked(const Database &Db, const std::string &
 	auto Tit = Db.Tables_.find(ParentTable);
 	if(Tit == Db.Tables_.end())
 		return false;
-	for(const auto &Pr : Tit->second) {
+	const HybridTableSlot::Table &ParentRows = Tit->second.RowStore;
+	for(const auto &Pr : ParentRows) {
 		auto Cit = Pr.find(ParentCol);
 		if(Cit != Pr.end() && Cit->second == Val)
 			return true;
 	}
+	return false;
+}
+
+static bool ParentHasCompositeFkTupleAssumeLocked(const Database &Db, const std::string &ParentTable,
+                                                  const std::vector<ForeignKey> &Parts,
+                                                  const Database::Item &Row) {
+	auto Tit = Db.Tables_.find(ParentTable);
+	if(Tit == Db.Tables_.end())
+		return false;
+	const HybridTableSlot::Table &ParentRows = Tit->second.RowStore;
+	for(const auto &Pr : ParentRows) {
+		bool Match = true;
+		for(const ForeignKey &Fk : Parts) {
+			auto CIt = Row.find(Fk.ColumnName);
+			auto PIt = Pr.find(Fk.ReferencedColumn);
+			if(CIt == Row.end() || PIt == Pr.end() || CIt->second != PIt->second) {
+				Match = false;
+				break;
+			}
+		}
+		if(Match)
+			return true;
+	}
+	return false;
+}
+
+static bool CompositeFkAnyChildColumnNull(const Database::Item &Row,
+                                          const std::vector<ForeignKey> &Parts) {
+	for(const ForeignKey &Fk : Parts)
+		if(FkCellIsNull(Row, Fk.ColumnName))
+			return true;
 	return false;
 }
 
@@ -1620,7 +1963,36 @@ void Database::RejectRowIfForeignKeysFailAssumeLocked(const std::string &TableNa
 			break;
 		}
 	}
+	std::unordered_set<std::string> SeenGroups;
 	for(const ForeignKey &Fk : FkIt->second) {
+		if(!Fk.CompositeGroup.empty()) {
+			if(!SeenGroups.insert(Fk.CompositeGroup).second)
+				continue;
+			std::vector<ForeignKey> Parts;
+			Parts.reserve(FkIt->second.size());
+			for(const ForeignKey &O : FkIt->second) {
+				if(O.CompositeGroup == Fk.CompositeGroup)
+					Parts.push_back(O);
+			}
+			if(CompositeFkAnyChildColumnNull(Row, Parts))
+				continue;
+			if(Parts[0].ReferencedTable == TableName && RowPk) {
+				bool SelfRef = true;
+				for(const ForeignKey &P : Parts) {
+					auto It = Row.find(P.ColumnName);
+					if(It == Row.end() || It->second != *RowPk) {
+						SelfRef = false;
+						break;
+					}
+				}
+				if(SelfRef)
+					continue;
+			}
+			if(ParentHasCompositeFkTupleAssumeLocked(*this, Parts[0].ReferencedTable, Parts, Row))
+				continue;
+			FailStorage("FOREIGN KEY violation on composite key in table \"" + TableName + "\".");
+			continue;
+		}
 		if(FkCellIsNull(Row, Fk.ColumnName))
 			continue;
 		const std::string &Val = Row.at(Fk.ColumnName);
@@ -1638,17 +2010,62 @@ void Database::RejectDeleteIfReferencedAssumeLocked(const std::string &ParentTab
 	std::vector<std::pair<std::string, size_t>> ChildRowsToDelete;
 	std::vector<std::tuple<std::string, size_t, std::string>> ChildNullUpdates;
 	for(const auto &[ChildTable, Fks] : ForeignKeys_) {
+		std::unordered_set<std::string> ChildGroupsDone;
 		for(const ForeignKey &Fk : Fks) {
 			if(Fk.ReferencedTable != ParentTable)
 				continue;
+			if(!Fk.CompositeGroup.empty()) {
+				if(!ChildGroupsDone.insert(Fk.CompositeGroup).second)
+					continue;
+				std::vector<ForeignKey> Parts;
+				for(const ForeignKey &O : Fks) {
+					if(O.CompositeGroup == Fk.CompositeGroup)
+						Parts.push_back(O);
+				}
+				bool ParentNull = false;
+				for(const ForeignKey &P : Parts) {
+					if(FkCellIsNull(ParentRow, P.ReferencedColumn)) {
+						ParentNull = true;
+						break;
+					}
+				}
+				if(ParentNull)
+					continue;
+				auto Cit = Tables_.find(ChildTable);
+				if(Cit == Tables_.end())
+					continue;
+				for(size_t Ix = 0; Ix < Cit->second.RowStore.size(); ++Ix) {
+					const Item &ChildRow = Cit->second.RowStore[Ix];
+					if(CompositeFkAnyChildColumnNull(ChildRow, Parts))
+						continue;
+					bool Match = true;
+					for(const ForeignKey &P : Parts) {
+						if(ChildRow.at(P.ColumnName) != ParentRow.at(P.ReferencedColumn)) {
+							Match = false;
+							break;
+						}
+					}
+					if(!Match)
+						continue;
+					if(Parts[0].OnDelete == ReferentialAction::Cascade)
+						ChildRowsToDelete.emplace_back(ChildTable, Ix);
+					else if(Parts[0].OnDelete == ReferentialAction::SetNull) {
+						for(const ForeignKey &P : Parts)
+							ChildNullUpdates.emplace_back(ChildTable, Ix, P.ColumnName);
+					} else
+						FailStorage("FOREIGN KEY violation: cannot delete referenced row in \"" +
+						            ParentTable + "\" (referenced by \"" + ChildTable + "\").");
+				}
+				continue;
+			}
 			if(FkCellIsNull(ParentRow, Fk.ReferencedColumn))
 				continue;
 			const std::string &RefVal = ParentRow.at(Fk.ReferencedColumn);
 			auto Cit = Tables_.find(ChildTable);
 			if(Cit == Tables_.end())
 				continue;
-			for(size_t Ix = 0; Ix < Cit->second.size(); ++Ix) {
-				const Item &ChildRow = Cit->second[Ix];
+			for(size_t Ix = 0; Ix < Cit->second.RowStore.size(); ++Ix) {
+				const Item &ChildRow = Cit->second.RowStore[Ix];
 				if(FkCellIsNull(ChildRow, Fk.ColumnName))
 					continue;
 				if(ChildRow.at(Fk.ColumnName) != RefVal)
@@ -1664,7 +2081,7 @@ void Database::RejectDeleteIfReferencedAssumeLocked(const std::string &ParentTab
 		}
 	}
 	for(const auto &[Tbl, Ix, Col] : ChildNullUpdates)
-		Tables_.at(Tbl)[Ix][Col] = std::string();
+		Tables_.at(Tbl).RowStore[Ix][Col] = std::string();
 	std::sort(ChildRowsToDelete.begin(), ChildRowsToDelete.end(),
 	          [](const auto &A, const auto &B) {
 		          if(A.first != B.first)
@@ -1672,8 +2089,9 @@ void Database::RejectDeleteIfReferencedAssumeLocked(const std::string &ParentTab
 		          return A.second > B.second;
 	          });
 	for(const auto &[Tbl, Ix] : ChildRowsToDelete) {
-		Item Deleted = Tables_.at(Tbl)[Ix];
-		Tables_.at(Tbl).erase(Tables_.at(Tbl).begin() + static_cast<std::ptrdiff_t>(Ix));
+		Item Deleted = Tables_.at(Tbl).RowStore[Ix];
+		Tables_.at(Tbl).RowStore.erase(Tables_.at(Tbl).RowStore.begin() + static_cast<std::ptrdiff_t>(Ix));
+		Tables_.at(Tbl).SyncColumnarAfterRowMutation();
 		RejectDeleteIfReferencedAssumeLocked(Tbl, Deleted);
 	}
 }
@@ -1701,7 +2119,53 @@ void Database::RejectRowIfChecksFailAssumeLocked(const std::string &TableName, c
 	}
 }
 
-std::future<void> Database::CreateTable(const std::string &TableName, const Schema &Columns) {
+void Database::RejectRowIfTypesFailAssumeLocked(const std::string &TableName, const Item &Row) const {
+	auto SchIt = TableSchemas_.find(TableName);
+	if(SchIt == TableSchemas_.end())
+		return;
+	for(const Column &Co : SchIt->second) {
+		if(!AdvancedTypes::IsAdvancedTypeSpelling(Co.DefaultValue))
+			continue;
+		const auto Desc = AdvancedTypes::ParseTypeSpelling(Co.DefaultValue);
+		if(!Desc)
+			continue;
+		auto It = Row.find(Co.Name);
+		if(It == Row.end() || It->second.empty())
+			continue;
+		if(!AdvancedTypes::ValidateCell(*Desc, It->second))
+			FailStorage("Type validation failed for column \"" + Co.Name + "\" (" + Co.DefaultValue + ")");
+	}
+}
+
+void Database::SetTableStoragePolicy(const std::string &TableName, StorageLayout Policy) {
+	std::scoped_lock Guard(DbMutex_);
+	RequireSessionDdlAssumeLocked();
+	auto It = Tables_.find(TableName);
+	if(It == Tables_.end())
+		FailStorage("SET STORAGE: table \"" + TableName + "\" does not exist.");
+	It->second.SetDeclaredPolicy(Policy);
+	AppendWalAfterSetTableStorage(TableName, Policy);
+	Dirty_.store(true, std::memory_order_release);
+}
+
+StorageLayout Database::TableStoragePolicy(const std::string &TableName) const {
+	std::shared_lock Guard(DbMutex_);
+	auto It = Tables_.find(TableName);
+	if(It == Tables_.end())
+		FailStorage("storage policy: table \"" + TableName + "\" does not exist.");
+	return It->second.DeclaredPolicy;
+}
+
+void Database::ReplayWalSetTableStorage(const std::string &TableName, StorageLayout Policy) {
+	std::scoped_lock Guard(DbMutex_);
+	auto It = Tables_.find(TableName);
+	if(It == Tables_.end())
+		return;
+	It->second.SetDeclaredPolicy(Policy);
+}
+
+std::future<void> Database::CreateTable(const std::string &TableName, const Schema &Columns,
+                                        StorageLayout Storage) {
 	Schema SchemaSnap(Columns);
 	for(size_t Ix = 0; Ix < Columns.size(); ++Ix) {
 		if(Columns[Ix].CheckConstraintDnfPacked.has_value() &&
@@ -1736,7 +2200,23 @@ std::future<void> Database::CreateTable(const std::string &TableName, const Sche
 					FailStorage("internal: CREATE TABLE lost CHECK DNF on column \"" + Columns[Ix].Name +
 					            "\" after schema install.");
 			}
-			Tables_[TableName] = Table();
+			HybridTableSlot Slot;
+			Slot.SetDeclaredPolicy(Storage);
+			Tables_[TableName] = std::move(Slot);
+			if(Storage != StorageLayout::Row)
+				AppendWalAfterSetTableStorage(TableName, Storage);
+			for(const Database::Column &Co : SchemaSnap) {
+				if(!Co.IsIdentity || Co.IdentitySequenceName.empty())
+					continue;
+				if(Sequences_.count(Co.IdentitySequenceName) == 0) {
+					SequenceState St;
+					St.Start = Co.IdentityStart;
+					St.Increment = Co.IdentityIncrement;
+					St.Current = Co.IdentityStart;
+					Sequences_[Co.IdentitySequenceName] = St;
+					AppendWalAfterCreateSequence(Co.IdentitySequenceName, St.Start, St.Increment);
+				}
+			}
 			AppendWalAfterCreate(TableName, SchemaSnap);
 		}
 		Dirty_.store(true, std::memory_order_release);
@@ -1813,7 +2293,7 @@ std::future<void> Database::RenameColumn(const std::string &TableName, const std
 			}
 			if(!Found)
 				FailStorage("ALTER RENAME COLUMN: column \"" + FromColumn + "\" not found.");
-			for(Item &Row : Tables_.at(TableName)) {
+			for(Item &Row : Tables_.at(TableName).RowStore) {
 				auto It = Row.find(FromColumn);
 				if(It == Row.end())
 					continue;
@@ -1855,10 +2335,10 @@ std::future<void> Database::AddColumn(const std::string &TableName, const Column
 				if(C.Name == NewColumn.Name)
 					FailStorage("ALTER ADD COLUMN: column \"" + NewColumn.Name + "\" already exists on table \"" + TableName + "\".");
 			SchIt->second.push_back(NewColumn);
-			auto &Rows = Tables_.at(TableName);
+			auto &RowStore = Tables_.at(TableName).RowStore;
 			const std::string Fill =
 			    NewColumn.InsertDefaultLiteral.has_value() ? *NewColumn.InsertDefaultLiteral : std::string();
-			for(auto &Row : Rows) {
+			for(auto &Row : RowStore) {
 				Row[NewColumn.Name] = Fill;
 				RejectRowIfChecksFailAssumeLocked(TableName, Row);
 			}
@@ -1891,8 +2371,9 @@ std::future<void> Database::DropColumn(const std::string &TableName, const std::
 			if(It == Sch.end())
 				FailStorage("ALTER DROP COLUMN: column \"" + ColumnName + "\" not found on table \"" + TableName + "\".");
 			Sch.erase(It, Sch.end());
-			for(auto &Row : Tables_.at(TableName))
+			for(auto &Row : Tables_.at(TableName).RowStore)
 				Row.erase(ColumnName);
+			Tables_.at(TableName).SyncColumnarAfterRowMutation();
 			auto IdxOuter = Indexes_.find(TableName);
 			if(IdxOuter != Indexes_.end())
 				IdxOuter->second.erase(ColumnName);
@@ -1910,23 +2391,188 @@ std::future<void> Database::DropColumn(const std::string &TableName, const std::
 	});
 }
 
+namespace {
+
+static constexpr const char *kNextValPrefix = "__astral_nextval__:";
+
+} // namespace
+
+void Database::ResolveRowSequenceLiteralsAssumeLocked(Item &Row) {
+	for(auto &Pr : Row) {
+		if(Pr.second.rfind(kNextValPrefix, 0) == 0) {
+			const std::string Seq = Pr.second.substr(std::strlen(kNextValPrefix));
+			Pr.second = NextSequenceValueAssumeLocked(Seq);
+		}
+	}
+}
+
+void Database::FillIdentityColumnsAssumeLocked(const Schema &Sch, Item &Row) {
+	for(const Column &Co : Sch) {
+		if(!Co.IsIdentity || Co.IdentitySequenceName.empty())
+			continue;
+		auto It = Row.find(Co.Name);
+		const bool Missing =
+		    It == Row.end() || It->second.empty() || It->second == "NULL";
+		if(Missing) {
+			Row[Co.Name] = NextSequenceValueAssumeLocked(Co.IdentitySequenceName);
+			continue;
+		}
+		if(Co.IdentityAlways)
+			FailStorage("INSERT: cannot supply a value for GENERATED ALWAYS AS IDENTITY column \"" + Co.Name +
+			            "\".");
+	}
+}
+
+std::future<void> Database::CreateSequence(const std::string &Name, int64_t Start, int64_t Increment,
+                                           bool IfNotExists) {
+	return DbDispatchAsync(this, [this, Name, Start, Increment, IfNotExists]() {
+		{
+			std::scoped_lock Guard(DbMutex_);
+			RequireSessionDdlAssumeLocked();
+			if(Sequences_.count(Name) != 0) {
+				if(IfNotExists)
+					return;
+				FailStorage("CREATE SEQUENCE: sequence \"" + Name + "\" already exists.");
+			}
+			if(Increment == 0)
+				FailStorage("CREATE SEQUENCE: INCREMENT BY must be non-zero.");
+			SequenceState St;
+			St.Start = Start;
+			St.Increment = Increment;
+			St.Current = Start;
+			Sequences_[Name] = St;
+			AppendWalAfterCreateSequence(Name, Start, Increment);
+		}
+		Dirty_.store(true, std::memory_order_release);
+	});
+}
+
+std::future<void> Database::DropSequence(const std::string &Name, bool IfExists) {
+	return DbDispatchAsync(this, [this, Name, IfExists]() {
+		{
+			std::scoped_lock Guard(DbMutex_);
+			RequireSessionDdlAssumeLocked();
+			if(Sequences_.erase(Name) == 0) {
+				if(IfExists)
+					return;
+				FailStorage("DROP SEQUENCE: sequence \"" + Name + "\" does not exist.");
+			}
+			AppendWalAfterDropSequence(Name);
+		}
+		Dirty_.store(true, std::memory_order_release);
+	});
+}
+
+std::string Database::NextSequenceValueAssumeLocked(const std::string &Name) {
+	auto It = Sequences_.find(Name);
+	if(It == Sequences_.end())
+		FailStorage("NEXTVAL: sequence \"" + Name + "\" does not exist.");
+	const int64_t Out = It->second.Current;
+	It->second.Current += It->second.Increment;
+	return std::to_string(Out);
+}
+
+std::string Database::NextSequenceValue(const std::string &Name) {
+	std::scoped_lock Guard(DbMutex_);
+	return NextSequenceValueAssumeLocked(Name);
+}
+
+void Database::ReplayWalCreateSequence(const std::string &Name, int64_t Start, int64_t Increment) {
+	std::scoped_lock Guard(DbMutex_);
+	SequenceState St;
+	St.Start = Start;
+	St.Increment = Increment;
+	St.Current = Start;
+	Sequences_[Name] = St;
+}
+
+void Database::ReplayWalDropSequence(const std::string &Name) {
+	std::scoped_lock Guard(DbMutex_);
+	Sequences_.erase(Name);
+}
+
+void Database::InsertBulkSyntheticRows(const std::string &TableName, int64_t Count, int64_t StartId, int64_t Step) {
+	if(Count <= 0)
+		FailStorage("BULK INSERT row count must be a positive integer.");
+	if(static_cast<std::uint64_t>(Count) > Limits::MaxBulkInsertRows)
+		FailStorage("BULK INSERT row count exceeds the configured maximum (see server limits).");
+	std::scoped_lock Guard(DbMutex_);
+	const auto Tit = Tables_.find(TableName);
+	if(Tit == Tables_.end())
+		FailStorage("INSERT_BULK: table \"" + TableName + "\" does not exist.");
+	const auto Sch = TableSchemaAssumeDbMutexHeld(TableName);
+	if(!Sch.has_value() || Sch->size() != 5)
+		FailStorage("INSERT_BULK requires a table with exactly five columns (fixture / bench shape).");
+	HybridTableSlot &Slot = Tit->second;
+	Table &TableRef = Slot.RowStore;
+	const size_t Begin = TableRef.size();
+	if(Begin > TableRef.max_size() - static_cast<size_t>(Count))
+		FailStorage("INSERT_BULK: row count would overflow table capacity.");
+	TableRef.reserve(Begin + static_cast<size_t>(Count));
+	std::vector<std::string> ColNames;
+	ColNames.reserve(Sch->size());
+	for(const Column &Co : *Sch)
+		ColNames.push_back(Co.Name);
+	const auto IdxOuter = Indexes_.find(TableName);
+	for(int64_t K = 0; K < Count; ++K) {
+		const int64_t RowId = StartId + K * Step;
+		const std::string IdStr = std::to_string(RowId);
+		Item MutableRow;
+		MutableRow[ColNames[0]] = IdStr;
+		MutableRow[ColNames[1]] = std::to_string(RowId % 997);
+		MutableRow[ColNames[2]] = std::string("txt_") + IdStr;
+		MutableRow[ColNames[3]] = std::string("chk_") + std::to_string(RowId % 71);
+		MutableRow[ColNames[4]] = std::string("e_") + std::to_string(RowId / 17);
+		ResolveRowSequenceLiteralsAssumeLocked(MutableRow);
+		FillIdentityColumnsAssumeLocked(*Sch, MutableRow);
+		RequireSessionInsertAssumeLocked(TableName, MutableRow);
+		RejectRowIfChecksFailAssumeLocked(TableName, MutableRow);
+		RejectRowIfTypesFailAssumeLocked(TableName, MutableRow);
+		RejectRowIfForeignKeysFailAssumeLocked(TableName, MutableRow);
+		TableRef.push_back(std::move(MutableRow));
+		const size_t RowIndex = TableRef.size() - 1;
+		const Item &Inserted = TableRef.back();
+		if(IdxOuter != Indexes_.end()) {
+			for(const auto &[ColumnName, Value] : Inserted) {
+				const auto ColIdx = IdxOuter->second.find(ColumnName);
+				if(ColIdx != IdxOuter->second.end())
+					std::get<BPlusTree<std::string, size_t>>(ColIdx->second.Index()).Insert(Value, RowIndex);
+			}
+		}
+		AppendWalAfterInsert(TableName, Inserted);
+		OnRowInsertedAssumeLocked(TableName, RowIndex, Inserted);
+	}
+	Slot.RecordWrite();
+	Slot.SyncColumnarAfterRowMutation();
+	Dirty_.store(true, std::memory_order_release);
+}
+
 std::future<void> Database::Insert(const std::string &TableName, const Item &Row) {
 	return DbDispatchAsync(this,[this, TableName, Row]() {
 		{
 			std::scoped_lock Guard(DbMutex_);
 			if(Tables_.find(TableName) == Tables_.end())
 				FailStorage("INSERT: table \"" + TableName + "\" does not exist.");
-			RequireSessionInsertAssumeLocked(TableName, Row);
-			RejectRowIfChecksFailAssumeLocked(TableName, Row);
-			RejectRowIfForeignKeysFailAssumeLocked(TableName, Row);
-			auto &TableRef = Tables_[TableName];
-			if(!TableRef.empty()) {
-				PREFETCH(TableRef.data());
+			Item MutableRow = Row;
+			if(auto Sch = TableSchemaAssumeDbMutexHeld(TableName); Sch.has_value()) {
+				ResolveRowSequenceLiteralsAssumeLocked(MutableRow);
+				FillIdentityColumnsAssumeLocked(*Sch, MutableRow);
 			}
-			TableRef.push_back(Row);
+			RequireSessionInsertAssumeLocked(TableName, MutableRow);
+			RejectRowIfChecksFailAssumeLocked(TableName, MutableRow);
+			RejectRowIfTypesFailAssumeLocked(TableName, MutableRow);
+			RejectRowIfForeignKeysFailAssumeLocked(TableName, MutableRow);
+			HybridTableSlot &Slot = Tables_[TableName];
+			if(!Slot.RowStore.empty()) {
+				PREFETCH(Slot.RowStore.data());
+			}
+			Slot.RowStore.push_back(MutableRow);
+			Slot.RecordWrite();
+			Slot.SyncColumnarAfterRowMutation();
+			auto &TableRef = Slot.RowStore;
 			auto IdxOuter = Indexes_.find(TableName);
 			if(IdxOuter != Indexes_.end()) {
-				for(const auto& [ColumnName, Value] : Row) {
+				for(const auto& [ColumnName, Value] : MutableRow) {
 					auto ColIdx = IdxOuter->second.find(ColumnName);
 					if(ColIdx != IdxOuter->second.end()) {
 						auto& Index = ColIdx->second;
@@ -1934,7 +2580,8 @@ std::future<void> Database::Insert(const std::string &TableName, const Item &Row
 					}
 				}
 			}
-			AppendWalAfterInsert(TableName, Row);
+			AppendWalAfterInsert(TableName, MutableRow);
+			OnRowInsertedAssumeLocked(TableName, TableRef.size() - 1, MutableRow);
 		}
 		Dirty_.store(true, std::memory_order_release);
 	});
@@ -1982,7 +2629,8 @@ std::future<void> Database::Upsert(const std::string &TableName, const Database:
 				if(InsertRow.find(K) == InsertRow.end())
 					FailStorage("UPSERT: INSERT row must include conflict column \"" + K + "\".");
 			}
-			auto &TableRef = Tables_.at(TableName);
+			HybridTableSlot &Slot = Tables_.at(TableName);
+			auto &TableRef = Slot.RowStore;
 			size_t Found = static_cast<size_t>(-1);
 			for(size_t I = 0; I < TableRef.size(); ++I) {
 				if(ExistingRowMatchesInsertKeys(TableRef[I], InsertRow, Keys)) {
@@ -2032,6 +2680,8 @@ std::future<void> Database::Upsert(const std::string &TableName, const Database:
 					if(V)
 						Ex[Col] = *V;
 				}
+				Slot.RecordWrite();
+				Slot.SyncColumnarAfterRowMutation();
 			} else {
 				RequireSessionInsertAssumeLocked(TableName, InsertRow);
 				RejectRowIfChecksFailAssumeLocked(TableName, InsertRow);
@@ -2050,6 +2700,8 @@ std::future<void> Database::Upsert(const std::string &TableName, const Database:
 						}
 					}
 				}
+				Slot.RecordWrite();
+				Slot.SyncColumnarAfterRowMutation();
 				AppendWalAfterInsert(TableName, TableRef.back());
 			}
 		}
@@ -2072,8 +2724,8 @@ std::future<void> Database::MergeUsing(const std::string &TargetTable, const std
 				FailStorage("MERGE: source table \"" + SourceTable + "\" does not exist.");
 			if(KeyPairs.empty())
 				FailStorage("MERGE: at least one ON key pair is required.");
-			auto &TRef = TIt->second;
-			auto &SRef = SIt->second;
+			auto &TRef = TIt->second.RowStore;
+			auto &SRef = SIt->second.RowStore;
 			for(const Item &SrcRow : SRef) {
 				for(const auto &[TgtKey, SrcKey] : KeyPairs) {
 					auto Sk = SrcRow.find(SrcKey);
@@ -2184,7 +2836,8 @@ std::future<void> Database::Delete(const std::string &TableName, const std::func
 		{
 			std::scoped_lock Guard(DbMutex_);
 			RequireSessionTablePermissionAssumeLocked(Permissions::Delete, TableName);
-			auto &TableRef = Tables_.at(TableName);
+			HybridTableSlot &Slot = Tables_.at(TableName);
+			auto &TableRef = Slot.RowStore;
 			auto IdxOuter = Indexes_.find(TableName);
 			const auto RowPasses = [this, TableName](const Item &Row) {
 				if(!RowAllowsAssumeLocked(Permissions::Delete, TableName, Row))
@@ -2209,6 +2862,10 @@ std::future<void> Database::Delete(const std::string &TableName, const std::func
 				}
 			}
 			TableRef.erase(std::remove_if(TableRef.begin(), TableRef.end(), DeleteCond), TableRef.end());
+			SyncFtsIndexesForTableAssumeLocked(TableName);
+			SyncVectorIndexesForTableAssumeLocked(TableName);
+			Slot.RecordWrite();
+			Slot.SyncColumnarAfterRowMutation();
 		}
 		Dirty_.store(true, std::memory_order_release);
 	});
@@ -2224,7 +2881,8 @@ std::future<void> Database::UpdateWithSetExprs(const std::string &TableName,
 			auto TableIt = Tables_.find(TableName);
 			if(TableIt == Tables_.end())
 				FailStorage("UPDATE: table \"" + TableName + "\" does not exist.");
-			auto &TableRef = TableIt->second;
+			HybridTableSlot &Slot = TableIt->second;
+			auto &TableRef = Slot.RowStore;
 			auto IdxOuter = Indexes_.find(TableName);
 			RequireSessionTablePermissionAssumeLocked(Permissions::Update, TableName);
 			for(size_t i = 0; i < TableRef.size(); ++i) {
@@ -2268,12 +2926,18 @@ std::future<void> Database::UpdateWithSetExprs(const std::string &TableName,
 						std::get<BPlusTree<std::string, size_t>>(Index.Index()).Insert(*V, i);
 					}
 				}
+				Item OldRow = Row;
 				for(const auto &[Col, Blob] : Assignments) {
 					auto V = SQL::EvalSerializedSetValueExpr(Blob, Ctx);
 					if(V)
 						Row[Col] = *V;
 				}
+				OnRowUpdatedAssumeLocked(TableName, i, OldRow, Row);
 				Modified = true;
+			}
+			if(Modified) {
+				Slot.RecordWrite();
+				Slot.SyncColumnarAfterRowMutation();
 			}
 		}
 		if(Modified)
@@ -2291,7 +2955,8 @@ std::future<void> Database::Update(const std::string &TableName,
 			auto TableIt = Tables_.find(TableName);
 			if(TableIt == Tables_.end())
 				FailStorage("UPDATE: table \"" + TableName + "\" does not exist.");
-			auto &TableRef = TableIt->second;
+			HybridTableSlot &Slot = TableIt->second;
+			auto &TableRef = Slot.RowStore;
 			auto IdxOuter = Indexes_.find(TableName);
 			RequireSessionTablePermissionAssumeLocked(Permissions::Update, TableName);
 			for(size_t i = 0; i < TableRef.size(); ++i) {
@@ -2324,9 +2989,15 @@ std::future<void> Database::Update(const std::string &TableName,
 						}
 					}
 				}
+				Item OldRow = Row;
 				for(const auto& [ColumnName, NewValue] : NewValues)
 					Row[ColumnName] = NewValue;
+				OnRowUpdatedAssumeLocked(TableName, i, OldRow, Row);
 				Modified = true;
+			}
+			if(Modified) {
+				Slot.RecordWrite();
+				Slot.SyncColumnarAfterRowMutation();
 			}
 		}
 		if(Modified)
@@ -2343,7 +3014,8 @@ std::future<Database::Table> Database::Select(const std::string &TableName, cons
 			if(TableIt == Tables_.end())
 				FailStorage("SELECT: table \"" + TableName + "\" does not exist.");
 			RequireSessionTablePermissionAssumeLocked(Permissions::Select, TableName);
-			const auto &TableRef = TableIt->second;
+			const HybridTableSlot &Slot = TableIt->second;
+			const Table &TableRef = Slot.RowsForRead(std::nullopt, false);
 			if(!TableRef.empty()) {
 				PREFETCH(TableRef.data());
 			}
@@ -2453,6 +3125,12 @@ bool Database::LoadSnapshotFromDiskPathSynchronously(std::filesystem::path Path)
 	std::unordered_map<std::string, std::string> LoadedViews;
 	if(!StripAndParseViewSnapshotTrailer(RawData, LoadedViews))
 		return false;
+	std::unordered_map<std::string, StorageSnapshotEntry> LoadedStorage;
+	if(!StripAndParseStorageSnapshotTrailer(RawData, LoadedStorage))
+		return false;
+	std::unordered_map<std::string, SequenceState> LoadedSeqs;
+	if(!StripAndParseSequenceSnapshotTrailer(RawData, LoadedSeqs))
+		return false;
 	std::unordered_map<std::string, std::vector<ForeignKey>> LoadedFks;
 	if(!StripAndParseForeignKeySnapshotTrailer(RawData, LoadedFks))
 		return false;
@@ -2471,8 +3149,11 @@ bool Database::LoadSnapshotFromDiskPathSynchronously(std::filesystem::path Path)
 		Tables_.clear();
 		ViewDefinitionSql_.clear();
 		Indexes_.clear();
+		FtsIndexes_.clear();
+		VectorIndexes_.clear();
 		ForeignKeys_.clear();
 		TableCheckConstraints_.clear();
+		Sequences_.clear();
 		Users_.clear();
 		Acls_.clear();
 		Roles_.clear();
@@ -2512,9 +3193,20 @@ bool Database::LoadSnapshotFromDiskPathSynchronously(std::filesystem::path Path)
 				}
 				NewTable.push_back(NewRow);
 			}
-			Tables_[TableName] = NewTable;
+			HybridTableSlot Slot;
+			Slot.RowStore = std::move(NewTable);
+			Tables_[TableName] = std::move(Slot);
+		}
+		for(const auto &[TName, Meta] : LoadedStorage) {
+			auto It = Tables_.find(TName);
+			if(It == Tables_.end())
+				continue;
+			It->second.SetDeclaredPolicy(Meta.Policy);
+			if(!Meta.Weights.empty())
+				It->second.Scheduler.DeserializeWeights(Meta.Weights);
 		}
 		ViewDefinitionSql_ = std::move(LoadedViews);
+		Sequences_ = std::move(LoadedSeqs);
 		ForeignKeys_ = std::move(LoadedFks);
 		if(ParsedUserAclPresent && !ParsedUsers.empty()) {
 			Users_ = std::move(ParsedUsers);
@@ -2556,8 +3248,8 @@ std::future<Database::Table> Database::JoinTables(const std::string &LeftTable, 
 			if(LeftIt == Tables_.end() || RightIt == Tables_.end())
 				FailStorage("JOIN: one or both tables are missing (left=\"" + LeftTable + "\", right=\"" + RightTable +
 				            "\").");
-			const auto &LeftData = LeftIt->second;
-			const auto &RightData = RightIt->second;
+			const Table &LeftData = LeftIt->second.RowStore;
+			const Table &RightData = RightIt->second.RowStore;
 			if(!LeftData.empty()) {
 				PREFETCH(LeftData.data());
 			}
@@ -2865,7 +3557,7 @@ IndexManagement<std::string, size_t>& Database::GetOrCreateIndex(const std::stri
 std::future<void> Database::AddIndex(const std::string &TableName, const std::string &ColumnName) {
 	return DbDispatchAsync(this,[this, TableName, ColumnName]() {
 		std::scoped_lock Guard(DbMutex_);
-		auto& table = Tables_[TableName];
+		auto& table = Tables_[TableName].RowStore;
 		auto& index = GetOrCreateIndex(TableName, ColumnName);
 		for (size_t i = 0; i < table.size(); ++i) {
 			const auto& row = table[i];
@@ -2914,8 +3606,12 @@ bool Database::ExportBundle(std::filesystem::path Destination, std::string_view 
 				if(SIt == TableSchemas_.end())
 					continue;
 				const Schema &Sch = SIt->second;
-				const Table &Rows =
-				    TIt != Tables_.end() ? TIt->second : Table{};
+				const HybridTableSlot::Table *RowData = nullptr;
+				HybridTableSlot::Table EmptyRows;
+				if(TIt != Tables_.end())
+					RowData = &TIt->second.RowStore;
+				else
+					RowData = &EmptyRows;
 				DS::JSONArray SchArr;
 				for(const Column &Col : Sch) {
 					DS::JSONObject Co;
@@ -2927,7 +3623,7 @@ bool Database::ExportBundle(std::filesystem::path Destination, std::string_view 
 					SchArr.push_back(DS::JSON(std::move(Co)));
 				}
 				DS::JSONArray RowsArr;
-				for(const Item &Rw : Rows) {
+				for(const Item &Rw : *RowData) {
 					DS::JSONObject O;
 					for(const Column &Col : Sch) {
 						auto It = Rw.find(Col.Name);
@@ -3189,7 +3885,7 @@ bool Database::ImportBundle(std::filesystem::path Source, std::string_view Forma
 			Opts.HasHeader = true;
 			std::string Content = ReadPathText(Source);
 			std::istringstream In(Content);
-			std::string Line;
+			std::string CsvLine;
 			std::optional<std::string> PendingName;
 			std::ostringstream Block;
 			auto FlushPending = [&](const std::string &BlockTxt) -> bool {
@@ -3210,10 +3906,10 @@ bool Database::ImportBundle(std::filesystem::path Source, std::string_view Forma
 				}
 				return true;
 			};
-			while(std::getline(In, Line)) {
-				if(!Line.empty() && Line.back() == '\r')
-					Line.pop_back();
-				if(auto M = ParseTableMarkerLine(Line)) {
+			while(std::getline(In, CsvLine)) {
+				if(!CsvLine.empty() && CsvLine.back() == '\r')
+					CsvLine.pop_back();
+				if(auto M = ParseTableMarkerLine(CsvLine)) {
 					if(PendingName) {
 						std::string S = Block.str();
 						Block.str("");
@@ -3223,7 +3919,7 @@ bool Database::ImportBundle(std::filesystem::path Source, std::string_view Forma
 					}
 					PendingName = std::move(*M);
 				} else {
-					Block << Line << '\n';
+					Block << CsvLine << '\n';
 				}
 			}
 			if(PendingName) {
@@ -3282,6 +3978,180 @@ bool Database::ConvertTabularFiles(std::filesystem::path SourcePath, std::filesy
 	} catch(...) {
 		return false;
 	}
+}
+
+void Database::SyncFtsIndexesForTableAssumeLocked(const std::string &TableName) {
+	for(auto &[Name, Spec] : FtsIndexes_) {
+		(void)Name;
+		if(Spec.Table != TableName)
+			continue;
+		Spec.Index.Clear();
+		auto Tit = Tables_.find(TableName);
+		if(Tit == Tables_.end())
+			continue;
+		const auto &Rows = Tit->second.RowStore;
+		for(size_t I = 0; I < Rows.size(); ++I) {
+			auto It = Rows[I].find(Spec.Column);
+			if(It != Rows[I].end())
+				Spec.Index.IndexRow(I, It->second);
+		}
+	}
+}
+
+void Database::SyncVectorIndexesForTableAssumeLocked(const std::string &TableName) {
+	for(auto &[Name, Spec] : VectorIndexes_) {
+		(void)Name;
+		if(Spec.Table != TableName)
+			continue;
+		auto Tit = Tables_.find(TableName);
+		if(Tit == Tables_.end()) {
+			Spec.Index.Clear();
+			continue;
+		}
+		Spec.Index.BuildFromColumn(Tit->second.RowStore, Spec.Column);
+	}
+}
+
+void Database::OnRowInsertedAssumeLocked(const std::string &TableName, size_t RowIndex, const Item &Row) {
+	for(auto &[Name, Spec] : FtsIndexes_) {
+		(void)Name;
+		if(Spec.Table != TableName)
+			continue;
+		auto It = Row.find(Spec.Column);
+		if(It != Row.end())
+			Spec.Index.IndexRow(RowIndex, It->second);
+	}
+	for(auto &[Name, Spec] : VectorIndexes_) {
+		(void)Name;
+		if(Spec.Table != TableName)
+			continue;
+		auto It = Row.find(Spec.Column);
+		if(It == Row.end())
+			continue;
+		const auto Vec = AdvancedTypes::ParseVectorCell(It->second);
+		if(Vec)
+			Spec.Index.UpsertRow(RowIndex, *Vec);
+	}
+}
+
+void Database::OnRowUpdatedAssumeLocked(const std::string &TableName, size_t RowIndex, const Item &OldRow,
+                                         const Item &NewRow) {
+	for(auto &[Name, Spec] : FtsIndexes_) {
+		(void)Name;
+		if(Spec.Table != TableName)
+			continue;
+		auto Oit = OldRow.find(Spec.Column);
+		if(Oit != OldRow.end())
+			Spec.Index.RemoveRow(RowIndex, Oit->second);
+		auto Nit = NewRow.find(Spec.Column);
+		if(Nit != NewRow.end())
+			Spec.Index.IndexRow(RowIndex, Nit->second);
+	}
+	for(auto &[Name, Spec] : VectorIndexes_) {
+		(void)Name;
+		if(Spec.Table != TableName)
+			continue;
+		auto Nit = NewRow.find(Spec.Column);
+		if(Nit == NewRow.end()) {
+			Spec.Index.RemoveRow(RowIndex);
+			continue;
+		}
+		const auto Vec = AdvancedTypes::ParseVectorCell(Nit->second);
+		if(Vec)
+			Spec.Index.UpsertRow(RowIndex, *Vec);
+		else
+			Spec.Index.RemoveRow(RowIndex);
+	}
+}
+
+void Database::CreateFtsIndex(const std::string &IndexName, const std::string &TableName,
+                              const std::string &ColumnName) {
+	std::scoped_lock Guard(DbMutex_);
+	if(FtsIndexes_.find(IndexName) != FtsIndexes_.end())
+		FailStorage("FTS index \"" + IndexName + "\" already exists.");
+	if(Tables_.find(TableName) == Tables_.end())
+		FailStorage("CREATE INDEX: table \"" + TableName + "\" does not exist.");
+	FtsIndexSpec Spec;
+	Spec.Table = TableName;
+	Spec.Column = ColumnName;
+	FtsIndexes_.emplace(IndexName, std::move(Spec));
+	SyncFtsIndexesForTableAssumeLocked(TableName);
+}
+
+void Database::DropFtsIndex(const std::string &IndexName, bool IfExists) {
+	std::scoped_lock Guard(DbMutex_);
+	const auto It = FtsIndexes_.find(IndexName);
+	if(It == FtsIndexes_.end()) {
+		if(!IfExists)
+			FailStorage("FTS index \"" + IndexName + "\" does not exist.");
+		return;
+	}
+	FtsIndexes_.erase(It);
+}
+
+void Database::CreateVectorIndex(const std::string &IndexName, const std::string &TableName,
+                                 const std::string &ColumnName, VectorMetric Metric) {
+	std::scoped_lock Guard(DbMutex_);
+	if(VectorIndexes_.find(IndexName) != VectorIndexes_.end())
+		FailStorage("Vector index \"" + IndexName + "\" already exists.");
+	if(Tables_.find(TableName) == Tables_.end())
+		FailStorage("CREATE INDEX: table \"" + TableName + "\" does not exist.");
+	VectorIndexSpec Spec;
+	Spec.Table = TableName;
+	Spec.Column = ColumnName;
+	Spec.Metric = Metric;
+	Spec.Index.SetMetric(Metric);
+	VectorIndexes_.emplace(IndexName, std::move(Spec));
+	SyncVectorIndexesForTableAssumeLocked(TableName);
+}
+
+void Database::DropVectorIndex(const std::string &IndexName, bool IfExists) {
+	std::scoped_lock Guard(DbMutex_);
+	const auto It = VectorIndexes_.find(IndexName);
+	if(It == VectorIndexes_.end()) {
+		if(!IfExists)
+			FailStorage("Vector index \"" + IndexName + "\" does not exist.");
+		return;
+	}
+	VectorIndexes_.erase(It);
+}
+
+void Database::DropSecondaryIndex(const std::string &IndexName, bool IfExists) {
+	std::scoped_lock Guard(DbMutex_);
+	const bool HadFts = FtsIndexes_.find(IndexName) != FtsIndexes_.end();
+	const bool HadVec = VectorIndexes_.find(IndexName) != VectorIndexes_.end();
+	if(!HadFts && !HadVec) {
+		if(!IfExists)
+			FailStorage("Index \"" + IndexName + "\" does not exist.");
+		return;
+	}
+	if(HadFts)
+		FtsIndexes_.erase(IndexName);
+	if(HadVec)
+		VectorIndexes_.erase(IndexName);
+}
+
+const TextIndex *Database::FtsForColumn(const std::string &TableName, const std::string &ColumnName) const {
+	for(const auto &[Name, Spec] : FtsIndexes_) {
+		(void)Name;
+		if(Spec.Table == TableName && Spec.Column == ColumnName)
+			return &Spec.Index;
+	}
+	return nullptr;
+}
+
+std::vector<size_t> Database::VectorTopKAssumeDbMutexHeld(const std::string &IndexName,
+                                                          const std::vector<double> &Query, std::size_t K) const {
+	const auto It = VectorIndexes_.find(IndexName);
+	if(It == VectorIndexes_.end())
+		return {};
+	return It->second.Index.TopK(Query, K);
+}
+
+std::vector<size_t> Database::VectorTopK(const std::string &IndexName, const std::vector<double> &Query,
+                                         std::size_t K) const {
+	std::scoped_lock Guard(DbMutex_);
+	return VectorTopKAssumeDbMutexHeld(IndexName, Query, K);
 }
 
 }

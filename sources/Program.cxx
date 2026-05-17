@@ -1,6 +1,10 @@
 #include <SQL/SQL.hxx>
 #include <SQL/BytecodeInterpreter.hxx>
 #include <SQL/Bytecode.hxx>
+#include <SQL/BytecodeFormat.hxx>
+#include <SQL/BytecodeInspect.hxx>
+#include <SQL/BytecodeDebug.hxx>
+#include <SQL/BytecodeProcedures.hxx>
 #include <IO/Logger.hxx>
 #include <IO/Error.hxx>
 #include <Database/Database.hxx>
@@ -35,123 +39,113 @@ std::string ReadFile(const std::string& Path) {
 	return Contents;
 }
 
-// Helper function to serialize bytecode
-void SerializeBytecode(const AstralDB::SQL::Bytecode& Code, const std::string& Path) {
-	std::ofstream Out(Path, std::ios::binary);
-	if (!Out) {
-		throw std::runtime_error(
-		    AstralDB::Err::Prefixed("CLI", "Cannot open bytecode output file for write: " + Path));
-	}
-
-	// Write version header
-	const uint32_t Version = 1;
-	Out.write(reinterpret_cast<const char*>(&Version), sizeof(Version));
-
-	// Write number of instructions
-	const uint32_t NumInstructions = static_cast<uint32_t>(Code.size());
-	Out.write(reinterpret_cast<const char*>(&NumInstructions), sizeof(NumInstructions));
-
-	// Write each instruction
-	for (const auto& Inst : Code) {
-		// Write opcode
-		const uint8_t Opcode = static_cast<uint8_t>(Inst.Opcode);
-		Out.write(reinterpret_cast<const char*>(&Opcode), sizeof(Opcode));
-
-		// Write number of operands
-		const uint32_t NumOperands = static_cast<uint32_t>(Inst.Operands.size());
-		Out.write(reinterpret_cast<const char*>(&NumOperands), sizeof(NumOperands));
-
-		// Write each operand
-		for (const auto& Operand : Inst.Operands) {
-			std::visit([&Out](const auto& Value) {
-				using T = std::decay_t<decltype(Value)>;
-				if constexpr (std::is_same_v<T, int64_t>) {
-					const uint8_t Type = 0;
-					Out.write(reinterpret_cast<const char*>(&Type), sizeof(Type));
-					Out.write(reinterpret_cast<const char*>(&Value), sizeof(Value));
-				} else if constexpr (std::is_same_v<T, std::string>) {
-					const uint8_t Type = 1;
-					Out.write(reinterpret_cast<const char*>(&Type), sizeof(Type));
-					const uint32_t Length = static_cast<uint32_t>(Value.length());
-					Out.write(reinterpret_cast<const char*>(&Length), sizeof(Length));
-					Out.write(Value.c_str(), Length);
-				}
-			}, Operand);
-		}
-	}
-}
-
-// Helper function to deserialize bytecode
-AstralDB::SQL::Bytecode DeserializeBytecode(const std::string& Path) {
-	std::ifstream In(Path, std::ios::binary);
-	if (!In) {
-		throw std::runtime_error(
-		    AstralDB::Err::Prefixed("CLI", "Cannot open bytecode input file: " + Path));
-	}
-
-	// Read version header
-	uint32_t Version;
-	In.read(reinterpret_cast<char*>(&Version), sizeof(Version));
-	if (Version != 1) {
-		throw std::runtime_error(AstralDB::Err::Prefixed(
-		    "CLI", "Unsupported bytecode file version " + std::to_string(Version) + " (expected 1)."));
-	}
-
-	// Read number of instructions
-	uint32_t NumInstructions;
-	In.read(reinterpret_cast<char*>(&NumInstructions), sizeof(NumInstructions));
-
-	AstralDB::SQL::Bytecode Code;
-	Code.reserve(NumInstructions);
-
-	// Read each instruction
-	for (uint32_t i = 0; i < NumInstructions; ++i) {
-		// Read opcode
-		uint8_t Opcode;
-		In.read(reinterpret_cast<char*>(&Opcode), sizeof(Opcode));
-
-		// Read number of operands
-		uint32_t NumOperands;
-		In.read(reinterpret_cast<char*>(&NumOperands), sizeof(NumOperands));
-
-		// Create instruction
-		AstralDB::SQL::Instruction Inst;
-		Inst.Opcode = static_cast<AstralDB::SQL::Opcode>(Opcode);
-		Inst.Operands.reserve(NumOperands);
-
-		// Read each operand
-		for (uint32_t j = 0; j < NumOperands; ++j) {
-			uint8_t Type;
-			In.read(reinterpret_cast<char*>(&Type), sizeof(Type));
-
-			if (Type == 0) { // int64_t
-				int64_t Value;
-				In.read(reinterpret_cast<char*>(&Value), sizeof(Value));
-				Inst.Operands.push_back(Value);
-			} else if (Type == 1) { // string
-				uint32_t Length;
-				In.read(reinterpret_cast<char*>(&Length), sizeof(Length));
-				std::string Value(Length, '\0');
-				In.read(&Value[0], Length);
-				Inst.Operands.push_back(Value);
-			} else {
-				throw std::runtime_error("Unknown operand type: " + std::to_string(Type));
-			}
-		}
-
-		Code.push_back(std::move(Inst));
-	}
-
-	return Code;
-}
-
 static constexpr const char* AstralDbVersionString = "1.0";
+
+struct CliBytecodeOptions {
+	bool TraceExecution = false;
+	std::size_t DebugMaxSteps = 0;
+	std::vector<std::size_t> Breakpoints;
+	std::optional<std::filesystem::path> ProcCatalog;
+	std::optional<std::string> BytecodeAspect;
+	bool CompileWithStringPool = false;
+};
+
+static bool CliArgIs(const std::string &Arg, std::initializer_list<const char *> Names) {
+	for(const char *N : Names)
+		if(Arg == N)
+			return true;
+	return false;
+}
+
+static void PrintBytecodeHelpLines() {
+	std::cout << "  Bytecode (.abc) tools (long flags; shorthands in parentheses):\n";
+	std::cout << "  --inspect-bytecode FILE (-ib)     Summary analysis\n";
+	std::cout << "  --bytecode-aspect FILE KIND (-ba) Query one aspect\n";
+	std::cout << "  --disasm-bytecode FILE (-db)      Pretty disassembly\n";
+	std::cout << "  --validate-bytecode FILE (-vb)    Structural validation\n";
+	std::cout << "  --debug-bytecode FILE (-dbg)      Execute with VM trace\n";
+	std::cout << "  --trace-bytecode (-tb)            Trace when running -fb / --proc-call\n";
+	std::cout << "  --debug-steps N (-ds)             Cap traced steps (0 = unlimited)\n";
+	std::cout << "  --breakpoint IP (-bp)             Instruction-index breakpoint\n";
+	std::cout << "  --compile-pool (-cp)              With -cc: string pool trailer\n";
+	std::cout << "  Procedures (catalog + astraldb_procs_cache/*.abc):\n";
+	std::cout << "  --proc-catalog PATH (-pc)         Registry JSON path\n";
+	std::cout << "  --proc-register NAME FILE (-pr)   Register .abc module\n";
+	std::cout << "  --proc-unregister NAME (-pu)      Remove registration\n";
+	std::cout << "  --proc-list (-pl)                 List procedures\n";
+	std::cout << "  --proc-info NAME (-pi)            Metadata + bytecode summary\n";
+	std::cout << "  --proc-call NAME (-px)            Execute registered .abc\n";
+	std::cout << "  --proc-relations (-pg)            Procedure <-> .abc relation graph\n";
+	std::cout << "  SQL: CREATE PROCEDURE n AS (…); CALL n; DROP PROCEDURE n;\n";
+}
+
+static std::filesystem::path ResolveProcCatalog(const std::filesystem::path &SessionDb,
+    const std::optional<std::filesystem::path> &Override) {
+	if(Override.has_value())
+		return *Override;
+	return AstralDB::SQL::DefaultProcedureCatalogPath(SessionDb);
+}
+
+static int RunBytecodeInspect(const std::filesystem::path &AbcPath) {
+	const auto Loaded = AstralDB::SQL::LoadAbcFile(AbcPath);
+	std::cout << AstralDB::SQL::FormatBytecodeAnalysis(AstralDB::SQL::AnalyzeBytecode(Loaded.Instructions));
+	if(!Loaded.StringPool.empty())
+		std::cout << "string_pool_entries=" << Loaded.StringPool.size() << "\n";
+	return 0;
+}
+
+static int RunBytecodeAspect(const std::filesystem::path &AbcPath, std::string_view Aspect) {
+	const auto Loaded = AstralDB::SQL::LoadAbcFile(AbcPath);
+	std::cout << AstralDB::SQL::QueryBytecodeAspect(Loaded.Instructions, Aspect);
+	return 0;
+}
+
+static int RunBytecodeDisasm(const std::filesystem::path &AbcPath) {
+	const auto Loaded = AstralDB::SQL::LoadAbcFile(AbcPath);
+	std::cout << AstralDB::SQL::DisassemblePretty(Loaded.Instructions);
+	return 0;
+}
+
+static int RunBytecodeValidate(const std::filesystem::path &AbcPath) {
+	const auto Loaded = AstralDB::SQL::LoadAbcFile(AbcPath);
+	const auto Report = AstralDB::SQL::ValidateBytecode(Loaded.Instructions);
+	for(const auto &W : Report.Warnings)
+		std::cerr << "warning: " << W << "\n";
+	for(const auto &E : Report.Errors)
+		std::cerr << "error: " << E << "\n";
+	return Report.Ok ? 0 : 2;
+}
+
+static void ExecuteBytecodeWithOptions(AstralDB::SQL::BytecodeInterpreter &Interpreter,
+    const AstralDB::SQL::Bytecode &Code, const std::vector<std::string> *Pool,
+    const CliBytecodeOptions &BcOpts, AstralDB::Logger *Logger) {
+	std::unique_ptr<AstralDB::SQL::VmDebugSession> Session;
+	if(BcOpts.TraceExecution || BcOpts.DebugMaxSteps > 0 || !BcOpts.Breakpoints.empty()) {
+		AstralDB::SQL::VmDebugConfig Cfg;
+		Cfg.TraceToStderr = true;
+		Cfg.MaxTraceSteps = BcOpts.DebugMaxSteps;
+		Cfg.BreakpointIps = BcOpts.Breakpoints;
+		Session = std::make_unique<AstralDB::SQL::VmDebugSession>(Cfg);
+		Session->AttachListener(AstralDB::SQL::MakeVmDebugListener(std::cerr, Cfg));
+		Interpreter.SetDebugSession(Session.get());
+	}
+	Interpreter.Execute(Code, Pool);
+	if(Session) {
+		const auto &Rep = Session->Report();
+		if(Logger && (BcOpts.TraceExecution || Rep.HaltedEarly))
+			Logger->Info("VM debug: steps=" + std::to_string(Rep.StepsExecuted) +
+			             " halted_early=" + (Rep.HaltedEarly ? "yes" : "no"));
+		if(Rep.HaltedEarly && !Rep.HaltReason.empty())
+			std::cerr << "[debug] halted: " << Rep.HaltReason << " at ip=" << Rep.HaltedAtIp << "\n";
+		Interpreter.SetDebugSession(nullptr);
+	}
+}
 
 static void ApplyCliGlobalFlags(int Argc, char** Argv, bool& Verbose, std::string& LogFile,
     AstralDB::SQL::OptimizationLevel& OptLevel, bool& MemoryOnly, std::string& CompileOut,
     std::filesystem::path *DatabasePathOpt, bool *DatabasePathProvided,
     std::optional<std::string> *CliUserOut, std::optional<std::string> *CliPasswordOut,
-    std::optional<std::filesystem::path> *AuditFileOut) {
+    std::optional<std::filesystem::path> *AuditFileOut, CliBytecodeOptions *BcOpts) {
 	for(int I = 1; I < Argc; ++I) {
 		const std::string Arg(Argv[I]);
 		if(Arg == "-V" || Arg == "--verbose")
@@ -197,6 +191,25 @@ static void ApplyCliGlobalFlags(int Argc, char** Argv, bool& Verbose, std::strin
 				*AuditFileOut = std::filesystem::path(Argv[++I]);
 			else
 				throw std::runtime_error("No path provided after --audit-file");
+		} else if(BcOpts && CliArgIs(Arg, {"--trace-bytecode", "-tb"}))
+			BcOpts->TraceExecution = true;
+		else if(BcOpts && CliArgIs(Arg, {"--compile-pool", "-cp"}))
+			BcOpts->CompileWithStringPool = true;
+		else if(BcOpts && CliArgIs(Arg, {"--debug-steps", "-ds"})) {
+			if(I + 1 < Argc)
+				BcOpts->DebugMaxSteps = static_cast<std::size_t>(std::stoull(Argv[++I]));
+			else
+				throw std::runtime_error("No count after --debug-steps / -ds");
+		} else if(BcOpts && CliArgIs(Arg, {"--breakpoint", "-bp"})) {
+			if(I + 1 < Argc)
+				BcOpts->Breakpoints.push_back(static_cast<std::size_t>(std::stoull(Argv[++I])));
+			else
+				throw std::runtime_error("No instruction index after --breakpoint / -bp");
+		} else if(BcOpts && CliArgIs(Arg, {"--proc-catalog", "-pc"})) {
+			if(I + 1 < Argc)
+				BcOpts->ProcCatalog = std::filesystem::path(Argv[++I]);
+			else
+				throw std::runtime_error("No path after --proc-catalog / -pc");
 		}
 	}
 }
@@ -326,7 +339,7 @@ void RunREPL(AstralDB::Logger& Logger, const std::filesystem::path& SessionDbPat
 			Interpreter.Execute(Code);
 
 			if (Logger.IsVerbose()) {
-				std::cout << "Executed bytecode:\n" << AstralDB::SQL::Disassemble(Code) << "\n";
+				std::cout << "Executed bytecode:\n" << AstralDB::SQL::DisassemblePretty(Code) << "\n";
 			}
 		} catch (const std::exception& e) {
 			AstralDB::Err::PrintCliError(std::cerr, e.what());
@@ -349,8 +362,9 @@ int main(int Argc, char** Argv) {
 		std::optional<std::string> CliUser;
 		std::optional<std::string> CliPassword;
 		std::optional<std::filesystem::path> CliAuditFile;
+		CliBytecodeOptions BcOpts;
 		ApplyCliGlobalFlags(Argc, Argv, Verbose, LogFile, OptLevel, MemoryOnly, CompileOut, &CliDbPath,
-		                    &DbFromCli, &CliUser, &CliPassword, &CliAuditFile);
+		                    &DbFromCli, &CliUser, &CliPassword, &CliAuditFile, &BcOpts);
 
 		Logger = std::make_unique<AstralDB::Logger>(LogFile, Verbose);
 		AstralDB::SQL::SetParserDiagnostics(Verbose);
@@ -393,6 +407,7 @@ int main(int Argc, char** Argv) {
 				std::cout << "  -O1                     Basic optimizations (default)\n";
 				std::cout << "  -O2                     Advanced optimizations\n";
 				std::cout << "  -O3                     Aggressive optimizations\n";
+				PrintBytecodeHelpLines();
 				return 0;
 			}
 			if(Arg == "-v" || Arg == "--version") {
@@ -438,6 +453,151 @@ int main(int Argc, char** Argv) {
 			}
 			if(Arg == "-O0" || Arg == "-O1" || Arg == "-O2" || Arg == "-O3")
 				continue;
+			if(CliArgIs(Arg, {"--trace-bytecode", "-tb", "--compile-pool", "-cp"}))
+				continue;
+			if(CliArgIs(Arg, {"--debug-steps", "-ds", "--breakpoint", "-bp", "--proc-catalog", "-pc"})) {
+				if(I + 1 < Argc)
+					++I;
+				continue;
+			}
+			if(CliArgIs(Arg, {"--inspect-bytecode", "-ib", "--inspect-bc"})) {
+				if(I + 1 < Argc)
+					return RunBytecodeInspect(Argv[++I]);
+				throw std::runtime_error("No file after --inspect-bytecode / -ib");
+			}
+			if(CliArgIs(Arg, {"--bytecode-aspect", "-ba"})) {
+				if(I + 2 < Argc) {
+					const std::filesystem::path Abc = Argv[++I];
+					const std::string Aspect = Argv[++I];
+					return RunBytecodeAspect(Abc, Aspect);
+				}
+				throw std::runtime_error("--bytecode-aspect / -ba needs FILE and ASPECT");
+			}
+			if(CliArgIs(Arg, {"--disasm-bytecode", "-db", "--dasm-bc"})) {
+				if(I + 1 < Argc)
+					return RunBytecodeDisasm(Argv[++I]);
+				throw std::runtime_error("No file after --disasm-bytecode / -db");
+			}
+			if(CliArgIs(Arg, {"--validate-bytecode", "-vb"})) {
+				if(I + 1 < Argc)
+					return RunBytecodeValidate(Argv[++I]);
+				throw std::runtime_error("No file after --validate-bytecode / -vb");
+			}
+			if(CliArgIs(Arg, {"--debug-bytecode", "-dbg", "-dbc"})) {
+				if(I + 1 < Argc) {
+					const auto Loaded = AstralDB::SQL::LoadAbcFile(Argv[++I]);
+					BcOpts.TraceExecution = true;
+					AstralDB::SQL::BytecodeInterpreter Interpreter(Logger.get());
+					Interpreter.DatabasePath(SessionDbPath);
+					Interpreter.EnsurePrimaryDatabaseOpened();
+					ApplyCliSessionAuth(Interpreter.PrimaryDatabase(), CliUser, CliPassword);
+					ApplyCliAuditLog(Interpreter.PrimaryDatabase(), CliAuditFile);
+					const std::vector<std::string> *Pool =
+					    Loaded.StringPool.empty() ? nullptr : &Loaded.StringPool;
+					ExecuteBytecodeWithOptions(Interpreter, Loaded.Instructions, Pool, BcOpts, Logger.get());
+					return 0;
+				}
+				throw std::runtime_error("No file after --debug-bytecode / -dbg");
+			}
+			if(CliArgIs(Arg, {"--proc-relations", "-pg", "--proc-graph"})) {
+				auto Catalog = AstralDB::SQL::LoadProcedureCatalog(
+				    ResolveProcCatalog(SessionDbPath, BcOpts.ProcCatalog));
+				if(Catalog.CatalogPath.empty())
+					Catalog.CatalogPath = ResolveProcCatalog(SessionDbPath, BcOpts.ProcCatalog);
+				AstralDB::SQL::RebuildProcedureRelations(Catalog);
+				std::cout << AstralDB::SQL::FormatProcedureRelations(Catalog);
+				return 0;
+			}
+			if(CliArgIs(Arg, {"--proc-list", "-pl"})) {
+				const auto Catalog = AstralDB::SQL::LoadProcedureCatalog(
+				    ResolveProcCatalog(SessionDbPath, BcOpts.ProcCatalog));
+				if(Catalog.Procedures.empty()) {
+					std::cout << "(no procedures registered)\n";
+					return 0;
+				}
+				for(const auto &P : Catalog.Procedures) {
+					std::cout << P.Name << "\tabc=" << P.AbcPath.string();
+					if(!P.DependsOn.empty()) {
+						std::cout << "\tdepends=";
+						for(std::size_t D = 0; D < P.DependsOn.size(); ++D) {
+							if(D)
+								std::cout << ",";
+							std::cout << P.DependsOn[D];
+						}
+					}
+					if(!P.Description.empty())
+						std::cout << "\t" << P.Description;
+					std::cout << "\n";
+				}
+				return 0;
+			}
+			if(CliArgIs(Arg, {"--proc-register", "-pr"})) {
+				if(I + 2 < Argc) {
+					const std::string Name = Argv[++I];
+					const std::filesystem::path Abc = Argv[++I];
+					auto Catalog = AstralDB::SQL::LoadProcedureCatalog(
+					    ResolveProcCatalog(SessionDbPath, BcOpts.ProcCatalog));
+					if(Catalog.CatalogPath.empty())
+						Catalog.CatalogPath = ResolveProcCatalog(SessionDbPath, BcOpts.ProcCatalog);
+					AstralDB::SQL::RegisterProcedure(Catalog, Name, Abc);
+					AstralDB::SQL::SaveProcedureCatalog(Catalog);
+					std::cout << "Registered procedure \"" << Name << "\" -> " << Abc.string() << "\n";
+					return 0;
+				}
+				throw std::runtime_error("--proc-register / -pr needs NAME and FILE");
+			}
+			if(CliArgIs(Arg, {"--proc-unregister", "-pu"})) {
+				if(I + 1 < Argc) {
+					const std::string Name = Argv[++I];
+					auto Catalog = AstralDB::SQL::LoadProcedureCatalog(
+					    ResolveProcCatalog(SessionDbPath, BcOpts.ProcCatalog));
+					if(!AstralDB::SQL::UnregisterProcedure(Catalog, Name))
+						throw std::runtime_error("Procedure not found: " + Name);
+					AstralDB::SQL::SaveProcedureCatalog(Catalog);
+					std::cout << "Unregistered procedure \"" << Name << "\"\n";
+					return 0;
+				}
+				throw std::runtime_error("No name after --proc-unregister / -pu");
+			}
+			if(CliArgIs(Arg, {"--proc-info", "-pi"})) {
+				if(I + 1 < Argc) {
+					const std::string Name = Argv[++I];
+					const auto Catalog = AstralDB::SQL::LoadProcedureCatalog(
+					    ResolveProcCatalog(SessionDbPath, BcOpts.ProcCatalog));
+					const auto Entry = AstralDB::SQL::FindProcedure(Catalog, Name);
+					if(!Entry)
+						throw std::runtime_error("Procedure not found: " + Name);
+					std::cout << AstralDB::SQL::FormatProcedureEntrySummary(*Entry);
+					const auto Loaded = AstralDB::SQL::LoadProcedureBytecode(*Entry, Catalog);
+					std::cout << AstralDB::SQL::FormatBytecodeAnalysis(
+					    AstralDB::SQL::AnalyzeBytecode(Loaded.Instructions));
+					return 0;
+				}
+				throw std::runtime_error("No name after --proc-info / -pi");
+			}
+			if(CliArgIs(Arg, {"--proc-call", "-px"})) {
+				if(I + 1 < Argc) {
+					const std::string Name = Argv[++I];
+					const auto Catalog = AstralDB::SQL::LoadProcedureCatalog(
+					    ResolveProcCatalog(SessionDbPath, BcOpts.ProcCatalog));
+					const auto Entry = AstralDB::SQL::FindProcedure(Catalog, Name);
+					if(!Entry)
+						throw std::runtime_error("Procedure not found: " + Name);
+					const auto Loaded = AstralDB::SQL::LoadProcedureBytecode(*Entry, Catalog);
+					AstralDB::SQL::BytecodeInterpreter Interpreter(Logger.get());
+					Interpreter.DatabasePath(SessionDbPath);
+					Interpreter.EnsurePrimaryDatabaseOpened();
+					ApplyCliSessionAuth(Interpreter.PrimaryDatabase(), CliUser, CliPassword);
+					ApplyCliAuditLog(Interpreter.PrimaryDatabase(), CliAuditFile);
+					const std::vector<std::string> *Pool =
+					    Loaded.StringPool.empty() ? nullptr : &Loaded.StringPool;
+					ExecuteBytecodeWithOptions(Interpreter, Loaded.Instructions, Pool, BcOpts, Logger.get());
+					if(Verbose)
+						std::cout << AstralDB::SQL::DisassemblePretty(Loaded.Instructions) << "\n";
+					return 0;
+				}
+				throw std::runtime_error("No name after --proc-call / -px");
+			}
 			if(Arg == "--export-bundle") {
 				if(I + 1 >= Argc)
 					throw std::runtime_error("No path after --export-bundle");
@@ -505,7 +665,7 @@ int main(int Argc, char** Argv) {
 					    AstralDB::SQL::BuildBytecode(Logger.get(), OptLevel, Interpreter.PrimaryDatabase());
 					Interpreter.Execute(Code);
 					if(Verbose)
-						std::cout << "Executed bytecode:\n" << AstralDB::SQL::Disassemble(Code) << "\n";
+						std::cout << "Executed bytecode:\n" << AstralDB::SQL::DisassemblePretty(Code) << "\n";
 					return 0;
 				}
 				throw std::runtime_error("No query provided after -q/--query");
@@ -532,7 +692,7 @@ int main(int Argc, char** Argv) {
 					    AstralDB::SQL::BuildBytecode(Logger.get(), OptLevel, Interpreter.PrimaryDatabase());
 					Interpreter.Execute(Code);
 					if(Verbose)
-						std::cout << "Executed bytecode:\n" << AstralDB::SQL::Disassemble(Code) << "\n";
+						std::cout << "Executed bytecode:\n" << AstralDB::SQL::DisassemblePretty(Code) << "\n";
 					return 0;
 				}
 				throw std::runtime_error("No file provided after -s");
@@ -568,15 +728,18 @@ int main(int Argc, char** Argv) {
 			}
 			if(Arg == "-fb" || Arg == "--from-bytecode") {
 				if(I + 1 < Argc) {
-					AstralDB::SQL::Bytecode Code = DeserializeBytecode(Argv[++I]);
+					const auto Loaded = AstralDB::SQL::LoadAbcFile(Argv[++I]);
 					AstralDB::SQL::BytecodeInterpreter Interpreter(Logger.get());
 					Interpreter.DatabasePath(SessionDbPath);
 					Interpreter.EnsurePrimaryDatabaseOpened();
 					ApplyCliSessionAuth(Interpreter.PrimaryDatabase(), CliUser, CliPassword);
 					ApplyCliAuditLog(Interpreter.PrimaryDatabase(), CliAuditFile);
-					Interpreter.Execute(Code);
+					const std::vector<std::string> *Pool =
+					    Loaded.StringPool.empty() ? nullptr : &Loaded.StringPool;
+					ExecuteBytecodeWithOptions(Interpreter, Loaded.Instructions, Pool, BcOpts, Logger.get());
 					if(Verbose)
-						std::cout << "Executed bytecode:\n" << AstralDB::SQL::Disassemble(Code) << "\n";
+						std::cout << "Executed bytecode:\n"
+						          << AstralDB::SQL::DisassemblePretty(Loaded.Instructions) << "\n";
 					return 0;
 				}
 				throw std::runtime_error("No file provided after -fb/--from-bytecode");
@@ -585,8 +748,14 @@ int main(int Argc, char** Argv) {
 				if(I + 1 < Argc) {
 					std::string Query = ReadFile(Argv[++I]);
 					AstralDB::SQL::Parser Parser(Query);
-					AstralDB::SQL::Bytecode Code = AstralDB::SQL::BuildBytecode(Logger.get(), OptLevel);
-					SerializeBytecode(Code, CompileOut);
+					if(BcOpts.CompileWithStringPool) {
+						const auto Compiled =
+						    AstralDB::SQL::BuildCompiledBytecode(Logger.get(), OptLevel);
+						AstralDB::SQL::SaveAbcFile(CompileOut, Compiled);
+					} else {
+						AstralDB::SQL::Bytecode Code = AstralDB::SQL::BuildBytecode(Logger.get(), OptLevel);
+						AstralDB::SQL::SaveAbcFile(CompileOut, Code);
+					}
 					std::cout << "Bytecode written to " << CompileOut << "\n";
 					return 0;
 				}
@@ -604,7 +773,7 @@ int main(int Argc, char** Argv) {
 				    AstralDB::SQL::BuildBytecode(Logger.get(), OptLevel, Interpreter.PrimaryDatabase());
 				Interpreter.Execute(Code);
 				if(Verbose)
-					std::cout << "Executed bytecode:\n" << AstralDB::SQL::Disassemble(Code) << "\n";
+					std::cout << "Executed bytecode:\n" << AstralDB::SQL::DisassemblePretty(Code) << "\n";
 				return 0;
 			}
 		}
