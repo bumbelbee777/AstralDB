@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Union
 
 from quasar.client import AstralDBClient, QueryResult
+from quasar.paths import path_key
 from quasar.errors import QuasarOverloadError
 from quasar.mvcc import MvccConfig, is_write_sql, prepare_read_sql
 from quasar.recovery import RetryPolicy, RetryStats, execute_with_retry, rollback_database
@@ -96,7 +97,7 @@ class PooledAstralDBClient(AstralDBClient):
         }
 
     def _db_semaphore(self, database: Path) -> threading.Semaphore:
-        key = str(database.resolve())
+        key = path_key(database)
         with self._db_slot_lock:
             if key not in self._db_slots:
                 n = max(1, int(self.pool_config.per_db_max_inflight))
@@ -167,7 +168,7 @@ class PooledAstralDBClient(AstralDBClient):
                 if bucket:
                     break
                 return
-            key = str(item.database.resolve())
+            key = path_key(item.database)
             bucket.setdefault(key, []).append(item)
             if sum(len(v) for v in bucket.values()) >= self.pool_config.batch_max_statements:
                 break
@@ -252,7 +253,7 @@ class PooledAstralDBClient(AstralDBClient):
 
     def warm(self, databases: Sequence[PathLike]) -> None:
         for db in databases:
-            key = str(Path(db).resolve())
+            key = path_key(db)
             with self._warm_lock:
                 if key in self._warmed:
                     continue

@@ -151,6 +151,21 @@ enum class Opcode : uint8_t {
 	VACUUM,
 	/** Operands: table name. */
 	REPACK_CONCURRENTLY,
+	/** Operands: graph name, vertex table, vertex id col, edge table, src col, dst col, label col, weight col,
+	 *  undirected (0/1). */
+	GRAPH_REGISTER,
+	/** Operands: graph name. */
+	GRAPH_DROP,
+	/** Operands: graph name, start id, max depth, mode (0=BFS,1=DFS), result table. */
+	GRAPH_TRAVERSE,
+	/** Operands: graph, label filter, result, min hops, max hops, anchor from, reverse (0/1). */
+	GRAPH_MATCH,
+	/** Operands: graph, from id, to id, weighted (0/1), result table. */
+	GRAPH_SHORTEST_PATH,
+	/** Operands: graph, damping_millis, iterations, result table. */
+	GRAPH_PAGERANK,
+	/** Operands: projection name, base graph, edge label filter. */
+	GRAPH_REGISTER_PROJECTION,
 };
 
 using Value = std::variant<int64_t, double, std::string>;
@@ -208,6 +223,13 @@ struct Instruction {
 			case Opcode::DROP_DATASET:
 			case Opcode::VACUUM:
 			case Opcode::REPACK_CONCURRENTLY:
+			case Opcode::GRAPH_REGISTER:
+			case Opcode::GRAPH_DROP:
+			case Opcode::GRAPH_TRAVERSE:
+			case Opcode::GRAPH_MATCH:
+			case Opcode::GRAPH_SHORTEST_PATH:
+			case Opcode::GRAPH_PAGERANK:
+			case Opcode::GRAPH_REGISTER_PROJECTION:
             case Opcode::DELETE:
             case Opcode::UPDATE:
             case Opcode::KEEP_ROWS:

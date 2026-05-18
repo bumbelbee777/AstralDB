@@ -111,8 +111,7 @@ class QuasarAutoscale:
     def __init__(self, cluster: "QuasarCluster", config: AutoscaleConfig) -> None:
         self.cluster = cluster
         self.config = config
-        base = cluster.config_path.parent if cluster.config_path else Path.cwd()
-        self.state_file = base / config.state_file
+        self.state_file = Path(config.state_file)
         self._state = self._load_state()
 
     def _load_state(self) -> Dict[str, Any]:
@@ -289,7 +288,7 @@ class QuasarAutoscale:
 
         warmed: List[str] = []
         for entry in added:
-            db = (base / entry["database"]).resolve()
+            db = Path(entry["database"])
             db.parent.mkdir(parents=True, exist_ok=True)
             try:
                 self.cluster.client.query("SELECT 1;", database=db, immediate=True)

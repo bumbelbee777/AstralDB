@@ -11,18 +11,18 @@ if(-not $SqlPath) {
 }
 if(-not $AstralDbExe) {
 	$candidates = @(
-		(Join-Path $Root "bin\AstralDB.exe"),
-		(Join-Path $Root "bin\astraldb_cli.exe"),
 		(Join-Path $Root "bin\astraldb.exe"),
 		(Join-Path $Root "bin\astraldb"),
-		(Join-Path $Root "build-cmake\Release\astraldb_cli.exe"),
-		(Join-Path $Root "build-cmake\Release\astraldb.exe")
+		(Join-Path $Root "bin\AstralDB.exe"),
+		(Join-Path $Root "build\Release\astraldb.exe"),
+		(Join-Path $Root "build-cmake\Release\astraldb.exe"),
+		(Join-Path $Root "build-ci\astraldb.exe")
 	)
 	foreach($p in $candidates) {
 		if(Test-Path -LiteralPath $p) { $AstralDbExe = $p; break }
 	}
 	if(-not $AstralDbExe) {
-		Write-Error "Build AstralDB first (looked for AstralDB.exe / astraldb_cli.exe under bin\ or build-cmake\Release\ under $Root)."
+		Write-Error "Build AstralDB first (looked for astraldb.exe under bin\, build\Release\, build-cmake\Release\, or build-ci\ under $Root)."
 	}
 }
 $SqlPath = (Resolve-Path -LiteralPath $SqlPath).Path

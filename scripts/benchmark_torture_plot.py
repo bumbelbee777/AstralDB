@@ -22,8 +22,8 @@ missing or the server is unreachable, that engine is skipped (median None). Use
 
 Use ``--skip-duckdb`` / ``--skip-sqlite`` to omit embedded engines.
 
-Executable resolution (Windows): ``bin/AstralDB.exe``, ``bin/astraldb_cli.exe``,
-``bin/astraldb.exe``, then ``bin/astraldb``.
+Executable resolution (Windows): ``bin/astraldb.exe``, ``bin/AstralDB.exe`` (legacy),
+then ``build-cmake/Release/astraldb.exe``.
 """
 
 from __future__ import annotations
@@ -430,19 +430,18 @@ def resolve_astral_executable(repo_root: Path) -> Optional[Path]:
     candidates: list[Path] = []
     if platform.system() == "Windows":
         candidates = [
-            bin_dir / "AstralDB.exe",
-            bin_dir / "astraldb_cli.exe",
             bin_dir / "astraldb.exe",
             bin_dir / "astraldb",
-            cmake_release / "astraldb_cli.exe",
+            bin_dir / "AstralDB.exe",
             cmake_release / "astraldb.exe",
+            repo_root / "build-ci" / "astraldb.exe",
         ]
     else:
         candidates = [
-            bin_dir / "astraldb_cli",
             bin_dir / "astraldb",
             bin_dir / "AstralDB",
-            repo_root / "build-cmake" / "astraldb_cli",
+            repo_root / "build-cmake" / "astraldb",
+            repo_root / "build-ci" / "astraldb",
         ]
     for p in candidates:
         if p.is_file():
@@ -506,7 +505,7 @@ def main() -> int:
     if astral is None:
         print(
             "No AstralDB executable found under bin/ "
-            "(expected AstralDB.exe, astraldb_cli.exe, or astraldb). "
+            "(expected astraldb or AstralDB.exe under bin/). "
             "Pass --astral PATH.",
             file=sys.stderr,
         )

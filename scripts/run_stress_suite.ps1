@@ -21,9 +21,9 @@ $Map = @{
 if(-not $AstralDbExe) {
 	$candidates = @(
 		(Join-Path $Root "bin\astraldb.exe"),
-		(Join-Path $Root "bin\astraldb_cli.exe"),
-		(Join-Path $Root "build-cmake\Release\astraldb_cli.exe"),
-		(Join-Path $Root "build-cmake\Release\astraldb.exe")
+		(Join-Path $Root "build\Release\astraldb.exe"),
+		(Join-Path $Root "build-cmake\Release\astraldb.exe"),
+		(Join-Path $Root "build-ci\astraldb.exe")
 	)
 	foreach($p in $candidates) {
 		if(Test-Path -LiteralPath $p) { $AstralDbExe = $p; break }

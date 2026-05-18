@@ -35,6 +35,14 @@ struct Limits {
 	static constexpr std::size_t MaxScalarSqlFuncArgs = 16ULL;
 	/** \c WITH RECURSIVE fixpoint iterations (row-growth rounds) per CTE. */
 	static constexpr std::uint64_t MaxCteRecursionDepth = 1'000'000ULL;
+	/** \c GRAPH TRAVERSE maximum hop depth per query. */
+	static constexpr std::uint64_t MaxGraphTraverseDepth = 64ULL;
+	/** Variable-length \c GRAPH MATCH without \c FROM : max distinct source vertices. */
+	static constexpr std::size_t MaxGraphVarLenSourceVertices = 4096ULL;
+	/** Cap rows materialized by one variable-length \c GRAPH MATCH . */
+	static constexpr std::uint64_t MaxGraphVarLenResultRows = 2'000'000ULL;
+	/** \c GRAPH PAGERANK power-iteration cap per statement. */
+	static constexpr std::uint64_t MaxGraphPageRankIterations = 10'000ULL;
 };
 
 } // namespace AstralDB

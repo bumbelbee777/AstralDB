@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
 from quasar.errors import QuasarSecurityError
+from quasar.paths import resolve_cluster_path, resolve_path_under_base
 
 PathLike = Union[str, Path]
 
@@ -111,48 +112,6 @@ def validate_executable(path: Path) -> Path:
     if os.access(resolved, os.X_OK) is False and os.name != "nt":
         raise SecurityError(f"executable not executable: {resolved}")
     return resolved
-
-
-def resolve_cluster_path(
-    base: Optional[Path],
-    value: str,
-    *,
-    allow_outside: bool = False,
-) -> Path:
-    """Resolve a cluster path; enforce containment only when base is set (config file)."""
-    if base is None:
-        if not value or not isinstance(value, str):
-            raise SecurityError("path must be a non-empty string")
-        if "\x00" in value:
-            raise SecurityError("path contains null bytes")
-        target = Path(value)
-        return (target if target.is_absolute() else (Path.cwd() / target)).resolve()
-    return resolve_path_under_base(base, value, allow_outside=allow_outside)
-
-
-def resolve_path_under_base(
-    base: Path,
-    value: str,
-    *,
-    allow_outside: bool = False,
-) -> Path:
-    """Resolve relative paths and reject traversal outside config root."""
-    if not value or not isinstance(value, str):
-        raise SecurityError("path must be a non-empty string")
-    if "\x00" in value:
-        raise SecurityError("path contains null bytes")
-    base = base.resolve()
-    target = Path(value)
-    if not target.is_absolute():
-        target = (base / target).resolve()
-    else:
-        target = target.resolve()
-    if not allow_outside:
-        try:
-            target.relative_to(base)
-        except ValueError:
-            raise SecurityError(f"path escapes config directory: {value}") from None
-    return target
 
 
 def load_json_config_file(path: Path, policy: Optional[SecurityPolicy] = None) -> Dict[str, Any]:

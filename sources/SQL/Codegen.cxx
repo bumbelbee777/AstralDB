@@ -1,4 +1,5 @@
 #include <SQL/Bytecode.hxx>
+#include <SQL/GraphOptimizer.hxx>
 #include <SQL/SetExprEval.hxx>
 #include <Database/MathSci.hxx>
 #include <SQL/SQL.hxx>
@@ -1447,6 +1448,45 @@ void DropDatasetAST::EmitBytecode(BytecodeScratch &Instructions) const {
 	AppendInstruction(Instructions, MakeInstruction(Opcode::DROP_DATASET, DatasetName));
 }
 
+void CreateGraphAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions,
+	                  MakeInstruction(Opcode::GRAPH_REGISTER, GraphName, VertexTable, VertexIdCol, EdgeTable,
+	                                  EdgeSrcCol, EdgeDstCol, EdgeLabelCol, EdgeWeightCol,
+	                                  static_cast<int64_t>(Undirected ? 1 : 0)));
+}
+
+void CreateGraphProjectionAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions, MakeInstruction(Opcode::GRAPH_REGISTER_PROJECTION, ProjectionName,
+	                                                BaseGraphName, EdgeLabelFilter));
+}
+
+void DropGraphAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions, MakeInstruction(Opcode::GRAPH_DROP, GraphName));
+}
+
+void GraphTraverseAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions,
+	                  MakeInstruction(Opcode::GRAPH_TRAVERSE, GraphName, StartVertexId, MaxDepth, Mode,
+	                                  ResultTable));
+}
+
+void GraphMatchAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions,
+	                  MakeInstruction(Opcode::GRAPH_MATCH, GraphName, EdgeLabelFilter, ResultTable, MinHops, MaxHops,
+	                                  AnchorVertexId, static_cast<int64_t>(Reverse ? 1 : 0)));
+}
+
+void GraphShortestPathAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions,
+	                  MakeInstruction(Opcode::GRAPH_SHORTEST_PATH, GraphName, FromVertexId, ToVertexId,
+	                                  static_cast<int64_t>(Weighted ? 1 : 0), ResultTable));
+}
+
+void GraphPageRankAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions,
+	                  MakeInstruction(Opcode::GRAPH_PAGERANK, GraphName, DampingMillis, Iterations, ResultTable));
+}
+
 void CreateIndexAST::EmitBytecode(BytecodeScratch &Instructions) const {
 	AppendInstruction(Instructions,
 	                  MakeInstruction(Opcode::CREATE_INDEX, IndexName, TableName, ColumnName,
@@ -1531,7 +1571,9 @@ Bytecode BuildBytecode(Logger *Logger, OptimizationLevel OptLevel, const AstralD
 		}
 	}
 
+	RunGraphOptimizerPipeline(Result, OptLevel, Logger);
 	RunOptimizerPipeline(Result, OptLevel, Logger);
+	RunGraphOptimizerPipeline(Result, OptLevel, Logger);
 
 	if(Logger)
 		Logger->Info("Bytecode build complete with " + std::to_string(Result.size()) + " instructions");

@@ -33,8 +33,8 @@ def test_load_resolves_relative_paths(tmp_path: Path):
     (tmp_path / "data").mkdir()
     config_path.write_text(json.dumps(cfg), encoding="utf-8")
     loaded = load_cluster_config(config_path)
-    assert loaded["shards"][0]["database"].endswith("data/s0.db".replace("/", "\\")) or "data" in loaded["shards"][0]["database"]
-    assert "backups" in loaded["backup_dir"]
+    assert loaded["shards"][0]["database"].endswith("data/s0.db")
+    assert loaded["backup_dir"].endswith("backups")
 
 
 def test_backup_prune_dry_run(tmp_path: Path):

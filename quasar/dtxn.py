@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Set, TYPE_CHECKING
 
 from quasar.client import AstralDBClient, QueryResult
 from quasar.quasar import ShardNode
+from quasar.paths import coerce_path, path_for_config, resolve_path
 from quasar.security import atomic_write_json
 from quasar.xtxn import CrossShardTxnResult, TxnStatement
 
@@ -47,11 +48,12 @@ class DistributedTxnConfig:
             return cls(enabled=False)
         wal = str(raw.get("wal_file", ".quasar/dtxn/wal.jsonl"))
         part_dir = str(raw.get("participant_log_dir", ".quasar/dtxn/participants"))
-        if base:
-            if not Path(wal).is_absolute():
-                wal = str((base / wal).resolve())
-            if not Path(part_dir).is_absolute():
-                part_dir = str((base / part_dir).resolve())
+        if base is not None:
+            wal = path_for_config(resolve_path(wal, base=base))
+            part_dir = path_for_config(resolve_path(part_dir, base=base))
+        else:
+            wal = path_for_config(coerce_path(wal))
+            part_dir = path_for_config(coerce_path(part_dir))
         return cls(
             enabled=bool(raw.get("enabled", True)),
             wal_file=wal,

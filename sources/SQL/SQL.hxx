@@ -1020,6 +1020,97 @@ struct DropDatasetAST : public StatementAST {
 	void EmitBytecode(BytecodeScratch &Instructions) const override;
 };
 
+struct CreateGraphAST : public StatementAST {
+	std::string GraphName;
+	std::string VertexTable;
+	std::string VertexIdCol;
+	std::string EdgeTable;
+	std::string EdgeSrcCol;
+	std::string EdgeDstCol;
+	std::string EdgeLabelCol;
+	std::string EdgeWeightCol;
+	bool Undirected = false;
+
+	CreateGraphAST(std::string Name, std::string VtxTbl, std::string VtxId, std::string EdgeTbl, std::string Src,
+	               std::string Dst, std::string Label = std::string(), std::string Weight = std::string(),
+	               bool UndirectedIn = false)
+	    : GraphName(std::move(Name)), VertexTable(std::move(VtxTbl)), VertexIdCol(std::move(VtxId)),
+	      EdgeTable(std::move(EdgeTbl)), EdgeSrcCol(std::move(Src)), EdgeDstCol(std::move(Dst)),
+	      EdgeLabelCol(std::move(Label)), EdgeWeightCol(std::move(Weight)), Undirected(UndirectedIn) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
+struct CreateGraphProjectionAST : public StatementAST {
+	std::string ProjectionName;
+	std::string BaseGraphName;
+	std::string EdgeLabelFilter;
+
+	CreateGraphProjectionAST(std::string Proj, std::string Base, std::string Filter)
+	    : ProjectionName(std::move(Proj)), BaseGraphName(std::move(Base)), EdgeLabelFilter(std::move(Filter)) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
+struct DropGraphAST : public StatementAST {
+	std::string GraphName;
+
+	explicit DropGraphAST(std::string Name) : GraphName(std::move(Name)) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
+struct GraphTraverseAST : public StatementAST {
+	std::string GraphName;
+	std::string StartVertexId;
+	int64_t MaxDepth = 1;
+	/** 0 = BFS, 1 = DFS */
+	int64_t Mode = 0;
+	std::string ResultTable;
+
+	GraphTraverseAST(std::string Graph, std::string Start, int64_t Depth, int64_t ModeIn, std::string Result)
+	    : GraphName(std::move(Graph)), StartVertexId(std::move(Start)), MaxDepth(Depth), Mode(ModeIn),
+	      ResultTable(std::move(Result)) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
+struct GraphMatchAST : public StatementAST {
+	std::string GraphName;
+	std::string EdgeLabelFilter;
+	int64_t MinHops = 1;
+	int64_t MaxHops = 1;
+	std::string AnchorVertexId;
+	bool Reverse = false;
+	std::string ResultTable;
+
+	GraphMatchAST(std::string Graph, std::string LabelFilter, int64_t MinH, int64_t MaxH, std::string Anchor,
+	              bool ReverseIn, std::string Result)
+	    : GraphName(std::move(Graph)), EdgeLabelFilter(std::move(LabelFilter)), MinHops(MinH), MaxHops(MaxH),
+	      AnchorVertexId(std::move(Anchor)), Reverse(ReverseIn), ResultTable(std::move(Result)) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
+struct GraphShortestPathAST : public StatementAST {
+	std::string GraphName;
+	std::string FromVertexId;
+	std::string ToVertexId;
+	bool Weighted = false;
+	std::string ResultTable;
+
+	GraphShortestPathAST(std::string Graph, std::string From, std::string To, bool WeightedIn, std::string Result)
+	    : GraphName(std::move(Graph)), FromVertexId(std::move(From)), ToVertexId(std::move(To)), Weighted(WeightedIn),
+	      ResultTable(std::move(Result)) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
+struct GraphPageRankAST : public StatementAST {
+	std::string GraphName;
+	int64_t DampingMillis = 850;
+	int64_t Iterations = 20;
+	std::string ResultTable;
+
+	GraphPageRankAST(std::string Graph, int64_t Damping, int64_t Iter, std::string Result)
+	    : GraphName(std::move(Graph)), DampingMillis(Damping), Iterations(Iter), ResultTable(std::move(Result)) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
 struct CreateIndexAST : public StatementAST {
 	std::string IndexName;
 	std::string TableName;
@@ -1209,6 +1300,10 @@ public:
 	std::unique_ptr<ExpressionAST> ParseStandalonePredicateExpression();
 
     std::unique_ptr<StatementAST> ParseStatement();
+	std::unique_ptr<StatementAST> ParseGraphStatement();
+	std::unique_ptr<StatementAST> ParseCreateGraphStatement();
+	std::unique_ptr<StatementAST> ParseCreateGraphProjectionStatement();
+	std::unique_ptr<StatementAST> ParseCypherMatchStatement();
 
     void DumpTokens() const;
 

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
+from quasar.paths import coerce_path, path_for_config, resolve_path
 from quasar.security import atomic_write_json
 
 if TYPE_CHECKING:
@@ -33,8 +34,10 @@ class ConsensusConfig:
         if not members:
             members = ("local",)
         state_dir = str(raw.get("state_dir", ".quasar/consensus"))
-        if base and not Path(state_dir).is_absolute():
-            state_dir = str((base / state_dir).resolve())
+        if base is not None:
+            state_dir = path_for_config(resolve_path(state_dir, base=base))
+        else:
+            state_dir = path_for_config(coerce_path(state_dir))
         return cls(
             enabled=bool(raw.get("enabled", False)),
             members=members,

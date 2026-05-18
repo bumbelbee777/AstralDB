@@ -9,13 +9,14 @@
 #include <Database/AdvancedTypes.hxx>
 #include <Database/MathSci.hxx>
 #include <SQL/JsonSql.hxx>
-#include <DS/JSONCodec.hxx>
+#include <DS/JSON.hxx>
 #include <SQL/MatchRecognize.hxx>
 #include <SQL/TextSearch.hxx>
 #include <Database/TextIndex.hxx>
 #include <IO/MathUtil.hxx>
 #include <Database/ColumnarStorage.hxx>
 #include <Database/Dataset.hxx>
+#include <Database/Graph.hxx>
 #include <Database/Database.hxx>
 #include <Database/Superfetch.hxx>
 #include <Database/TimeSeries.hxx>
@@ -2450,6 +2451,156 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             ++Ic;
             break;
         }
+		case Opcode::GRAPH_REGISTER: {
+			if(inst.Operands.size() != 9)
+				FailVm("GRAPH_REGISTER expects nine operands");
+			const auto *Gn = std::get_if<std::string>(&inst.Operands[0]);
+			const auto *Vt = std::get_if<std::string>(&inst.Operands[1]);
+			const auto *Vid = std::get_if<std::string>(&inst.Operands[2]);
+			const auto *Et = std::get_if<std::string>(&inst.Operands[3]);
+			const auto *Src = std::get_if<std::string>(&inst.Operands[4]);
+			const auto *Dst = std::get_if<std::string>(&inst.Operands[5]);
+			const auto *Lbl = std::get_if<std::string>(&inst.Operands[6]);
+			const auto *Wt = std::get_if<std::string>(&inst.Operands[7]);
+			const auto *Und = std::get_if<int64_t>(&inst.Operands[8]);
+			if(!Gn || !Vt || !Vid || !Et || !Src || !Dst || !Lbl || !Wt || !Und)
+				FailVm("GRAPH_REGISTER operand types");
+			if(Databases_.empty())
+				Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+			GraphSpec Spec;
+			Spec.Name = *Gn;
+			Spec.VertexTable = *Vt;
+			Spec.VertexIdCol = *Vid;
+			Spec.EdgeTable = *Et;
+			Spec.EdgeSrcCol = *Src;
+			Spec.EdgeDstCol = *Dst;
+			Spec.EdgeLabelCol = *Lbl;
+			Spec.EdgeWeightCol = *Wt;
+			Spec.Undirected = *Und != 0;
+			Databases_[0]->RegisterGraph(std::move(Spec));
+			++Ic;
+			break;
+		}
+		case Opcode::GRAPH_REGISTER_PROJECTION: {
+			if(inst.Operands.size() != 3)
+				FailVm("GRAPH_REGISTER_PROJECTION expects three operands");
+			const auto *Pn = std::get_if<std::string>(&inst.Operands[0]);
+			const auto *Bn = std::get_if<std::string>(&inst.Operands[1]);
+			const auto *Fl = std::get_if<std::string>(&inst.Operands[2]);
+			if(!Pn || !Bn || !Fl)
+				FailVm("GRAPH_REGISTER_PROJECTION operand types");
+			if(Databases_.empty())
+				Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+			GraphProjectionRequest Req;
+			Req.ProjectionName = *Pn;
+			Req.BaseGraphName = *Bn;
+			Req.EdgeLabelFilter = *Fl;
+			Databases_[0]->RegisterGraphProjection(Req);
+			++Ic;
+			break;
+		}
+		case Opcode::GRAPH_DROP: {
+			if(inst.Operands.size() != 1)
+				FailVm("GRAPH_DROP expects graph name");
+			const auto *Gn = std::get_if<std::string>(&inst.Operands[0]);
+			if(!Gn)
+				FailVm("GRAPH_DROP operand types");
+			if(Databases_.empty())
+				Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+			Databases_[0]->DropGraph(*Gn);
+			++Ic;
+			break;
+		}
+		case Opcode::GRAPH_TRAVERSE: {
+			if(inst.Operands.size() != 5)
+				FailVm("GRAPH_TRAVERSE expects five operands");
+			const auto *Gn = std::get_if<std::string>(&inst.Operands[0]);
+			const auto *Start = std::get_if<std::string>(&inst.Operands[1]);
+			const auto *Depth = std::get_if<int64_t>(&inst.Operands[2]);
+			const auto *Mode = std::get_if<int64_t>(&inst.Operands[3]);
+			const auto *Result = std::get_if<std::string>(&inst.Operands[4]);
+			if(!Gn || !Start || !Depth || !Mode || !Result)
+				FailVm("GRAPH_TRAVERSE operand types");
+			if(Databases_.empty())
+				Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+			GraphTraverseRequest Req;
+			Req.GraphName = *Gn;
+			Req.StartVertexId = *Start;
+			Req.MaxDepth = *Depth;
+			Req.Mode = *Mode != 0 ? GraphTraverseMode::Dfs : GraphTraverseMode::Bfs;
+			Req.ResultTable = *Result;
+			Databases_[0]->GraphTraverse(Req);
+			++Ic;
+			break;
+		}
+		case Opcode::GRAPH_MATCH: {
+			if(inst.Operands.size() != 7)
+				FailVm("GRAPH_MATCH expects seven operands");
+			const auto *Gn = std::get_if<std::string>(&inst.Operands[0]);
+			const auto *Filter = std::get_if<std::string>(&inst.Operands[1]);
+			const auto *Result = std::get_if<std::string>(&inst.Operands[2]);
+			const auto *MinH = std::get_if<int64_t>(&inst.Operands[3]);
+			const auto *MaxH = std::get_if<int64_t>(&inst.Operands[4]);
+			const auto *Anchor = std::get_if<std::string>(&inst.Operands[5]);
+			const auto *Rev = std::get_if<int64_t>(&inst.Operands[6]);
+			if(!Gn || !Filter || !Result || !MinH || !MaxH || !Anchor || !Rev)
+				FailVm("GRAPH_MATCH operand types");
+			if(Databases_.empty())
+				Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+			GraphMatchRequest Req;
+			Req.GraphName = *Gn;
+			Req.EdgeLabelFilter = *Filter;
+			Req.ResultTable = *Result;
+			Req.MinHops = *MinH;
+			Req.MaxHops = *MaxH;
+			Req.AnchorVertexId = *Anchor;
+			Req.Reverse = *Rev != 0;
+			Databases_[0]->GraphMatch(Req);
+			++Ic;
+			break;
+		}
+		case Opcode::GRAPH_SHORTEST_PATH: {
+			if(inst.Operands.size() != 5)
+				FailVm("GRAPH_SHORTEST_PATH expects five operands");
+			const auto *Gn = std::get_if<std::string>(&inst.Operands[0]);
+			const auto *Fr = std::get_if<std::string>(&inst.Operands[1]);
+			const auto *To = std::get_if<std::string>(&inst.Operands[2]);
+			const auto *Wt = std::get_if<int64_t>(&inst.Operands[3]);
+			const auto *Result = std::get_if<std::string>(&inst.Operands[4]);
+			if(!Gn || !Fr || !To || !Wt || !Result)
+				FailVm("GRAPH_SHORTEST_PATH operand types");
+			if(Databases_.empty())
+				Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+			GraphShortestPathRequest Req;
+			Req.GraphName = *Gn;
+			Req.FromVertexId = *Fr;
+			Req.ToVertexId = *To;
+			Req.Weighted = *Wt != 0;
+			Req.ResultTable = *Result;
+			Databases_[0]->GraphShortestPath(Req);
+			++Ic;
+			break;
+		}
+		case Opcode::GRAPH_PAGERANK: {
+			if(inst.Operands.size() != 4)
+				FailVm("GRAPH_PAGERANK expects four operands");
+			const auto *Gn = std::get_if<std::string>(&inst.Operands[0]);
+			const auto *Damp = std::get_if<int64_t>(&inst.Operands[1]);
+			const auto *Iter = std::get_if<int64_t>(&inst.Operands[2]);
+			const auto *Result = std::get_if<std::string>(&inst.Operands[3]);
+			if(!Gn || !Damp || !Iter || !Result)
+				FailVm("GRAPH_PAGERANK operand types");
+			if(Databases_.empty())
+				Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+			GraphPageRankRequest Req;
+			Req.GraphName = *Gn;
+			Req.DampingMillis = *Damp;
+			Req.Iterations = *Iter;
+			Req.ResultTable = *Result;
+			Databases_[0]->GraphPageRank(Req);
+			++Ic;
+			break;
+		}
         case Opcode::UPSERT: {
             if(inst.Operands.size() < 5)
                 FailVm("UPSERT malformed operands");

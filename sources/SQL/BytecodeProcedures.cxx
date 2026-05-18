@@ -1,7 +1,7 @@
 #include <SQL/BytecodeProcedures.hxx>
 #include <SQL/BytecodeInspect.hxx>
 #include <SQL/SQL.hxx>
-#include <DS/JSONCodec.hxx>
+#include <DS/JSON.hxx>
 #include <Database/Database.hxx>
 #include <IO/Error.hxx>
 #include <algorithm>

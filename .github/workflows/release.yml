@@ -27,8 +27,8 @@ jobs:
               cmake -S . -B build-ci
               -G Ninja
               -DCMAKE_BUILD_TYPE=Release
-            build: cmake --build build-ci --target astraldb_cli
-            binary: build-ci/astraldb_cli
+            build: cmake --build build-ci --target astraldb
+            binary: build-ci/astraldb
 
           - name: windows-amd64
             os: windows-latest
@@ -38,8 +38,8 @@ jobs:
               -G Ninja
               -DCMAKE_BUILD_TYPE=Release
               -DCMAKE_CXX_COMPILER=clang++
-            build: cmake --build build-ci --target astraldb_cli
-            binary: build-ci/astraldb_cli.exe
+            build: cmake --build build-ci --target astraldb
+            binary: build-ci/astraldb.exe
 
     steps:
       - name: Checkout

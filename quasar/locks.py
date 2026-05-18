@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Generator, Iterable, List, Optional, Union
 
 from quasar.errors import QuasarLockError
+from quasar.paths import path_key
 
 PathLike = Union[str, Path]
 
@@ -98,7 +99,7 @@ def lock_databases(
     timeout_sec: float = 0.0,
 ) -> Generator[None, None, None]:
     """Acquire locks for multiple DB paths in sorted order (deadlock avoidance)."""
-    unique = sorted({Path(p).resolve() for p in paths}, key=lambda p: str(p))
+    unique = sorted({Path(p).resolve() for p in paths}, key=path_key)
     locks = [DatabaseLock(p, timeout_sec=timeout_sec) for p in unique]
     acquired: List[DatabaseLock] = []
     try:

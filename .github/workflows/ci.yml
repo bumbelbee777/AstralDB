@@ -31,7 +31,8 @@ jobs:
               -DCMAKE_CXX_COMPILER=g++
             build: cmake --build build-ci
             test: ctest --test-dir build-ci --output-on-failure
-            cli: build-ci/astraldb_cli
+            cli: build-ci/astraldb
+            artifact: astraldb-linux-amd64
 
           - name: Linux (Clang)
             os: ubuntu-24.04
@@ -42,7 +43,8 @@ jobs:
               -DCMAKE_CXX_COMPILER=clang++-18
             build: cmake --build build-ci
             test: ctest --test-dir build-ci --output-on-failure
-            cli: build-ci/astraldb_cli
+            cli: build-ci/astraldb
+            artifact: astraldb-linux-amd64-clang
 
           - name: Windows (Clang)
             os: windows-latest
@@ -53,7 +55,8 @@ jobs:
               -DCMAKE_CXX_COMPILER=clang++
             build: cmake --build build-ci
             test: ctest --test-dir build-ci --output-on-failure
-            cli: build-ci/astraldb_cli.exe
+            cli: build-ci/astraldb.exe
+            artifact: astraldb-windows-amd64
 
     steps:
       - name: Checkout
@@ -78,6 +81,13 @@ jobs:
       - name: Test
         run: ${{ matrix.test }}
 
+      - name: Upload astraldb binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.cli }}
+          if-no-files-found: error
+
       - name: Smoke-check CLI (torture_test.sql)
         shell: bash
         run: |
@@ -92,5 +102,5 @@ jobs:
       - name: Quasar unit tests
         run: |
           python -m pip install --upgrade pip
-          pip install -r quasar/requirements.txt
+          pip install -e ".[dev]"
           python -m pytest quasar/tests -q

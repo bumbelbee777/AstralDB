@@ -5,10 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+from quasar.paths import resolve_config_path
 from quasar.security import (
     SecurityPolicy,
     load_json_config_file,
-    resolve_cluster_path,
     validate_shard_name,
     validate_sql_identifier,
 )
@@ -150,7 +150,7 @@ def normalize_cluster_config(
     allow_outside = policy.allow_path_outside_config_root
 
     def _path(value: str) -> str:
-        return str(resolve_cluster_path(base, value, allow_outside=allow_outside))
+        return resolve_config_path(base, value, allow_outside=allow_outside)
 
     out: Dict[str, Any] = dict(config)
     if "security" not in out:
@@ -226,6 +226,33 @@ def normalize_cluster_config(
         pool.setdefault("read_lane_immediate", True)
         pool.setdefault("per_db_max_inflight", 2)
         pool.setdefault("keepalive_interval_sec", 0)
+
+    if "distributed_txn" in config:
+        dtxn = dict(config["distributed_txn"])
+        if "wal_file" in dtxn and isinstance(dtxn["wal_file"], str):
+            dtxn["wal_file"] = _path(dtxn["wal_file"])
+        if "participant_log_dir" in dtxn and isinstance(dtxn["participant_log_dir"], str):
+            dtxn["participant_log_dir"] = _path(dtxn["participant_log_dir"])
+        out["distributed_txn"] = dtxn
+
+    if "consensus" in config:
+        consensus = dict(config["consensus"])
+        if "state_dir" in consensus and isinstance(consensus["state_dir"], str):
+            consensus["state_dir"] = _path(consensus["state_dir"])
+        out["consensus"] = consensus
+
+    if "financial" in config:
+        financial = dict(config["financial"])
+        for key in ("journal_file", "idempotency_dir", "saga_state_dir"):
+            if key in financial and isinstance(financial[key], str):
+                financial[key] = _path(financial[key])
+        out["financial"] = financial
+
+    if "autoscaling" in config:
+        autoscale = dict(config["autoscaling"])
+        if "state_file" in autoscale and isinstance(autoscale["state_file"], str):
+            autoscale["state_file"] = _path(autoscale["state_file"])
+        out["autoscaling"] = autoscale
 
     return out
 

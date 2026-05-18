@@ -3,6 +3,7 @@
 #include <Database/WriteAheadLog.hxx>
 #include <Database/HybridStorageScheduler.hxx>
 #include <Database/Dataset.hxx>
+#include <Database/Graph.hxx>
 #include <Database/HybridTable.hxx>
 #include <Database/Superfetch.hxx>
 #include <IO/Limits.hxx>
@@ -74,7 +75,19 @@ struct MergeInsertCell {
 	std::string ValueExpr;
 };
 
+void RegisterGraphCatalogEntryAssumeLocked(Database &Db, GraphSpec Spec);
+void InstallGraphCatalogAssumeLocked(Database &Db, std::vector<GraphSpec> Specs);
+void ReplayWalGraphRegisterAssumeLocked(Database &Db, GraphSpec Spec);
+void ReplayWalGraphDropAssumeLocked(Database &Db, const std::string &Name);
+void ReplayWalGraphProjectionAssumeLocked(Database &Db, const GraphProjectionRequest &Req);
+
 class Database {
+	friend void RegisterGraphCatalogEntryAssumeLocked(Database &Db, GraphSpec Spec);
+	friend void InstallGraphCatalogAssumeLocked(Database &Db, std::vector<GraphSpec> Specs);
+	friend void ReplayWalGraphRegisterAssumeLocked(Database &Db, GraphSpec Spec);
+	friend void ReplayWalGraphDropAssumeLocked(Database &Db, const std::string &Name);
+	friend void ReplayWalGraphProjectionAssumeLocked(Database &Db, const GraphProjectionRequest &Req);
+
 public:
 	struct Column {
 		std::string Name;
@@ -127,6 +140,12 @@ private:
 	std::unordered_map<std::string, std::string> ProcedureDefinitionSql_;
 	std::unordered_map<std::string, SequenceState> Sequences_;
 	std::unordered_map<std::string, DatasetCatalog> Datasets_;
+	/** Named graphs: spec + prebuilt out-adjacency for fast traversals. */
+	std::unordered_map<std::string, std::pair<GraphSpec, GraphAdjacency>> Graphs_;
+	/** Edge table name → graph names that use it (incremental adjacency updates). */
+	std::unordered_map<std::string, std::vector<std::string>> GraphsByEdgeTable_;
+	/** Base graph name → projection graph names derived from it. */
+	std::unordered_map<std::string, std::vector<std::string>> GraphProjectionsByBase_;
 
     std::atomic<bool> Dirty_;
 	std::atomic<bool> WalSuspended_{false};
@@ -181,6 +200,7 @@ private:
 	void SyncFtsIndexesForTableAssumeLocked(const std::string &TableName);
 	void SyncVectorIndexesForTableAssumeLocked(const std::string &TableName);
 	void OnRowInsertedAssumeLocked(const std::string &TableName, size_t RowIndex, const Item &Row);
+	void OnGraphEdgeInsertedAssumeLocked(const std::string &EdgeTable, const Item &Row);
 	void OnRowUpdatedAssumeLocked(const std::string &TableName, size_t RowIndex, const Item &OldRow, const Item &NewRow);
 
 	bool AclEnforcementActiveAssumeLocked() const;
@@ -251,6 +271,17 @@ public:
 	void DropDataset(const std::string &Name);
 	/** \p VersionId 0 loads the latest version; otherwise the matching snapshot is used. */
 	void LoadDatasetInto(const std::string &Name, const std::string &TargetTable, int64_t VersionId = 0);
+	void RegisterGraph(GraphSpec Spec);
+	void RegisterGraphProjection(const GraphProjectionRequest &Req);
+	void DropGraph(const std::string &Name);
+	const GraphSpec *GraphByName(const std::string &Name) const;
+	const GraphAdjacency *GraphAdjacencyByName(const std::string &Name) const;
+	void GraphTraverse(const GraphTraverseRequest &Req);
+	void GraphMatch(const GraphMatchRequest &Req);
+	void GraphShortestPath(const GraphShortestPathRequest &Req);
+	void GraphPageRank(const GraphPageRankRequest &Req);
+	/** Replace \p TableName with \p Schema and \p Rows under one lock (graph result materialization). */
+	void ReplaceTableContents(const std::string &TableName, const Schema &Schema, Table Rows);
 	/** Compact storage, rebuild columnar replicas, sync main file, truncate WAL. */
 	void Vacuum(const std::string &TableName = std::string());
 	/** Online repack: build shadow table and swap under brief exclusive lock. */
@@ -403,5 +434,11 @@ public:
 	void ReplayWalAddForeignKey(const std::string &TableName, ForeignKey Key);
 	void ReplayWalCreateSequence(const std::string &Name, int64_t Start, int64_t Increment);
 	void ReplayWalDropSequence(const std::string &Name);
+	void ReplayWalGraphRegister(GraphSpec Spec);
+	void ReplayWalGraphDrop(const std::string &Name);
+	void ReplayWalGraphProjection(const GraphProjectionRequest &Req);
+	void AppendWalAfterGraphRegister(const GraphSpec &Spec);
+	void AppendWalAfterGraphDrop(const std::string &Name);
+	void AppendWalAfterGraphProjection(const GraphProjectionRequest &Req);
 };
 }

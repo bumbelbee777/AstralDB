@@ -10,7 +10,7 @@
 
 | | |
 |---|---|
-| **Release `astraldb.exe`** | **~1.5 MB** (Windows Release; CMake `astraldb_cli` ~2.0 MB) |
+| **Release `astraldb.exe`** | **~1.5 MB** (Windows Release; CMake target `astraldb` ~2.0 MB) |
 | **Core sources** | ~27k lines across ~85 source files |
 | **Contract tests** | **103+** doctest cases |
 | **Example SQL harness** | **31+** `examples/*.sql` scripts (parse → compile → run in CI) |
@@ -33,9 +33,11 @@ See [`docs/Overview.md`](docs/Overview.md) for the full contract.
 
 [**Quasar**](docs/Quasar.md) (v1.0) wraps the same `astraldb` executable for **multi-file deployments**: **sharding**, **pooled/batched** high-QPS access, **cross-shard transactions**, **multi-region** replication, multi-master, failover, rebalancing, cross-shard JOIN, and an optional **HTTP gateway**.
 
+**Linux / macOS:**
+
 ```bash
-pip install -r quasar/requirements.txt
-export QUASAR_ASTRALDB=build-ci/astraldb_cli    # Windows: astraldb_cli.exe
+pip install -e ".[dev]"
+export QUASAR_ASTRALDB=build-ci/astraldb
 
 python -m quasar init ./cluster
 python -m quasar health ./cluster/cluster.json
@@ -46,7 +48,22 @@ python -m quasar drift ./cluster/cluster.json
 python -m quasar batch ./cluster/cluster.json quasar/examples/batch.example.sql
 ```
 
-Quasar batches many queries into shared `astraldb` subprocesses by default (`pool.enabled`). It does **not** add a network server inside the engine. See [`docs/Quasar.md`](docs/Quasar.md) for cross-shard transactions, multi-region, and **caveats** (best-effort 2PC, async geo-replication).
+**Windows (PowerShell):**
+
+```powershell
+pip install -e ".[dev]"
+$env:QUASAR_ASTRALDB = "build-ci\astraldb.exe"   # or build\Release\astraldb.exe
+
+python -m quasar init .\cluster
+python -m quasar health .\cluster\cluster.json
+python -m quasar shard .\cluster\cluster.json "SELECT 1;" --shard-key tenant:acme
+```
+
+Quasar batches many queries into shared `astraldb` subprocesses by default (`pool.enabled`). It does **not** add a network server inside the engine.
+
+**Paths:** `python -m quasar init` writes relative paths with forward slashes (`data/shard0.db`). On load, Quasar resolves them to absolute paths under the config directory and normalizes nested paths (`.quasar/…`, backups, dtxn WAL). You can use forward slashes in hand-edited `cluster.json` on Windows; avoid unescaped backslashes in JSON. Set `QUASAR_ASTRALDB` to your built CLI (`astraldb` / `astraldb.exe`).
+
+See [`docs/Quasar.md`](docs/Quasar.md) for cross-shard transactions, multi-region, gateway auth, and **caveats** (best-effort 2PC, async geo-replication).
 
 ## Memory guards (spike-aware, near-zero steady-state cost)
 

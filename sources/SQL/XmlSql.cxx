@@ -1,6 +1,6 @@
 #include <SQL/XmlSql.hxx>
 
-#include <DS/XMLCodec.hxx>
+#include <DS/XML.hxx>
 
 namespace AstralDB {
 namespace SQL {

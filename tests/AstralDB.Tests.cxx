@@ -2651,6 +2651,157 @@ TEST_CASE("GeoSpatial: terrain point and DEM sample") {
 	REQUIRE(*Elev == AstralTest::Approx(7.5).epsilon(0.01));
 }
 
+TEST_CASE("GQL graph: analytics shortest path PageRank projection varlen") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	const std::string Script = ReadExampleFile(RepoRoot() / "examples" / "graph_analytics.sql");
+	REQUIRE(!Script.empty());
+	fs::path Dir = UniqueTempDir("astral_gql2_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "gql2.log").string(), false);
+	AstralDB::SQL::Parser P(Script);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::Basic);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	REQUIRE(AllRows(Db, "paths_1_3").size() >= 3);
+	const auto Route = AllRows(Db, "route");
+	REQUIRE(!Route.empty());
+	REQUIRE(Route.front().at("found") == "1");
+	REQUIRE(AllRows(Db, "ranks").size() == 5);
+}
+
+TEST_CASE("GQL graph: social BFS reach and finance labeled match") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_graph_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "graph.log").string(), false);
+	const char *Social =
+	    "CREATE TABLE users (id INT, name TEXT); CREATE TABLE follows (src INT, dst INT); "
+	    "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol'), (4, 'Dave'); "
+	    "INSERT INTO follows VALUES (1, 2), (1, 3), (2, 4), (3, 4); "
+	    "CREATE GRAPH social VERTEX TABLE users (id) EDGE TABLE follows (src, dst); "
+	    "GRAPH MATCH (a)-[e]->(b) IN social INTO all_edges; "
+	    "GRAPH TRAVERSE FROM 1 IN social DEPTH 3 BFS INTO reach_alice;";
+	AstralDB::SQL::Parser P(Social);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::Basic);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	REQUIRE(AllRows(Db, "all_edges").size() == 4);
+	const auto Reach = AllRows(Db, "reach_alice");
+	REQUIRE(Reach.size() == 4);
+	std::set<std::string> Seen;
+	for(const auto &Row : Reach) {
+		auto It = Row.find("vertex_id");
+		REQUIRE(It != Row.end());
+		Seen.insert(It->second);
+	}
+	REQUIRE(Seen.count("1"));
+	REQUIRE(Seen.count("2"));
+	REQUIRE(Seen.count("3"));
+	REQUIRE(Seen.count("4"));
+
+	fs::path DirFin = UniqueTempDir("astral_graph_fin_");
+	ScopedCwd CwdFin(DirFin);
+	RemoveEphemeralDb(DirFin);
+	AstralDB::Logger LogFin((DirFin / "graph_fin.log").string(), false);
+	const char *Finance =
+	    "CREATE TABLE accounts (id INT, name TEXT); "
+	    "CREATE TABLE transfers (src INT, dst INT, kind TEXT, amount INT); "
+	    "INSERT INTO accounts VALUES (100, 'Treasury'), (101, 'Alice'), (102, 'Bob'), (103, 'Carol'); "
+	    "INSERT INTO transfers VALUES (100, 101, 'fund', 5000), (101, 102, 'payment', 120), "
+	    "(102, 103, 'payment', 80), (103, 101, 'payment', 40); "
+	    "CREATE GRAPH ledger VERTEX TABLE accounts (id) EDGE TABLE transfers (src, dst, kind); "
+	    "GRAPH MATCH (a)-[e]->(b) IN ledger WHERE e.kind = 'payment' INTO payments; "
+	    "GRAPH TRAVERSE FROM 101 IN ledger DEPTH 4 DFS INTO from_alice;";
+	AstralDB::SQL::Parser P2(Finance);
+	AstralDB::SQL::Bytecode Code2 =
+	    AstralDB::SQL::BuildBytecode(&LogFin, AstralDB::SQL::OptimizationLevel::Basic);
+	AstralDB::SQL::BytecodeInterpreter I2(&LogFin);
+	REQUIRE_NOTHROW(I2.Execute(Code2));
+	REQUIRE(I2.PrimaryDatabase() != nullptr);
+	REQUIRE(AllRows(I2.PrimaryDatabase(), "payments").size() == 3);
+	REQUIRE(AllRows(I2.PrimaryDatabase(), "from_alice").size() >= 3);
+}
+
+TEST_CASE("GQL graph: Cypher MATCH syntax") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	const std::string Script = ReadExampleFile(RepoRoot() / "examples" / "graph_cypher.sql");
+	REQUIRE(!Script.empty());
+	fs::path Dir = UniqueTempDir("astral_graph_cypher_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "cypher.log").string(), false);
+	AstralDB::SQL::Parser P(Script);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::Basic);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	REQUIRE(I.PrimaryDatabase() != nullptr);
+	REQUIRE(I.PrimaryDatabase()->GraphByName("social") != nullptr);
+	REQUIRE(AllRows(I.PrimaryDatabase(), "cypher_edges").size() == 2);
+	REQUIRE(AllRows(I.PrimaryDatabase(), "cypher_from_alice").size() == 1);
+}
+
+TEST_CASE("GQL graph: catalog persists across snapshot reopen") {
+	fs::path Dir = UniqueTempDir("astral_graph_persist_");
+	fs::path DbPath = Dir / "graph_persist.db";
+	std::error_code Ec;
+	fs::remove(DbPath, Ec);
+	fs::remove(DbPath.string() + ".wal", Ec);
+	{
+		AstralDB::Database Db(DbPath, nullptr);
+		AstralDB::Database::Schema U;
+		AstralDB::Database::Column Cu;
+		Cu.Name = "id";
+		Cu.DefaultValue = "INT";
+		Cu.IsPrimaryKey = true;
+		U.push_back(Cu);
+		Db.CreateTable("u", U).get();
+		AstralDB::Database::Schema F;
+		AstralDB::Database::Column Cs;
+		Cs.Name = "src";
+		Cs.DefaultValue = "INT";
+		AstralDB::Database::Column Cd;
+		Cd.Name = "dst";
+		Cd.DefaultValue = "INT";
+		F.push_back(Cs);
+		F.push_back(Cd);
+		Db.CreateTable("f", F).get();
+		Db.Insert("u", {{"id", "1"}}).get();
+		Db.Insert("u", {{"id", "2"}}).get();
+		Db.Insert("f", {{"src", "1"}, {"dst", "2"}}).get();
+		AstralDB::GraphSpec G;
+		G.Name = "g";
+		G.VertexTable = "u";
+		G.VertexIdCol = "id";
+		G.EdgeTable = "f";
+		G.EdgeSrcCol = "src";
+		G.EdgeDstCol = "dst";
+		Db.RegisterGraph(std::move(G));
+		REQUIRE(Db.GraphByName("g") != nullptr);
+		Db.SyncToFile();
+	}
+	{
+		AstralDB::Database Db2(DbPath, nullptr);
+		REQUIRE(Db2.GraphByName("g") != nullptr);
+		REQUIRE(Db2.GraphByName("g")->EdgeTable == "f");
+		AstralDB::GraphMatchRequest Req;
+		Req.GraphName = "g";
+		Req.MinHops = 1;
+		Req.MaxHops = 1;
+		Req.ResultTable = "again";
+		Db2.GraphMatch(Req);
+		REQUIRE(AllRows(&Db2, "again").size() == 1);
+	}
+}
+
 TEST_CASE("Dataset: versioning snapshots two generations") {
 	AstralDB::SQL::SetParserDiagnostics(false);
 	fs::path Dir = UniqueTempDir("astral_dsv_");

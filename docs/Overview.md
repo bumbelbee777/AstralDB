@@ -17,6 +17,7 @@ AstralDB targets the SQL most teams actually write today: **joins and set operat
 | **SQL-92 core** | Tables, predicates, DML, constraints | `CREATE`/`DROP TABLE`, `INSERT` (multi-row, bulk, `ON CONFLICT`), `UPDATE`/`DELETE`, `SELECT` with `WHERE`/`GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT`/`OFFSET`, joins, `UNION`/`INTERSECT`/`EXCEPT`, `CASE`/`COALESCE`/`CAST`, transactions |
 | **SQL-99 analytics** | Reporting and recursion | `WITH` / `WITH RECURSIVE`, window functions (`ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`/`LEAD`, framed aggregates), OLAP (`ROLLUP`/`CUBE`/`GROUPING SETS`, `GROUPING()`), sequences, identity columns, correlated `EXISTS` |
 | **SQL:2003+ extensions** | Temporal, semi-structured, search | `FOR SYSTEM TIME AS OF`, `MATCH_RECOGNIZE`, JSON/XML scalars, full-text `MATCH`, vector indexes, advanced cell types (`STRUCT`, `MAP`, `LIST`, `VECTOR`, …) |
+| **Graph / GQL** | Table-backed graphs + adjacency index | `CREATE GRAPH`, projections, `GRAPH MATCH` (incl. `*1..n`), `SHORTEST PATH`, `PAGERANK`, `TRAVERSE` — [`GraphGql.md`](GraphGql.md), `examples/graph_*.sql` |
 | **Operational SQL** | Durability and governance | RBAC (`GRANT`/`REVOKE`, roles), row/column grants, views, stored procedures (`.abc` cache), `EXPORT`/`IMPORT` bundles |
 
 Runnable scripts for each band live under **`examples/`** (for example **`sql92_03_coverage.sql`**, **`sql92_analytics.sql`**, **`sql99_recursive.sql`**, **`sql_olap.sql`**, **`sql_window_frames.sql`**, **`sql_merge_upsert.sql`**, **`sql_standard_features.sql`**). When this overview and the scripts disagree, **trust the scripts and tests**.
@@ -133,6 +134,7 @@ Near-term work: widen SQL coverage, harden semantics (especially `NULL` and opti
 | Topic | Location |
 |-------|----------|
 | CLI flags and examples | [`Usage.md`](Usage.md) |
+| Graph / GQL | [`GraphGql.md`](GraphGql.md) |
 | C++ conventions | [`CodingStyle.md`](CodingStyle.md) |
 | Cluster orchestration | [`Quasar.md`](Quasar.md) |
 | Runnable contract | `examples/`, `tests/` |

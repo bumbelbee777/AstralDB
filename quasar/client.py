@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Sequence, Union
 
+from quasar.paths import path_for_cli
 from quasar.security import (
     SecurityPolicy,
     redact_command,
@@ -58,16 +59,16 @@ def find_astraldb(explicit: Optional[PathLike] = None) -> Path:
     candidates: List[Path] = [
         repo_root / "bin" / "astraldb.exe",
         repo_root / "bin" / "astraldb",
-        repo_root / "build-cmake" / "Release" / "astraldb_cli.exe",
-        repo_root / "build-cmake" / "Release" / "astraldb_cli",
-        repo_root / "build-ci" / "astraldb_cli.exe",
-        repo_root / "build-ci" / "astraldb_cli",
+        repo_root / "build-cmake" / "Release" / "astraldb.exe",
+        repo_root / "build-cmake" / "Release" / "astraldb",
+        repo_root / "build-ci" / "astraldb.exe",
+        repo_root / "build-ci" / "astraldb",
     ]
     for candidate in candidates:
         if candidate.is_file():
             return validate_executable(candidate)
 
-    which = shutil.which("astraldb") or shutil.which("astraldb_cli")
+    which = shutil.which("astraldb")
     if which:
         return validate_executable(Path(which))
 
@@ -109,7 +110,7 @@ class AstralDBClient:
         cmd.extend(self.extra_args)
         if database is not None:
             db_path = Path(database).resolve()
-            cmd.extend(["--database", str(db_path)])
+            cmd.extend(["--database", path_for_cli(db_path)])
         elif memory:
             cmd.append("-m")
         if self.user:
@@ -178,7 +179,7 @@ class AstralDBClient:
         script_path = Path(path).resolve()
         if not script_path.is_file():
             raise FileNotFoundError(f"script not found: {script_path}")
-        return self.run(["-s", str(script_path)], database=database, memory=memory).raise_on_error(
+        return self.run(["-s", path_for_cli(script_path)], database=database, memory=memory).raise_on_error(
             redact_secrets=self.security.redact_secrets_in_errors
         )
 

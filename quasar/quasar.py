@@ -582,13 +582,12 @@ class QuasarCluster:
         self.reconciler: Optional[QuasarReconciler] = None
         if not self.financial.enabled:
             return
-        base = self.config_path.parent if self.config_path else Path.cwd()
-        journal_path = base / str(fin_raw.get("journal_file", ".quasar/journal.jsonl"))
+        journal_path = Path(fin_raw.get("journal_file", ".quasar/journal.jsonl"))
         self.journal = QuasarJournal(journal_path)
-        idem_dir = base / str(fin_raw.get("idempotency_dir", ".quasar/idempotency"))
+        idem_dir = Path(fin_raw.get("idempotency_dir", ".quasar/idempotency"))
         idem_cfg = IdempotencyConfig.from_config(fin_raw.get("idempotency"))
         self.idempotency = IdempotencyStore(self, idem_cfg, base_dir=idem_dir)
-        saga_dir = base / str(fin_raw.get("saga_state_dir", ".quasar/sagas"))
+        saga_dir = Path(fin_raw.get("saga_state_dir", ".quasar/sagas"))
         self.saga = QuasarSaga(self, state_dir=saga_dir, journal=self.journal)
         self.ledger = QuasarLedger(self, self.financial, saga=self.saga)
         self.reconciler = QuasarReconciler(self)
@@ -694,12 +693,7 @@ class QuasarCluster:
                 primary=Path(spec["primary"]),
                 standbys=[Path(p) for p in spec.get("standbys", [])],
             )
-        state = fo.get("state_file", ".quasar/failover.json")
-        if self.config_path:
-            base = self.config_path.parent
-            state_path = Path(state) if Path(state).is_absolute() else base / state
-        else:
-            state_path = Path(state)
+        state_path = Path(fo.get("state_file", ".quasar/failover.json"))
         policy = FailoverPolicy.from_config(fo)
         return QuasarFailover(
             self.shard,
@@ -1604,7 +1598,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--astraldb",
         type=Path,
-        help="Path to astraldb / astraldb_cli executable (or set QUASAR_ASTRALDB)",
+        help="Path to astraldb executable (or set QUASAR_ASTRALDB)",
     )
     parser.add_argument("-U", "--user", help="AstralDB user (-U)")
     parser.add_argument("-P", "--password", help="AstralDB password (-P)")

@@ -183,6 +183,8 @@ bool Parser::IsKeyword(const std::string &TokenValue) {
         "TS_COMPRESS", "TS_DECOMPRESS", "TS_COMPRESS_SERIES",
         "DATASET", "LOAD", "INTO", "VERSION", "VARIANT", "TERRAIN", "TERRAIN_POINT",
         "VACUUM", "REPACK", "CONCURRENTLY",
+        "GRAPH", "VERTEX", "EDGE", "TRAVERSE", "DEPTH", "BFS", "DFS", "PROJECTION", "SHORTEST", "PATH",
+        "PAGERANK", "DAMPING", "ITERATIONS", "WEIGHTED", "WEIGHT", "UNDIRECTED", "TO",
         "MATCH_RECOGNIZE", "MATCH", "AGAINST", "TEXT_CONTAINS", "MATCH_AGAINST", "PATTERN", "DEFINE",
         "SYSTEM", "TIME", "INDEX", "FTS", "VECTOR", "METRIC"};
     return Keywords.find(TokenValue) != Keywords.end();
@@ -1203,6 +1205,11 @@ ASTNode Parser::ParseCreateStatement() {
 		ParseSequenceOptions(Start, Increment);
 		return std::make_unique<CreateSequenceAST>(std::move(SeqName), Start, Increment, IfNotExists);
 	}
+	if(MatchKeyword("GRAPH")) {
+		if(MatchKeyword("PROJECTION"))
+			return ParseCreateGraphProjectionStatement();
+		return ParseCreateGraphStatement();
+	}
 	if(MatchKeyword("DATASET")) {
 		auto Nt = CurrentToken();
 		if(!Nt || Nt->Type != TokenType::IDENTIFIER)
@@ -1442,6 +1449,14 @@ ASTNode Parser::ParseDropStatement() {
 		std::string DsName = Nt->Value;
 		AdvanceToken();
 		return std::make_unique<DropDatasetAST>(std::move(DsName));
+	}
+	if(MatchKeyword("GRAPH")) {
+		auto Nt = CurrentToken();
+		if(!Nt || Nt->Type != TokenType::IDENTIFIER)
+			ParseFail("Expected graph name after DROP GRAPH.");
+		std::string Gn = Nt->Value;
+		AdvanceToken();
+		return std::make_unique<DropGraphAST>(std::move(Gn));
 	}
 	if(MatchKeyword("SEQUENCE")) {
 		bool IfExistsSeq = false;
@@ -3714,8 +3729,352 @@ std::unique_ptr<StatementAST> Parser::ParseRepackStatement() {
 	return std::make_unique<RepackConcurrentlyAST>(std::move(Table));
 }
 
+std::unique_ptr<StatementAST> Parser::ParseCreateGraphStatement() {
+	auto Gn = CurrentToken();
+	if(!Gn || Gn->Type != TokenType::IDENTIFIER)
+		ParseFail("Expected graph name after CREATE GRAPH.");
+	std::string GraphName = Gn->Value;
+	AdvanceToken();
+	if(!MatchKeyword("VERTEX"))
+		ParseFail("CREATE GRAPH requires VERTEX TABLE … EDGE TABLE …");
+	if(!MatchKeyword("TABLE"))
+		ParseFail("CREATE GRAPH requires VERTEX TABLE …");
+	auto Vt = CurrentToken();
+	if(!Vt || Vt->Type != TokenType::IDENTIFIER)
+		ParseFail("Expected vertex table name.");
+	std::string VertexTable = Vt->Value;
+	AdvanceToken();
+	if(!MatchToken(TokenType::PUNCTUATION, "("))
+		ParseFail("Expected '(' after vertex table name.");
+	auto Vid = CurrentToken();
+	if(!Vid || Vid->Type != TokenType::IDENTIFIER)
+		ParseFail("Expected vertex id column.");
+	std::string VertexIdCol = Vid->Value;
+	AdvanceToken();
+	if(!MatchToken(TokenType::PUNCTUATION, ")"))
+		ParseFail("Expected ')' after vertex id column.");
+	if(!MatchKeyword("EDGE"))
+		ParseFail("CREATE GRAPH requires EDGE TABLE …");
+	if(!MatchKeyword("TABLE"))
+		ParseFail("CREATE GRAPH requires EDGE TABLE …");
+	auto Et = CurrentToken();
+	if(!Et || Et->Type != TokenType::IDENTIFIER)
+		ParseFail("Expected edge table name.");
+	std::string EdgeTable = Et->Value;
+	AdvanceToken();
+	if(!MatchToken(TokenType::PUNCTUATION, "("))
+		ParseFail("Expected '(' after edge table name.");
+	auto Src = CurrentToken();
+	if(!Src || Src->Type != TokenType::IDENTIFIER)
+		ParseFail("Expected edge source column.");
+	std::string EdgeSrcCol = Src->Value;
+	AdvanceToken();
+	if(!MatchToken(TokenType::PUNCTUATION, ","))
+		ParseFail("Expected ',' between edge columns.");
+	auto Dst = CurrentToken();
+	if(!Dst || Dst->Type != TokenType::IDENTIFIER)
+		ParseFail("Expected edge destination column.");
+	std::string EdgeDstCol = Dst->Value;
+	AdvanceToken();
+	std::string EdgeLabelCol;
+	if(MatchToken(TokenType::PUNCTUATION, ",")) {
+		auto Lbl = CurrentToken();
+		if(!Lbl || Lbl->Type != TokenType::IDENTIFIER)
+			ParseFail("Expected edge label column.");
+		EdgeLabelCol = Lbl->Value;
+		AdvanceToken();
+	}
+	if(!MatchToken(TokenType::PUNCTUATION, ")"))
+		ParseFail("Expected ')' after edge columns.");
+	std::string EdgeWeightCol;
+	bool Undirected = false;
+	if(MatchKeyword("UNDIRECTED"))
+		Undirected = true;
+	if(MatchKeyword("WEIGHT")) {
+		if(!MatchToken(TokenType::PUNCTUATION, "("))
+			ParseFail("CREATE GRAPH WEIGHT expects '(' column name ')'");
+		auto Wt = CurrentToken();
+		if(!Wt || Wt->Type != TokenType::IDENTIFIER)
+			ParseFail("Expected weight column name.");
+		EdgeWeightCol = Wt->Value;
+		AdvanceToken();
+		if(!MatchToken(TokenType::PUNCTUATION, ")"))
+			ParseFail("Expected ')' after weight column.");
+	}
+	return std::make_unique<CreateGraphAST>(std::move(GraphName), std::move(VertexTable), std::move(VertexIdCol),
+	                                        std::move(EdgeTable), std::move(EdgeSrcCol), std::move(EdgeDstCol),
+	                                        std::move(EdgeLabelCol), std::move(EdgeWeightCol), Undirected);
+}
+
+std::unique_ptr<StatementAST> Parser::ParseCreateGraphProjectionStatement() {
+	auto Pn = CurrentToken();
+	if(!Pn || Pn->Type != TokenType::IDENTIFIER)
+		ParseFail("Expected projection name after CREATE GRAPH PROJECTION.");
+	std::string ProjName = Pn->Value;
+	AdvanceToken();
+	if(!MatchKeyword("FROM"))
+		ParseFail("CREATE GRAPH PROJECTION requires FROM base_graph.");
+	auto Bn = CurrentToken();
+	if(!Bn || Bn->Type != TokenType::IDENTIFIER)
+		ParseFail("Expected base graph name after FROM.");
+	std::string BaseName = Bn->Value;
+	AdvanceToken();
+	if(!MatchKeyword("EDGE"))
+		ParseFail("CREATE GRAPH PROJECTION requires EDGE WHERE …");
+	if(!MatchKeyword("WHERE"))
+		ParseFail("CREATE GRAPH PROJECTION requires EDGE WHERE edge.label = 'value'.");
+	auto Ev = CurrentToken();
+	if(!Ev || Ev->Type != TokenType::IDENTIFIER)
+		ParseFail("CREATE GRAPH PROJECTION WHERE expects edge variable.");
+	AdvanceToken();
+	if(!MatchToken(TokenType::PUNCTUATION, "."))
+		ParseFail("CREATE GRAPH PROJECTION WHERE expects edge.label = 'value'.");
+	auto Lc = CurrentToken();
+	if(!Lc || Lc->Type != TokenType::IDENTIFIER)
+		ParseFail("CREATE GRAPH PROJECTION WHERE expects label column.");
+	AdvanceToken();
+	if(!MatchToken(TokenType::PUNCTUATION, "="))
+		ParseFail("CREATE GRAPH PROJECTION WHERE expects '='.");
+	auto Lit = CurrentToken();
+	if(!Lit || Lit->Type != TokenType::LITERAL)
+		ParseFail("CREATE GRAPH PROJECTION WHERE expects string literal.");
+	std::string Filter = Lit->Value;
+	AdvanceToken();
+	return std::make_unique<CreateGraphProjectionAST>(std::move(ProjName), std::move(BaseName), std::move(Filter));
+}
+
+std::unique_ptr<StatementAST> Parser::ParseGraphStatement() {
+	AdvanceToken();
+	if(MatchKeyword("TRAVERSE")) {
+		if(!MatchKeyword("FROM"))
+			ParseFail("GRAPH TRAVERSE requires FROM start vertex.");
+		auto St = CurrentToken();
+		if(!St || (St->Type != TokenType::LITERAL && St->Type != TokenType::IDENTIFIER))
+			ParseFail("GRAPH TRAVERSE FROM expects a literal or identifier.");
+		std::string StartId = St->Value;
+		AdvanceToken();
+		if(!MatchKeyword("IN"))
+			ParseFail("GRAPH TRAVERSE requires IN graph_name.");
+		auto Gn = CurrentToken();
+		if(!Gn || Gn->Type != TokenType::IDENTIFIER)
+			ParseFail("Expected graph name after IN.");
+		std::string GraphName = Gn->Value;
+		AdvanceToken();
+		int64_t Depth = 1;
+		if(MatchKeyword("DEPTH")) {
+			auto Dt = CurrentToken();
+			if(!Dt || Dt->Type != TokenType::LITERAL)
+				ParseFail("GRAPH TRAVERSE DEPTH expects integer literal.");
+			Depth = std::stoll(Dt->Value);
+			AdvanceToken();
+		}
+		int64_t Mode = 0;
+		if(MatchKeyword("DFS"))
+			Mode = 1;
+		else
+			(void)MatchKeyword("BFS");
+		if(!MatchKeyword("INTO"))
+			ParseFail("GRAPH TRAVERSE requires INTO result_table.");
+		auto Rt = CurrentToken();
+		if(!Rt || Rt->Type != TokenType::IDENTIFIER)
+			ParseFail("Expected result table name after INTO.");
+		std::string Result = Rt->Value;
+		AdvanceToken();
+		return std::make_unique<GraphTraverseAST>(std::move(GraphName), std::move(StartId), Depth, Mode,
+		                                          std::move(Result));
+	}
+	if(MatchKeyword("SHORTEST")) {
+		if(!MatchKeyword("PATH"))
+			ParseFail("GRAPH SHORTEST PATH requires PATH keyword.");
+		if(!MatchKeyword("FROM"))
+			ParseFail("GRAPH SHORTEST PATH requires FROM vertex.");
+		auto Fr = CurrentToken();
+		if(!Fr || (Fr->Type != TokenType::LITERAL && Fr->Type != TokenType::IDENTIFIER))
+			ParseFail("GRAPH SHORTEST PATH FROM expects id literal.");
+		std::string FromId = Fr->Value;
+		AdvanceToken();
+		if(!MatchKeyword("TO"))
+			ParseFail("GRAPH SHORTEST PATH requires TO vertex.");
+		auto To = CurrentToken();
+		if(!To || (To->Type != TokenType::LITERAL && To->Type != TokenType::IDENTIFIER))
+			ParseFail("GRAPH SHORTEST PATH TO expects id literal.");
+		std::string ToId = To->Value;
+		AdvanceToken();
+		if(!MatchKeyword("IN"))
+			ParseFail("GRAPH SHORTEST PATH requires IN graph_name.");
+		auto Gn = CurrentToken();
+		if(!Gn || Gn->Type != TokenType::IDENTIFIER)
+			ParseFail("Expected graph name after IN.");
+		std::string GraphName = Gn->Value;
+		AdvanceToken();
+		bool Weighted = MatchKeyword("WEIGHTED");
+		if(!MatchKeyword("INTO"))
+			ParseFail("GRAPH SHORTEST PATH requires INTO result_table.");
+		auto Rt = CurrentToken();
+		if(!Rt || Rt->Type != TokenType::IDENTIFIER)
+			ParseFail("Expected result table name after INTO.");
+		std::string Result = Rt->Value;
+		AdvanceToken();
+		return std::make_unique<GraphShortestPathAST>(std::move(GraphName), std::move(FromId), std::move(ToId),
+		                                                Weighted, std::move(Result));
+	}
+	if(MatchKeyword("PAGERANK")) {
+		if(!MatchKeyword("IN"))
+			ParseFail("GRAPH PAGERANK requires IN graph_name.");
+		auto Gn = CurrentToken();
+		if(!Gn || Gn->Type != TokenType::IDENTIFIER)
+			ParseFail("Expected graph name after IN.");
+		std::string GraphName = Gn->Value;
+		AdvanceToken();
+		int64_t DampingMillis = 850;
+		int64_t Iterations = 20;
+		if(MatchKeyword("DAMPING")) {
+			auto Dt = CurrentToken();
+			if(!Dt || Dt->Type != TokenType::LITERAL)
+				ParseFail("GRAPH PAGERANK DAMPING expects decimal literal (e.g. 0.85).");
+			const double D = std::stod(Dt->Value);
+			DampingMillis = static_cast<int64_t>(D * 1000.0);
+			AdvanceToken();
+		}
+		if(MatchKeyword("ITERATIONS")) {
+			auto It = CurrentToken();
+			if(!It || It->Type != TokenType::LITERAL)
+				ParseFail("GRAPH PAGERANK ITERATIONS expects integer literal.");
+			Iterations = std::stoll(It->Value);
+			AdvanceToken();
+		}
+		if(!MatchKeyword("INTO"))
+			ParseFail("GRAPH PAGERANK requires INTO result_table.");
+		auto Rt = CurrentToken();
+		if(!Rt || Rt->Type != TokenType::IDENTIFIER)
+			ParseFail("Expected result table name after INTO.");
+		std::string Result = Rt->Value;
+		AdvanceToken();
+		return std::make_unique<GraphPageRankAST>(std::move(GraphName), DampingMillis, Iterations, std::move(Result));
+	}
+	if(MatchKeyword("MATCH")) {
+		if(!MatchToken(TokenType::PUNCTUATION, "("))
+			ParseFail("GRAPH MATCH expects '(' pattern.");
+		auto A = CurrentToken();
+		if(!A || A->Type != TokenType::IDENTIFIER)
+			ParseFail("GRAPH MATCH pattern expects vertex variable.");
+		AdvanceToken();
+		if(!MatchToken(TokenType::PUNCTUATION, ")"))
+			ParseFail("GRAPH MATCH pattern: expected ')' after source vertex.");
+		bool Reverse = false;
+		if(MatchToken(TokenType::PUNCTUATION, "<")) {
+			if(!MatchToken(TokenType::PUNCTUATION, "-"))
+				ParseFail("GRAPH MATCH pattern: expected '<-['.");
+			Reverse = true;
+		} else if(!MatchToken(TokenType::PUNCTUATION, "-"))
+			ParseFail("GRAPH MATCH pattern: expected '-[' or '<-['.");
+		if(!MatchToken(TokenType::PUNCTUATION, "["))
+			ParseFail("GRAPH MATCH pattern: expected '['.");
+		auto E = CurrentToken();
+		if(!E || E->Type != TokenType::IDENTIFIER)
+			ParseFail("GRAPH MATCH pattern expects edge variable.");
+		AdvanceToken();
+		int64_t MinHops = 1;
+		int64_t MaxHops = 1;
+		if(MatchToken(TokenType::PUNCTUATION, "*")) {
+			MinHops = 1;
+			MaxHops = static_cast<int64_t>(Limits::MaxGraphTraverseDepth);
+			auto Ht = CurrentToken();
+			if(Ht && Ht->Type == TokenType::LITERAL) {
+				const std::string &V = Ht->Value;
+				const size_t Dot = V.find("..");
+				if(Dot != std::string::npos) {
+					MinHops = std::stoll(V.substr(0, Dot));
+					MaxHops = std::stoll(V.substr(Dot + 2));
+				} else {
+					MinHops = std::stoll(V);
+					MaxHops = MinHops;
+				}
+				AdvanceToken();
+				if(Dot == std::string::npos && MatchToken(TokenType::PUNCTUATION, ".") &&
+				   MatchToken(TokenType::PUNCTUATION, ".")) {
+					auto Ht2 = CurrentToken();
+					if(!Ht2 || Ht2->Type != TokenType::LITERAL)
+						ParseFail("GRAPH MATCH *m..n expects max hop literal.");
+					MaxHops = std::stoll(Ht2->Value);
+					AdvanceToken();
+				}
+			}
+		}
+		if(!MatchToken(TokenType::PUNCTUATION, "]"))
+			ParseFail("GRAPH MATCH pattern: expected ']' after edge.");
+		if(Reverse) {
+			if(!MatchToken(TokenType::PUNCTUATION, "-"))
+				ParseFail("GRAPH MATCH pattern: expected '-'.");
+		} else {
+			if(!MatchToken(TokenType::PUNCTUATION, "-"))
+				ParseFail("GRAPH MATCH pattern: expected '->'.");
+			if(!MatchToken(TokenType::PUNCTUATION, ">"))
+				ParseFail("GRAPH MATCH pattern: expected '>'.");
+		}
+		if(!MatchToken(TokenType::PUNCTUATION, "("))
+			ParseFail("GRAPH MATCH pattern: expected '(' for target vertex.");
+		auto B = CurrentToken();
+		if(!B || B->Type != TokenType::IDENTIFIER)
+			ParseFail("GRAPH MATCH pattern expects target vertex variable.");
+		AdvanceToken();
+		if(!MatchToken(TokenType::PUNCTUATION, ")"))
+			ParseFail("GRAPH MATCH pattern: expected ')' after target vertex.");
+		std::string Anchor;
+		if(MatchKeyword("FROM")) {
+			auto St = CurrentToken();
+			if(!St || (St->Type != TokenType::LITERAL && St->Type != TokenType::IDENTIFIER))
+				ParseFail("GRAPH MATCH FROM expects vertex id.");
+			Anchor = St->Value;
+			AdvanceToken();
+		}
+		if(!MatchKeyword("IN"))
+			ParseFail("GRAPH MATCH requires IN graph_name.");
+		auto Gn = CurrentToken();
+		if(!Gn || Gn->Type != TokenType::IDENTIFIER)
+			ParseFail("Expected graph name after IN.");
+		std::string GraphName = Gn->Value;
+		AdvanceToken();
+		std::string LabelFilter;
+		if(MatchKeyword("WHERE")) {
+			auto Col = CurrentToken();
+			if(!Col || Col->Type != TokenType::IDENTIFIER)
+				ParseFail("GRAPH MATCH WHERE expects edge.label = 'value'.");
+			AdvanceToken();
+			if(!MatchToken(TokenType::PUNCTUATION, "."))
+				ParseFail("GRAPH MATCH WHERE expects edge.label = 'value'.");
+			auto Lc = CurrentToken();
+			if(!Lc || Lc->Type != TokenType::IDENTIFIER)
+				ParseFail("GRAPH MATCH WHERE expects label column name.");
+			(void)Lc;
+			AdvanceToken();
+			if(!MatchToken(TokenType::PUNCTUATION, "="))
+				ParseFail("GRAPH MATCH WHERE expects '='.");
+			auto Lit = CurrentToken();
+			if(!Lit || Lit->Type != TokenType::LITERAL)
+				ParseFail("GRAPH MATCH WHERE expects string literal.");
+			LabelFilter = Lit->Value;
+			AdvanceToken();
+		}
+		if(!MatchKeyword("INTO"))
+			ParseFail("GRAPH MATCH requires INTO result_table.");
+		auto Rt = CurrentToken();
+		if(!Rt || Rt->Type != TokenType::IDENTIFIER)
+			ParseFail("Expected result table name after INTO.");
+		std::string Result = Rt->Value;
+		AdvanceToken();
+		return std::make_unique<GraphMatchAST>(std::move(GraphName), std::move(LabelFilter), MinHops, MaxHops,
+		                                       std::move(Anchor), Reverse, std::move(Result));
+	}
+	ParseFail("GRAPH statement must be TRAVERSE, MATCH, SHORTEST PATH, or PAGERANK.");
+}
+
 std::unique_ptr<StatementAST> Parser::ParseStatement() {
     if (auto Token = CurrentToken()) {
+		if(Token->Type == TokenType::KEYWORD && Token->Value == "MATCH")
+			return ParseCypherMatchStatement();
+		if(Token->Type == TokenType::KEYWORD && Token->Value == "GRAPH")
+			return ParseGraphStatement();
         if(Token->Type == TokenType::KEYWORD && Token->Value == "WITH")
             return ParseWithStatement();
         if(Token->Type == TokenType::KEYWORD && Token->Value == "LOAD")

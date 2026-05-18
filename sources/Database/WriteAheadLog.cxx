@@ -407,6 +407,36 @@ void WriteAheadLog::Replay(Database &Db) {
 				FailWal("Corrupt WAL line: FOREIGN KEY action - delete or repair " + WalPath_.string());
 			Fk.OnDelete = static_cast<ReferentialAction>(static_cast<uint8_t>(Act));
 			Db.ReplayWalAddForeignKey(Tab, std::move(Fk));
+		} else if(Tok[0] == "GR") {
+			if(Tok.size() < 12)
+				FailWal("Corrupt WAL line: GRAPH REGISTER (GR) record incomplete - delete or repair " +
+				        WalPath_.string());
+			GraphSpec Spec;
+			Spec.Name = Tok[1];
+			Spec.VertexTable = Tok[2];
+			Spec.VertexIdCol = Tok[3];
+			Spec.EdgeTable = Tok[4];
+			Spec.EdgeSrcCol = Tok[5];
+			Spec.EdgeDstCol = Tok[6];
+			Spec.EdgeLabelCol = Tok[7];
+			Spec.EdgeWeightCol = Tok[8];
+			Spec.Undirected = Tok[9] == "1";
+			Spec.ProjectionOf = Tok[10];
+			Spec.ProjectionEdgeFilter = Tok[11];
+			Db.ReplayWalGraphRegister(std::move(Spec));
+		} else if(Tok[0] == "GD") {
+			if(Tok.size() < 2)
+				FailWal("Corrupt WAL line: GRAPH DROP (GD) record incomplete - delete or repair " + WalPath_.string());
+			Db.ReplayWalGraphDrop(Tok[1]);
+		} else if(Tok[0] == "GP") {
+			if(Tok.size() < 4)
+				FailWal("Corrupt WAL line: GRAPH PROJECTION (GP) record incomplete - delete or repair " +
+				        WalPath_.string());
+			GraphProjectionRequest Req;
+			Req.ProjectionName = Tok[1];
+			Req.BaseGraphName = Tok[2];
+			Req.EdgeLabelFilter = Tok[3];
+			Db.ReplayWalGraphProjection(Req);
 		}
 	}
 }

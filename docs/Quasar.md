@@ -1,6 +1,6 @@
 # Quasar (v1.0)
 
-**Quasar** is AstralDB’s Python orchestration layer: a small toolkit (~2 MB with optional Flask) that wraps the **`astraldb` / `astraldb_cli` executable** so you can run sharded clusters, replicas, backups, and migrations without building a custom server.
+**Quasar** is AstralDB’s Python orchestration layer: a small toolkit (~2 MB with optional Flask) that wraps the **`astraldb` executable** so you can run sharded clusters, replicas, backups, and migrations without building a custom server.
 
 AstralDB itself stays a **single static binary** with no network listener. Quasar does not change the engine; it **spawns the CLI** with `--database`, `-q`, `-s`, and bundle export/import flags, then coordinates multiple database files on disk.
 
@@ -11,8 +11,8 @@ AstralDB itself stays a **single static binary** with no network listener. Quasa
 cmake -S . -B build-ci -DCMAKE_BUILD_TYPE=Release
 cmake --build build-ci
 
-pip install -r quasar/requirements.txt
-export QUASAR_ASTRALDB=build-ci/astraldb_cli   # or astraldb_cli.exe on Windows
+pip install -e ".[dev]"
+export QUASAR_ASTRALDB=build-ci/astraldb   # or astraldb.exe on Windows
 
 python -m quasar init ./my-cluster
 python -m quasar validate ./my-cluster/cluster.json
@@ -104,7 +104,7 @@ Environment:
 
 | Variable | Purpose |
 |----------|---------|
-| `QUASAR_ASTRALDB` / `ASTRALDB_BIN` | Path to `astraldb` / `astraldb_cli` |
+| `QUASAR_ASTRALDB` / `ASTRALDB_BIN` | Path to `astraldb` |
 | `ASTRALDB_USER` / `ASTRALDB_PASSWORD` | Passed as `-U` / `-P` (same as CLI) |
 | `QUASAR_API_KEY` | Optional gateway auth (`X-Quasar-Key` header) |
 
@@ -837,13 +837,13 @@ Env overrides: `QUASAR_MAX_SQL_BYTES`, `QUASAR_REQUIRE_GATEWAY_AUTH`.
 3. **Consensus scope** — File-quorum consensus coordinates **orchestration** (rebalance, commit decisions), not AstralDB storage engine replication. Split-brain across DB files still requires failover/replica playbooks.
 4. **File locking** — Only one AstralDB process should write a given database path at a time.
 5. **Security** — Passwords via `-P` or env; gateway API key is a simple shared secret, not OAuth.
-6. **Windows paths** — Use forward slashes in JSON or escaped backslashes; prefer `init` scaffolding.
+6. **Windows paths** — Prefer `python -m quasar init` (writes `data/shard0.db` style paths). Hand-edited `cluster.json` may use forward slashes; Quasar normalizes them on load. Avoid raw backslashes in JSON unless escaped (`\\`). `QUASAR_ASTRALDB` should point at `astraldb.exe` (see README).
 7. **CI** — `pytest quasar/tests` runs on every CI matrix job (mock CLI + real backup I/O).
 
 ## Tests
 
 ```bash
-pip install -r quasar/requirements.txt
+pip install -e ".[dev]"
 python -m pytest quasar/tests -q
 ```
 

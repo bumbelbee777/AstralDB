@@ -8,7 +8,7 @@
 #include <Database/TimeSeriesCompression.hxx>
 #include <IO/MathUtil.hxx>
 #include <IO/SIMD.hxx>
-#include <DS/JSONCodec.hxx>
+#include <DS/JSON.hxx>
 #include <SQL/JsonSql.hxx>
 #include <SQL/XmlSql.hxx>
 #include <SQL/SQL.hxx>

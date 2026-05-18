@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quasar"
+version = "1.0.0"
+description = "Orchestration layer for AstralDB production deployments"
+readme = "docs/Quasar.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "AstralDB contributors" }]
+keywords = ["astraldb", "database", "orchestration", "sharding"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+]
+dependencies = [
+    "flask>=3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+quasar = "quasar.quasar:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["quasar*"]
+
+[tool.pytest.ini_options]
+testpaths = ["quasar/tests"]
+pythonpath = ["."]

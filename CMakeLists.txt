@@ -8,7 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(ASTRALDB_WARNINGS_AS_ERRORS "Treat warnings as errors" ON)
 
-add_library(astraldb STATIC
+add_library(astraldb_core STATIC
     sources/Database/Database.cxx
     sources/Database/AdvancedTypes.cxx
     sources/Database/MathSci.cxx
@@ -21,6 +21,8 @@ add_library(astraldb STATIC
     sources/Database/TimeSeries.cxx
     sources/Database/TimeSeriesCompression.cxx
     sources/Database/GeoSpatial.cxx
+    sources/Database/Graph.cxx
+    sources/Database/GraphStorage.cxx
     sources/Database/User.cxx
     sources/Database/WriteAheadLog.cxx
     sources/IO/SIMD.cxx
@@ -33,6 +35,8 @@ add_library(astraldb STATIC
     sources/SQL/BytecodeProcedures.cxx
     sources/SQL/Codegen.cxx
     sources/SQL/Optimizer.cxx
+    sources/SQL/GraphOptimizer.cxx
+    sources/SQL/GraphCypher.cxx
     sources/SQL/Parser.cxx
     sources/SQL/SetExprEval.cxx
     sources/SQL/JsonSql.cxx
@@ -41,37 +45,36 @@ add_library(astraldb STATIC
     sources/Database/VectorIndex.cxx
     sources/SQL/MatchRecognize.cxx
     sources/SQL/TextSearch.cxx
-    sources/DS/XML.cxx
 )
 
-target_include_directories(astraldb
+target_include_directories(astraldb_core
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/sources
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
 
 if(MSVC)
-    target_compile_options(astraldb PRIVATE /W4 /O2)
+    target_compile_options(astraldb_core PRIVATE /W4 /O2)
     if(ASTRALDB_WARNINGS_AS_ERRORS)
-        target_compile_options(astraldb PRIVATE /WX)
+        target_compile_options(astraldb_core PRIVATE /WX)
     endif()
 else()
-    target_compile_options(astraldb PRIVATE -Wall -Wextra -O2)
+    target_compile_options(astraldb_core PRIVATE -Wall -Wextra -O2)
     if(ASTRALDB_WARNINGS_AS_ERRORS)
-        target_compile_options(astraldb PRIVATE -Werror)
+        target_compile_options(astraldb_core PRIVATE -Werror)
     endif()
 endif()
 
-add_executable(astraldb_cli
+add_executable(astraldb
     sources/Program.cxx
 )
-target_link_libraries(astraldb_cli PRIVATE astraldb)
+target_link_libraries(astraldb PRIVATE astraldb_core)
 
 add_executable(astraldb_tests
     tests/TestMain.cxx
     tests/AstralDB.Tests.cxx
 )
-target_link_libraries(astraldb_tests PRIVATE astraldb)
+target_link_libraries(astraldb_tests PRIVATE astraldb_core)
 target_include_directories(astraldb_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 set_target_properties(astraldb_tests PROPERTIES OUTPUT_NAME run_tests)
 

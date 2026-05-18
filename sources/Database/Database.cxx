@@ -1,5 +1,6 @@
 #include <Database/AdvancedTypes.hxx>
 #include <Database/Database.hxx>
+#include <Database/GraphStorage.hxx>
 #include <IO/MemoryGuard.hxx>
 #include <cstring>
 #include <Database/AtRestKey.hxx>
@@ -31,7 +32,7 @@
 #include <string_view>
 #include <cctype>
 #include <DS/TabularData.hxx>
-#include <DS/JSONCodec.hxx>
+#include <DS/JSON.hxx>
 #include <SQL/Bytecode.hxx>
 #include <SQL/BytecodeProcedures.hxx>
 #if defined(_WIN32)
@@ -1324,6 +1325,7 @@ void Database::SyncToFileUnlocked() {
 	AppendSequenceSnapshotTrailer(RawData, Sequences_);
 	AppendStorageSnapshotTrailer(RawData, Tables_);
 	AppendViewSnapshotTrailer(RawData, ViewDefinitionSql_);
+	AppendGraphCatalogSnapshotTrailer(RawData, Graphs_);
 	std::string CompressedData = CompressData(RawData);
 	std::string EncryptedData = EncryptData(CompressedData);
 	std::ofstream File(DbPath_, std::ios::binary);
@@ -2596,6 +2598,188 @@ void Database::DropDataset(const std::string &Name) {
 	Datasets_.erase(Name);
 }
 
+void Database::AppendWalAfterGraphRegister(const GraphSpec &Spec) {
+	if(WalSuspended_.load(std::memory_order_acquire))
+		return;
+	Wal_.AppendLine(GraphWalLineRegister(Spec));
+}
+
+void Database::AppendWalAfterGraphDrop(const std::string &Name) {
+	if(WalSuspended_.load(std::memory_order_acquire))
+		return;
+	Wal_.AppendLine(GraphWalLineDrop(Name));
+}
+
+void Database::AppendWalAfterGraphProjection(const GraphProjectionRequest &Req) {
+	if(WalSuspended_.load(std::memory_order_acquire))
+		return;
+	Wal_.AppendLine(GraphWalLineProjection(Req));
+}
+
+void Database::RegisterGraph(GraphSpec Spec) {
+	const std::string Name = Spec.Name;
+	std::scoped_lock Guard(DbMutex_);
+	RegisterGraphCatalogEntryAssumeLocked(*this, std::move(Spec));
+	AppendWalAfterGraphRegister(Graphs_.at(Name).first);
+}
+
+void Database::ReplayWalGraphRegister(GraphSpec Spec) {
+	std::scoped_lock Guard(DbMutex_);
+	ReplayWalGraphRegisterAssumeLocked(*this, std::move(Spec));
+}
+
+void Database::ReplayWalGraphDrop(const std::string &Name) {
+	std::scoped_lock Guard(DbMutex_);
+	ReplayWalGraphDropAssumeLocked(*this, Name);
+}
+
+void Database::ReplayWalGraphProjection(const GraphProjectionRequest &Req) {
+	std::scoped_lock Guard(DbMutex_);
+	ReplayWalGraphProjectionAssumeLocked(*this, Req);
+}
+
+void Database::DropGraph(const std::string &Name) {
+	std::scoped_lock Guard(DbMutex_);
+	if(Graphs_.find(Name) == Graphs_.end())
+		return;
+	ReplayWalGraphDropAssumeLocked(*this, Name);
+	AppendWalAfterGraphDrop(Name);
+}
+
+const GraphSpec *Database::GraphByName(const std::string &Name) const {
+	std::scoped_lock Guard(DbMutex_);
+	const auto It = Graphs_.find(Name);
+	if(It == Graphs_.end())
+		return nullptr;
+	return &It->second.first;
+}
+
+const GraphAdjacency *Database::GraphAdjacencyByName(const std::string &Name) const {
+	std::scoped_lock Guard(DbMutex_);
+	const auto It = Graphs_.find(Name);
+	if(It == Graphs_.end())
+		return nullptr;
+	return &It->second.second;
+}
+
+void Database::GraphTraverse(const GraphTraverseRequest &Req) {
+	GraphSpec Spec;
+	GraphAdjacency Adj;
+	{
+		std::scoped_lock Guard(DbMutex_);
+		const auto It = Graphs_.find(Req.GraphName);
+		if(It == Graphs_.end())
+			FailStorage("GRAPH \"" + Req.GraphName + "\" is not registered (CREATE GRAPH first).");
+		Spec = It->second.first;
+		Adj = It->second.second;
+	}
+	RunGraphTraverse(*this, Spec, Adj, Req);
+}
+
+void Database::ReplaceTableContents(const std::string &TableName, const Schema &Schema, Table Rows) {
+	std::scoped_lock Guard(DbMutex_);
+	if(TableSchemas_.find(TableName) != TableSchemas_.end()) {
+		Tables_.erase(TableName);
+		TableSchemas_.erase(TableName);
+	}
+	TableSchemas_[TableName] = Schema;
+	HybridTableSlot Slot;
+	Slot.SetDeclaredPolicy(StorageLayout::Row);
+	Slot.RowStore = std::move(Rows);
+	Slot.RecordWrite();
+	Slot.SyncColumnarAfterRowMutation();
+	Tables_[TableName] = std::move(Slot);
+	Dirty_.store(true, std::memory_order_release);
+}
+
+void Database::RegisterGraphProjection(const GraphProjectionRequest &Req) {
+	std::scoped_lock Guard(DbMutex_);
+	const auto BaseIt = Graphs_.find(Req.BaseGraphName);
+	if(BaseIt == Graphs_.end())
+		FailStorage("CREATE GRAPH PROJECTION: base graph \"" + Req.BaseGraphName + "\" is not registered.");
+	if(Graphs_.count(Req.ProjectionName))
+		FailStorage("CREATE GRAPH PROJECTION: name \"" + Req.ProjectionName + "\" already exists.");
+	GraphSpec Spec = BaseIt->second.first;
+	Spec.Name = Req.ProjectionName;
+	Spec.ProjectionOf = Req.BaseGraphName;
+	Spec.ProjectionEdgeFilter = Req.EdgeLabelFilter;
+	RegisterGraphCatalogEntryAssumeLocked(*this, std::move(Spec));
+	AppendWalAfterGraphProjection(Req);
+}
+
+void Database::GraphMatch(const GraphMatchRequest &Req) {
+	GraphSpec Spec;
+	GraphAdjacency Adj;
+	GraphEdgeTable Edges;
+	{
+		std::scoped_lock Guard(DbMutex_);
+		const auto It = Graphs_.find(Req.GraphName);
+		if(It == Graphs_.end())
+			FailStorage("GRAPH \"" + Req.GraphName + "\" is not registered (CREATE GRAPH first).");
+		Spec = It->second.first;
+		Adj = It->second.second;
+		const auto Vt = Tables_.find(Spec.VertexTable);
+		if(Vt != Tables_.end()) {
+			const Table &Live = Vt->second.RowsForRead(std::nullopt, false);
+			Edges.assign(Live.begin(), Live.end());
+		}
+	}
+	RunGraphMatch(*this, Spec, Adj, Req, Edges);
+}
+
+void Database::GraphShortestPath(const GraphShortestPathRequest &Req) {
+	GraphSpec Spec;
+	GraphAdjacency Adj;
+	{
+		std::scoped_lock Guard(DbMutex_);
+		const auto It = Graphs_.find(Req.GraphName);
+		if(It == Graphs_.end())
+			FailStorage("GRAPH \"" + Req.GraphName + "\" is not registered (CREATE GRAPH first).");
+		Spec = It->second.first;
+		Adj = It->second.second;
+	}
+	RunGraphShortestPath(*this, Spec, Adj, Req);
+}
+
+void Database::GraphPageRank(const GraphPageRankRequest &Req) {
+	GraphSpec Spec;
+	GraphAdjacency Adj;
+	GraphEdgeTable VertexRows;
+	{
+		std::scoped_lock Guard(DbMutex_);
+		const auto It = Graphs_.find(Req.GraphName);
+		if(It == Graphs_.end())
+			FailStorage("GRAPH \"" + Req.GraphName + "\" is not registered (CREATE GRAPH first).");
+		Spec = It->second.first;
+		Adj = It->second.second;
+		const auto Vt = Tables_.find(Spec.VertexTable);
+		if(Vt != Tables_.end()) {
+			const Table &Live = Vt->second.RowsForRead(std::nullopt, false);
+			VertexRows.assign(Live.begin(), Live.end());
+		}
+	}
+	RunGraphPageRank(*this, Spec, Adj, Req, VertexRows);
+}
+
+void Database::OnGraphEdgeInsertedAssumeLocked(const std::string &EdgeTable, const Item &Row) {
+	const auto MapIt = GraphsByEdgeTable_.find(EdgeTable);
+	if(MapIt == GraphsByEdgeTable_.end())
+		return;
+	for(const std::string &GraphName : MapIt->second) {
+		const auto GIt = Graphs_.find(GraphName);
+		if(GIt == Graphs_.end())
+			continue;
+		const GraphSpec &Spec = GIt->second.first;
+		GraphAdjacencyInsertEdge(GIt->second.second, Spec, Row);
+		for(const std::string &ProjName : GraphProjectionsByBase_[GraphName]) {
+			const auto PIt = Graphs_.find(ProjName);
+			if(PIt == Graphs_.end())
+				continue;
+			GraphAdjacencyInsertEdge(PIt->second.second, PIt->second.first, Row);
+		}
+	}
+}
+
 void Database::LoadDatasetInto(const std::string &Name, const std::string &TargetTable, const int64_t VersionId) {
 	MemoryGuard::SpikeScope Spike;
 	DatasetEntry Ent;
@@ -3305,6 +3489,9 @@ bool Database::LoadSnapshotFromDiskPathSynchronously(std::filesystem::path Path)
 	std::string EncryptedData((std::istreambuf_iterator<char>(File)), std::istreambuf_iterator<char>());
 	std::string CompressedData = DecryptData(EncryptedData);
 	std::string RawData = DecompressData(CompressedData);
+	std::vector<GraphSpec> LoadedGraphs;
+	if(!StripAndParseGraphCatalogSnapshotTrailer(RawData, LoadedGraphs))
+		return false;
 	std::unordered_map<std::string, std::string> LoadedViews;
 	if(!StripAndParseViewSnapshotTrailer(RawData, LoadedViews))
 		return false;
@@ -3337,6 +3524,9 @@ bool Database::LoadSnapshotFromDiskPathSynchronously(std::filesystem::path Path)
 		ForeignKeys_.clear();
 		TableCheckConstraints_.clear();
 		Sequences_.clear();
+		Graphs_.clear();
+		GraphsByEdgeTable_.clear();
+		GraphProjectionsByBase_.clear();
 		Users_.clear();
 		Acls_.clear();
 		Roles_.clear();
@@ -3409,6 +3599,7 @@ bool Database::LoadSnapshotFromDiskPathSynchronously(std::filesystem::path Path)
 			Users_.emplace_back("Admin0", "admin", Permissions::All);
 		EnsureBootstrapAdminAclAssumeLocked();
 		CurrentUser_.reset();
+		InstallGraphCatalogAssumeLocked(*this, std::move(LoadedGraphs));
 	}
 	return true;
 }
@@ -4197,6 +4388,8 @@ void Database::SyncVectorIndexesForTableAssumeLocked(const std::string &TableNam
 }
 
 void Database::OnRowInsertedAssumeLocked(const std::string &TableName, size_t RowIndex, const Item &Row) {
+	(void)RowIndex;
+	OnGraphEdgeInsertedAssumeLocked(TableName, Row);
 	for(auto &[Name, Spec] : FtsIndexes_) {
 		(void)Name;
 		if(Spec.Table != TableName)

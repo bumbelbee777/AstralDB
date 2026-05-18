@@ -87,6 +87,13 @@ bool OpcodeIsDml(Opcode Op) {
 	case Opcode::DROP_DATASET:
 	case Opcode::VACUUM:
 	case Opcode::REPACK_CONCURRENTLY:
+	case Opcode::GRAPH_REGISTER:
+	case Opcode::GRAPH_DROP:
+	case Opcode::GRAPH_TRAVERSE:
+	case Opcode::GRAPH_MATCH:
+	case Opcode::GRAPH_SHORTEST_PATH:
+	case Opcode::GRAPH_PAGERANK:
+	case Opcode::GRAPH_REGISTER_PROJECTION:
 		return true;
 	default:
 		return false;
@@ -205,6 +212,20 @@ std::string OpcodeName(Opcode Op) {
 		return "VACUUM";
 	case Opcode::REPACK_CONCURRENTLY:
 		return "REPACK_CONCURRENTLY";
+	case Opcode::GRAPH_REGISTER:
+		return "GRAPH_REGISTER";
+	case Opcode::GRAPH_DROP:
+		return "GRAPH_DROP";
+	case Opcode::GRAPH_TRAVERSE:
+		return "GRAPH_TRAVERSE";
+	case Opcode::GRAPH_MATCH:
+		return "GRAPH_MATCH";
+	case Opcode::GRAPH_SHORTEST_PATH:
+		return "GRAPH_SHORTEST_PATH";
+	case Opcode::GRAPH_PAGERANK:
+		return "GRAPH_PAGERANK";
+	case Opcode::GRAPH_REGISTER_PROJECTION:
+		return "GRAPH_REGISTER_PROJECTION";
 	case Opcode::UPDATE:
 		return "UPDATE";
 	case Opcode::DELETE:

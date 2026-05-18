@@ -58,19 +58,18 @@ def resolve_astral_executable(repo_root: Path) -> Optional[Path]:
     cmake_release = repo_root / "build-cmake" / "Release"
     if platform.system() == "Windows":
         candidates = [
-            bin_dir / "AstralDB.exe",
-            bin_dir / "astraldb_cli.exe",
             bin_dir / "astraldb.exe",
             bin_dir / "astraldb",
-            cmake_release / "astraldb_cli.exe",
+            bin_dir / "AstralDB.exe",
             cmake_release / "astraldb.exe",
+            repo_root / "build-ci" / "astraldb.exe",
         ]
     else:
         candidates = [
-            bin_dir / "astraldb_cli",
             bin_dir / "astraldb",
             bin_dir / "AstralDB",
-            repo_root / "build-cmake" / "astraldb_cli",
+            repo_root / "build-cmake" / "astraldb",
+            repo_root / "build-ci" / "astraldb",
         ]
     for p in candidates:
         if p.is_file():

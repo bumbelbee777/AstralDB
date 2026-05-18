@@ -1,6 +1,6 @@
 #include <SQL/JsonSql.hxx>
 
-#include <DS/JSONCodec.hxx>
+#include <DS/JSON.hxx>
 #include <sstream>
 
 namespace AstralDB {
