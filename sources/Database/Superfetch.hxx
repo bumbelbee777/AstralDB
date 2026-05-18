@@ -10,6 +10,9 @@
 #include <intrin.h>
 #include <xmmintrin.h>
 #endif
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+#include <mach/mach_time.h>
+#endif
 
 namespace AstralDB {
 
@@ -152,11 +155,19 @@ private:
 	static uint64_t ReadTsc() noexcept {
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 		return __rdtsc();
-#elif defined(__GNUC__) || defined(__clang__)
+#elif defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 		unsigned Hi = 0;
 		unsigned Lo = 0;
 		__asm__ __volatile__("rdtsc" : "=a"(Lo), "=d"(Hi));
 		return (static_cast<uint64_t>(Hi) << 32) | Lo;
+#elif defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
+#if defined(__APPLE__)
+		return mach_absolute_time();
+#else
+		uint64_t Cnt = 0;
+		__asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(Cnt));
+		return Cnt;
+#endif
 #else
 		return 0;
 #endif
