@@ -1,0 +1,17 @@
+{
+  "saga_id": "settlement-42",
+  "steps": [
+    {
+      "name": "reserve",
+      "shard_key": "acct:1001",
+      "sql": "UPDATE accounts SET balance_cents = balance_cents - 5000 WHERE account_id = 'acct:1001';",
+      "compensate_sql": "UPDATE accounts SET balance_cents = balance_cents + 5000 WHERE account_id = 'acct:1001';"
+    },
+    {
+      "name": "credit_counterparty",
+      "shard_key": "acct:2002",
+      "sql": "UPDATE accounts SET balance_cents = balance_cents + 5000 WHERE account_id = 'acct:2002';",
+      "compensate_sql": "UPDATE accounts SET balance_cents = balance_cents - 5000 WHERE account_id = 'acct:2002';"
+    }
+  ]
+}

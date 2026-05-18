@@ -186,6 +186,8 @@ static void ApplyCliGlobalFlags(int Argc, char** Argv, bool& Verbose, std::strin
 			OptLevel = AstralDB::SQL::OptimizationLevel::Advanced;
 		else if(Arg == "-O3")
 			OptLevel = AstralDB::SQL::OptimizationLevel::Aggressive;
+		else if(Arg == "-O4")
+			OptLevel = AstralDB::SQL::OptimizationLevel::Maximum;
 		else if(Arg == "--audit-file" && AuditFileOut) {
 			if(I + 1 < Argc)
 				*AuditFileOut = std::filesystem::path(Argv[++I]);
@@ -407,6 +409,7 @@ int main(int Argc, char** Argv) {
 				std::cout << "  -O1                     Basic optimizations (default)\n";
 				std::cout << "  -O2                     Advanced optimizations\n";
 				std::cout << "  -O3                     Aggressive optimizations\n";
+				std::cout << "  -O4                     Maximum optimizations\n";
 				PrintBytecodeHelpLines();
 				return 0;
 			}
@@ -451,7 +454,7 @@ int main(int Argc, char** Argv) {
 					++I;
 				continue;
 			}
-			if(Arg == "-O0" || Arg == "-O1" || Arg == "-O2" || Arg == "-O3")
+			if(Arg == "-O0" || Arg == "-O1" || Arg == "-O2" || Arg == "-O3" || Arg == "-O4")
 				continue;
 			if(CliArgIs(Arg, {"--trace-bytecode", "-tb", "--compile-pool", "-cp"}))
 				continue;

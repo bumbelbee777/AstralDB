@@ -1,13 +1,17 @@
-"""Detect drift between shards (fingerprints, hashes, custom probe SQL)."""
+"""Detect drift between shards (fingerprints, hashes, custom probe SQL, replicas)."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from quasar.client import AstralDBClient
 from quasar.inventory import QuasarInventory, sha256_file
 from quasar.quasar import QuasarShard
+
+if TYPE_CHECKING:
+    from quasar.quasar import QuasarReplica
 
 
 @dataclass
@@ -81,3 +85,27 @@ class QuasarDrift:
         if probe_sql:
             reports.append(self.check_probe(probe_sql))
         return reports
+
+    @staticmethod
+    def check_replica_set(rep: "QuasarReplica", *, label: str) -> DriftReport:
+        """Compare master file hash to each replica (logical replication sanity)."""
+        master = rep.set.master
+        master_hash = sha256_file(master) if master.is_file() else "missing"
+        fingerprints: Dict[str, str] = {"master": master_hash}
+        outliers: List[str] = []
+        for i, replica in enumerate(rep.set.replicas):
+            key = f"replica_{i}"
+            rhash = sha256_file(replica) if replica.is_file() else "missing"
+            fingerprints[key] = rhash
+            if rhash != master_hash:
+                outliers.append(key)
+        return DriftReport(
+            method=f"replica_hash:{label}",
+            consistent=len(outliers) == 0,
+            fingerprints=fingerprints,
+            outliers=outliers,
+        )
+
+    @staticmethod
+    def check_all_replicas(replicas: Dict[str, "QuasarReplica"]) -> List[DriftReport]:
+        return [QuasarDrift.check_replica_set(rep, label=name) for name, rep in replicas.items()]

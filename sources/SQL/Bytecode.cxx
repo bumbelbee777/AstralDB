@@ -17,7 +17,7 @@
 #include <Database/ColumnarStorage.hxx>
 #include <Database/Dataset.hxx>
 #include <Database/Database.hxx>
-#include <Database/PrefetchEngine.hxx>
+#include <Database/Superfetch.hxx>
 #include <Database/TimeSeries.hxx>
 #include <IO/SIMD.hxx>
 #include <iostream>
@@ -209,6 +209,23 @@ static bool CellIsSqlNull(const Database::Item &Row, const std::string &Col) {
 	return It == Row.end() || It->second.empty();
 }
 
+static bool SqlCellIsNullValue(std::string_view V) {
+	return V.empty();
+}
+
+/** SQL UNKNOWN: comparisons involving NULL (empty cell) do not satisfy WHERE. */
+static bool ComparisonOperandIsNull(const std::string &Lhs, const std::string &Rhs, const std::string &Op) {
+	if(Op == kOpIsNull || Op == kOpIsNotNull)
+		return false;
+	if(SqlCellIsNullValue(Lhs))
+		return true;
+	if(Op == kOpIn)
+		return false;
+	if(Op == "LIKE" || Op == "NOT LIKE" || Op == "MATCH" || Op == "NOT MATCH")
+		return SqlCellIsNullValue(Rhs);
+	return SqlCellIsNullValue(Rhs);
+}
+
 static bool SqlLike(const std::string &Str, const std::string &Pat) {
 	const size_t n = Str.size(), m = Pat.size();
 	const size_t DpRows = m + 1;
@@ -379,6 +396,8 @@ static bool MatchOnePredicate(const Database *Db, const std::string &ContextTabl
 		const std::string Rcol(RcolSv.begin(), RcolSv.end());
 		auto ItR = Row.find(Rcol);
 		const std::string RhsVal = ItR == Row.end() ? "" : ItR->second;
+		if(ComparisonOperandIsNull(Lhs, RhsVal, Op))
+			return false;
 		if(Op == "LIKE")
 			return SqlLike(Lhs, RhsVal);
 		if(Op == "NOT LIKE")
@@ -395,15 +414,21 @@ static bool MatchOnePredicate(const Database *Db, const std::string &ContextTabl
 	if(Op == kOpIsNotNull)
 		return !CellIsSqlNull(Row, Col);
 	if(Op == kOpIn) {
+		if(SqlCellIsNullValue(Lhs))
+			return false;
 		std::vector<std::string> Vals;
 		if(!SplitInList(Rhs, Vals))
 			return false;
 		for(const auto &V : Vals) {
+			if(SqlCellIsNullValue(V))
+				continue;
 			if(CellCompare(Lhs, V, "="))
 				return true;
 		}
 		return false;
 	}
+	if(ComparisonOperandIsNull(Lhs, Rhs, Op))
+		return false;
 	if(Op == "LIKE")
 		return SqlLike(Lhs, Rhs);
 	if(Op == "NOT LIKE")
@@ -1122,10 +1147,10 @@ static void RunGroupByCore(Database::Table &Tbl, const Instruction &Inst,
 			std::unordered_map<std::string, std::vector<std::string>> CurMin;
 			std::unordered_map<std::string, std::vector<std::string>> CurMax;
 		} Acc;
-		PrefetchEngine::RowScanSession GbScan;
-		PrefetchEngine::BeginRowScan(Tbl, GbScan);
+		Superfetch::RowScanSession GbScan;
+		Superfetch::BeginRowScan(Tbl, GbScan);
 		for(std::size_t Tri = 0; Tri < Tbl.size(); ++Tri) {
-			PrefetchEngine::AdvanceRowScan(Tbl, Tri, GbScan);
+			Superfetch::AdvanceRowScan(Tbl, Tri, GbScan);
 			const auto &Row = Tbl[Tri];
 			const std::string Sig = GroupKeySignature(Row, ActiveKeys);
 			if(IncludeCountStar)
@@ -1249,10 +1274,10 @@ static void RunGroupByCore(Database::Table &Tbl, const Instruction &Inst,
 		std::unordered_map<std::string, Database::Item> Template;
 		Cnt.reserve(Tbl.size());
 		Template.reserve(Tbl.size());
-		PrefetchEngine::RowScanSession GbScan;
-		PrefetchEngine::BeginRowScan(Tbl, GbScan);
+		Superfetch::RowScanSession GbScan;
+		Superfetch::BeginRowScan(Tbl, GbScan);
 		for(std::size_t Tri = 0; Tri < Tbl.size(); ++Tri) {
-			PrefetchEngine::AdvanceRowScan(Tbl, Tri, GbScan);
+			Superfetch::AdvanceRowScan(Tbl, Tri, GbScan);
 			const auto &Row = Tbl[Tri];
 			const std::string Sig = GroupKeySignature(Row, ActiveKeys);
 			Cnt[Sig]++;
@@ -1280,10 +1305,10 @@ static void RunGroupByCore(Database::Table &Tbl, const Instruction &Inst,
 	} else if(AggMode == 0) {
 		std::unordered_map<std::string, Database::Item> First;
 		First.reserve(Tbl.size());
-		PrefetchEngine::RowScanSession GbScan;
-		PrefetchEngine::BeginRowScan(Tbl, GbScan);
+		Superfetch::RowScanSession GbScan;
+		Superfetch::BeginRowScan(Tbl, GbScan);
 		for(std::size_t Tri = 0; Tri < Tbl.size(); ++Tri) {
-			PrefetchEngine::AdvanceRowScan(Tbl, Tri, GbScan);
+			Superfetch::AdvanceRowScan(Tbl, Tri, GbScan);
 			const auto &Row = Tbl[Tri];
 			const std::string Sig = GroupKeySignature(Row, ActiveKeys);
 			if(First.find(Sig) == First.end())
@@ -1539,11 +1564,11 @@ static std::optional<std::string> ResolveStringImmediate(const Instruction &Inst
                                                          const std::vector<std::string> *Pool) {
 	if(Inst.Operands.empty())
 		return std::nullopt;
-	if(Inst.Opcode == Opcode::PUSH) {
+	if(Inst.Opcode_ == Opcode::PUSH) {
 		if(const auto *S = std::get_if<std::string>(&Inst.Operands[0]))
 			return *S;
 	}
-	if(Inst.Opcode == Opcode::PUSH_POOL) {
+	if(Inst.Opcode_ == Opcode::PUSH_POOL) {
 		if(!Pool)
 			FailVm("PUSH_POOL operand without string pool");
 		if(const auto *Ix = std::get_if<int64_t>(&Inst.Operands[0])) {
@@ -1564,7 +1589,7 @@ std::optional<std::string> StrPushOperand(const Bytecode &Code, size_t Idx,
 }
 
 	std::optional<int64_t> IntPushOperand(const Bytecode &Code, size_t Idx) {
-	if(Idx >= Code.size() || Code[Idx].Opcode != Opcode::PUSH)
+	if(Idx >= Code.size() || Code[Idx].Opcode_ != Opcode::PUSH)
 		return std::nullopt;
 	if(Code[Idx].Operands.empty())
 		return std::nullopt;
@@ -1715,7 +1740,7 @@ void BytecodeInterpreter::RunNestedBytecode(const Bytecode &Code, const std::vec
 		if(DebugSession_) {
 			VmTraceEvent Ev;
 			Ev.Ip = static_cast<std::size_t>(Ic);
-			Ev.Op = Code[static_cast<std::size_t>(Ic)].Opcode;
+			Ev.Op = Code[static_cast<std::size_t>(Ic)].Opcode_;
 			Ev.StackDepth = StackSlots_.size();
 			Ev.StepNumber = StepsExecuted_ + 1;
 			DebugSession_->NotifyBeforeStep(Ev);
@@ -1741,7 +1766,7 @@ void BytecodeInterpreter::Execute(const Bytecode &Code, const std::vector<std::s
 		if(DebugSession_) {
 			VmTraceEvent Ev;
 			Ev.Ip = static_cast<std::size_t>(Ic);
-			Ev.Op = Code[static_cast<std::size_t>(Ic)].Opcode;
+			Ev.Op = Code[static_cast<std::size_t>(Ic)].Opcode_;
 			Ev.StackDepth = StackSlots_.size();
 			Ev.StepNumber = StepsExecuted_ + 1;
 			DebugSession_->NotifyBeforeStep(Ev);
@@ -1764,7 +1789,7 @@ void BytecodeInterpreter::Execute(const Bytecode &Code, const std::vector<std::s
 bool BytecodeInterpreter::Step(const Bytecode &Code) {
     if (Ic >= Code.size()) return false;
     const Instruction &inst = Code[Ic];
-    switch (inst.Opcode) {
+    switch (inst.Opcode_) {
         case Opcode::NOP:
             ++Ic;
             break;
@@ -1952,7 +1977,7 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 } else {
                     while (
                         J < Code.size()
-                        && (Code[J].Opcode == Opcode::PUSH || Code[J].Opcode == Opcode::PUSH_POOL)) {
+                        && (Code[J].Opcode_ == Opcode::PUSH || Code[J].Opcode_ == Opcode::PUSH_POOL)) {
                         auto ColName = StrPushOperand(Code, J, StringOperandPool_);
                         if (!ColName || IsBytecodeConstraintTok(*ColName))
                             break;
@@ -1965,7 +1990,7 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                         ++J;
                         std::vector<std::string> Cons;
                         while (J < Code.size()
-                               && (Code[J].Opcode == Opcode::PUSH || Code[J].Opcode == Opcode::PUSH_POOL)) {
+                               && (Code[J].Opcode_ == Opcode::PUSH || Code[J].Opcode_ == Opcode::PUSH_POOL)) {
                             auto T = StrPushOperand(Code, J, StringOperandPool_);
                             if (!T || !IsBytecodeConstraintTok(*T))
                                 break;
@@ -2763,10 +2788,10 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                     std::unordered_map<std::string, std::vector<std::string>> CurMin;
                     std::unordered_map<std::string, std::vector<std::string>> CurMax;
                 } Acc;
-                PrefetchEngine::RowScanSession GbScan;
-                PrefetchEngine::BeginRowScan(Tbl, GbScan);
+                Superfetch::RowScanSession GbScan;
+                Superfetch::BeginRowScan(Tbl, GbScan);
                 for(std::size_t Tri = 0; Tri < Tbl.size(); ++Tri) {
-                    PrefetchEngine::AdvanceRowScan(Tbl, Tri, GbScan);
+                    Superfetch::AdvanceRowScan(Tbl, Tri, GbScan);
                     const auto &Row = Tbl[Tri];
                     const std::string Sig = GroupKeySignature(Row, Keys);
                     if(IncludeCountStar)
@@ -2892,10 +2917,10 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 std::unordered_map<std::string, Database::Item> Template;
                 std::unordered_map<std::string, std::unordered_set<std::string>> DistinctVals;
                 Template.reserve(Tbl.size());
-                PrefetchEngine::RowScanSession GbScan;
-                PrefetchEngine::BeginRowScan(Tbl, GbScan);
+                Superfetch::RowScanSession GbScan;
+                Superfetch::BeginRowScan(Tbl, GbScan);
                 for(std::size_t Tri = 0; Tri < Tbl.size(); ++Tri) {
-                    PrefetchEngine::AdvanceRowScan(Tbl, Tri, GbScan);
+                    Superfetch::AdvanceRowScan(Tbl, Tri, GbScan);
                     const auto &Row = Tbl[Tri];
                     const std::string Sig = GroupKeySignature(Row, Keys);
                     if(Template.find(Sig) == Template.end()) {
@@ -2927,10 +2952,10 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             } else if(AggMode == 0) {
                 std::unordered_map<std::string, Database::Item> First;
                 First.reserve(Tbl.size());
-                PrefetchEngine::RowScanSession GbScan;
-                PrefetchEngine::BeginRowScan(Tbl, GbScan);
+                Superfetch::RowScanSession GbScan;
+                Superfetch::BeginRowScan(Tbl, GbScan);
                 for(std::size_t Tri = 0; Tri < Tbl.size(); ++Tri) {
-                    PrefetchEngine::AdvanceRowScan(Tbl, Tri, GbScan);
+                    Superfetch::AdvanceRowScan(Tbl, Tri, GbScan);
                     const auto &Row = Tbl[Tri];
                     const std::string Sig = GroupKeySignature(Row, Keys);
                     if(First.find(Sig) == First.end())
@@ -2958,10 +2983,10 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 std::unordered_map<std::string, Database::Item> Template;
                 Cnt.reserve(Tbl.size());
                 Template.reserve(Tbl.size());
-                PrefetchEngine::RowScanSession GbScan;
-                PrefetchEngine::BeginRowScan(Tbl, GbScan);
+                Superfetch::RowScanSession GbScan;
+                Superfetch::BeginRowScan(Tbl, GbScan);
                 for(std::size_t Tri = 0; Tri < Tbl.size(); ++Tri) {
-                    PrefetchEngine::AdvanceRowScan(Tbl, Tri, GbScan);
+                    Superfetch::AdvanceRowScan(Tbl, Tri, GbScan);
                     const auto &Row = Tbl[Tri];
                     const std::string Sig = GroupKeySignature(Row, Keys);
                     Cnt[Sig]++;
@@ -3083,10 +3108,10 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
 			auto &Rows = Tit->second.RowStore;
 			std::vector<Database::Item> Kept;
 			Kept.reserve(Rows.size());
-			PrefetchEngine::RowScanSession AsOfScan;
-			PrefetchEngine::BeginRowScan(Rows, AsOfScan);
+			Superfetch::RowScanSession AsOfScan;
+			Superfetch::BeginRowScan(Rows, AsOfScan);
 			for(std::size_t Ri = 0; Ri < Rows.size(); ++Ri) {
-				PrefetchEngine::AdvanceRowScan(Rows, Ri, AsOfScan);
+				Superfetch::AdvanceRowScan(Rows, Ri, AsOfScan);
 				const auto &Row = Rows[Ri];
 				auto FindKey = [&](const char *K) -> std::optional<std::string> {
 					for(const auto &[Name, Val] : Row) {
@@ -3741,10 +3766,10 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 auto &Tbl = Databases_[0]->Tables_[TableName].RowStore;
                 std::unordered_set<std::string> Seen;
                 Database::Table Out;
-                PrefetchEngine::RowScanSession DedupScan;
-                PrefetchEngine::BeginRowScan(Tbl, DedupScan);
+                Superfetch::RowScanSession DedupScan;
+                Superfetch::BeginRowScan(Tbl, DedupScan);
                 for(std::size_t Tri = 0; Tri < Tbl.size(); ++Tri) {
-                    PrefetchEngine::AdvanceRowScan(Tbl, Tri, DedupScan);
+                    Superfetch::AdvanceRowScan(Tbl, Tri, DedupScan);
                     const auto &Row = Tbl[Tri];
                     const std::string Sig = RowSignatureCanon(Row);
                     if(Seen.insert(Sig).second)
@@ -3826,34 +3851,34 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             Database::Table Built;
             if(Mode == static_cast<int64_t>(CompoundSetOpKind::UnionAll)) {
                 Built.reserve(LT.size() + RT.size());
-                PrefetchEngine::RowScanSession LScan;
-                PrefetchEngine::BeginRowScan(LT, LScan);
+                Superfetch::RowScanSession LScan;
+                Superfetch::BeginRowScan(LT, LScan);
                 for(std::size_t Li = 0; Li < LT.size(); ++Li) {
-                    PrefetchEngine::AdvanceRowScan(LT, Li, LScan);
+                    Superfetch::AdvanceRowScan(LT, Li, LScan);
                     Built.push_back(MapRowByColumnList(LT[Li], Lsrc, OutNames));
                 }
-                PrefetchEngine::RowScanSession RScan;
-                PrefetchEngine::BeginRowScan(RT, RScan);
+                Superfetch::RowScanSession RScan;
+                Superfetch::BeginRowScan(RT, RScan);
                 for(std::size_t Ri = 0; Ri < RT.size(); ++Ri) {
-                    PrefetchEngine::AdvanceRowScan(RT, Ri, RScan);
+                    Superfetch::AdvanceRowScan(RT, Ri, RScan);
                     Built.push_back(MapRowByColumnList(RT[Ri], Rsrc, OutNames));
                 }
             } else if(Mode == static_cast<int64_t>(CompoundSetOpKind::UnionDistinct)) {
                 std::unordered_set<std::string> Seen;
                 Built.reserve(LT.size() + RT.size());
-                PrefetchEngine::RowScanSession LScan;
-                PrefetchEngine::BeginRowScan(LT, LScan);
+                Superfetch::RowScanSession LScan;
+                Superfetch::BeginRowScan(LT, LScan);
                 for(std::size_t Li = 0; Li < LT.size(); ++Li) {
-                    PrefetchEngine::AdvanceRowScan(LT, Li, LScan);
+                    Superfetch::AdvanceRowScan(LT, Li, LScan);
                     auto P = MapRowByColumnList(LT[Li], Lsrc, OutNames);
                     const std::string Sig = RowSignatureCanon(P);
                     if(Seen.insert(Sig).second)
                         Built.push_back(std::move(P));
                 }
-                PrefetchEngine::RowScanSession RScan;
-                PrefetchEngine::BeginRowScan(RT, RScan);
+                Superfetch::RowScanSession RScan;
+                Superfetch::BeginRowScan(RT, RScan);
                 for(std::size_t Ri = 0; Ri < RT.size(); ++Ri) {
-                    PrefetchEngine::AdvanceRowScan(RT, Ri, RScan);
+                    Superfetch::AdvanceRowScan(RT, Ri, RScan);
                     auto P = MapRowByColumnList(RT[Ri], Rsrc, OutNames);
                     const std::string Sig = RowSignatureCanon(P);
                     if(Seen.insert(Sig).second)
@@ -3861,17 +3886,17 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 }
             } else if(Mode == static_cast<int64_t>(CompoundSetOpKind::Intersect)) {
                 std::unordered_set<std::string> RhsSigs;
-                PrefetchEngine::RowScanSession RScan;
-                PrefetchEngine::BeginRowScan(RT, RScan);
+                Superfetch::RowScanSession RScan;
+                Superfetch::BeginRowScan(RT, RScan);
                 for(std::size_t Ri = 0; Ri < RT.size(); ++Ri) {
-                    PrefetchEngine::AdvanceRowScan(RT, Ri, RScan);
+                    Superfetch::AdvanceRowScan(RT, Ri, RScan);
                     RhsSigs.insert(RowSignatureCanon(MapRowByColumnList(RT[Ri], Rsrc, OutNames)));
                 }
                 std::unordered_set<std::string> OutSeen;
-                PrefetchEngine::RowScanSession LScan;
-                PrefetchEngine::BeginRowScan(LT, LScan);
+                Superfetch::RowScanSession LScan;
+                Superfetch::BeginRowScan(LT, LScan);
                 for(std::size_t Li = 0; Li < LT.size(); ++Li) {
-                    PrefetchEngine::AdvanceRowScan(LT, Li, LScan);
+                    Superfetch::AdvanceRowScan(LT, Li, LScan);
                     auto P = MapRowByColumnList(LT[Li], Lsrc, OutNames);
                     const std::string Sig = RowSignatureCanon(P);
                     if(RhsSigs.count(Sig) && OutSeen.insert(Sig).second)
@@ -3879,17 +3904,17 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 }
             } else if(Mode == static_cast<int64_t>(CompoundSetOpKind::Except)) {
                 std::unordered_set<std::string> RhsSigs;
-                PrefetchEngine::RowScanSession RScan;
-                PrefetchEngine::BeginRowScan(RT, RScan);
+                Superfetch::RowScanSession RScan;
+                Superfetch::BeginRowScan(RT, RScan);
                 for(std::size_t Ri = 0; Ri < RT.size(); ++Ri) {
-                    PrefetchEngine::AdvanceRowScan(RT, Ri, RScan);
+                    Superfetch::AdvanceRowScan(RT, Ri, RScan);
                     RhsSigs.insert(RowSignatureCanon(MapRowByColumnList(RT[Ri], Rsrc, OutNames)));
                 }
                 std::unordered_set<std::string> OutSeen;
-                PrefetchEngine::RowScanSession LScan;
-                PrefetchEngine::BeginRowScan(LT, LScan);
+                Superfetch::RowScanSession LScan;
+                Superfetch::BeginRowScan(LT, LScan);
                 for(std::size_t Li = 0; Li < LT.size(); ++Li) {
-                    PrefetchEngine::AdvanceRowScan(LT, Li, LScan);
+                    Superfetch::AdvanceRowScan(LT, Li, LScan);
                     auto P = MapRowByColumnList(LT[Li], Lsrc, OutNames);
                     const std::string Sig = RowSignatureCanon(P);
                     if(!RhsSigs.count(Sig) && OutSeen.insert(Sig).second)
@@ -4306,7 +4331,7 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             const size_t NeedOps = 4u + 2u * static_cast<size_t>(*Npc);
             if(inst.Operands.size() < NeedOps)
                 FailVm("JOIN ON pairs truncated vs count");
-            if(inst.Opcode != Opcode::CROSS_JOIN && *Npc == 0)
+            if(inst.Opcode_ != Opcode::CROSS_JOIN && *Npc == 0)
                 FailVm(
 				    "JOIN uses ON equality columns unless CROSS JOIN (pair count must be positive)");
             std::vector<std::pair<std::string, std::string>> Pairs;
@@ -4321,7 +4346,7 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 Databases_.push_back(std::make_unique<Database>(DatabasePath_));
             Database *DbPtr = Databases_[0].get();
             Database::Table Result;
-            const bool IsCross = inst.Opcode == Opcode::CROSS_JOIN;
+            const bool IsCross = inst.Opcode_ == Opcode::CROSS_JOIN;
             DbPtr->WithExclusiveBytecodeLock([&]() {
                 auto &Left = DbPtr->Tables_[*Lt].RowStore;
                 auto &Right = DbPtr->Tables_[*Rt].RowStore;
@@ -4330,15 +4355,16 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 const auto LeftBlank = CollectBlankColumnKeysFromSchema(LeftSch, Left);
                 const auto RightBlank = CollectBlankColumnKeysFromSchema(RightSch, Right);
 
-            if(inst.Opcode == Opcode::RIGHT_JOIN) {
-                PrefetchEngine::JoinScanSession JoinScan;
-                PrefetchEngine::BeginJoinScan(Right, Left, JoinScan);
+            if(inst.Opcode_ == Opcode::RIGHT_JOIN) {
+                Superfetch::JoinScanSession JoinScan;
+                Superfetch::BeginJoinScan(Right, Left, JoinScan);
                 for(std::size_t Ri = 0; Ri < Right.size(); ++Ri) {
-                    PrefetchEngine::AdvanceJoinOuter(Right, Ri, JoinScan);
+                    Superfetch::AdvanceJoinOuter(Right, Ri, JoinScan);
                     const auto &Rr = Right[Ri];
+                    Superfetch::BeginInnerRescan(Left, JoinScan.Inner);
                     bool AnyPair = false;
                     for(std::size_t Li = 0; Li < Left.size(); ++Li) {
-                        PrefetchEngine::AdvanceJoinInner(Left, Li, JoinScan);
+                        Superfetch::AdvanceJoinInner(Left, Li, JoinScan.Inner);
                         const auto &Lr = Left[Li];
                         if(IsCross || JoinOnMatchPairs(Lr, Rr, Pairs)) {
                             Result.push_back(MergeJoinRowsPreferLeft(Lr, Rr));
@@ -4352,23 +4378,24 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                         Result.push_back(MergeJoinRowsPreferLeft(Pad, Rr));
                     }
                 }
-            } else if(inst.Opcode == Opcode::INNER_JOIN || inst.Opcode == Opcode::LEFT_JOIN ||
-                      inst.Opcode == Opcode::FULL_JOIN || inst.Opcode == Opcode::CROSS_JOIN) {
-                PrefetchEngine::JoinScanSession JoinScan;
-                PrefetchEngine::BeginJoinScan(Left, Right, JoinScan);
+            } else if(inst.Opcode_ == Opcode::INNER_JOIN || inst.Opcode_ == Opcode::LEFT_JOIN ||
+                      inst.Opcode_ == Opcode::FULL_JOIN || inst.Opcode_ == Opcode::CROSS_JOIN) {
+                Superfetch::JoinScanSession JoinScan;
+                Superfetch::BeginJoinScan(Left, Right, JoinScan);
                 for(std::size_t Li = 0; Li < Left.size(); ++Li) {
-                    PrefetchEngine::AdvanceJoinOuter(Left, Li, JoinScan);
+                    Superfetch::AdvanceJoinOuter(Left, Li, JoinScan);
                     const auto &Lr = Left[Li];
+                    Superfetch::BeginInnerRescan(Right, JoinScan.Inner);
                     bool Any = false;
                     for(std::size_t Ri = 0; Ri < Right.size(); ++Ri) {
-                        PrefetchEngine::AdvanceJoinInner(Right, Ri, JoinScan);
+                        Superfetch::AdvanceJoinInner(Right, Ri, JoinScan.Inner);
                         const auto &Rr = Right[Ri];
                         if(IsCross || JoinOnMatchPairs(Lr, Rr, Pairs)) {
                             Result.push_back(MergeJoinRowsPreferLeft(Lr, Rr));
                             Any = true;
                         }
                     }
-                    if(!Any && (inst.Opcode == Opcode::LEFT_JOIN || inst.Opcode == Opcode::FULL_JOIN)) {
+                    if(!Any && (inst.Opcode_ == Opcode::LEFT_JOIN || inst.Opcode_ == Opcode::FULL_JOIN)) {
                         Database::Item J = Lr;
                         for(const auto &K : RightBlank) {
                             if(J.find(K) == J.end())
@@ -4378,15 +4405,16 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                     }
                 }
             }
-            if(inst.Opcode == Opcode::FULL_JOIN) {
-                PrefetchEngine::JoinScanSession FullJoinScan;
-                PrefetchEngine::BeginJoinScan(Right, Left, FullJoinScan);
+            if(inst.Opcode_ == Opcode::FULL_JOIN) {
+                Superfetch::JoinScanSession FullJoinScan;
+                Superfetch::BeginJoinScan(Right, Left, FullJoinScan);
                 for(std::size_t Ri = 0; Ri < Right.size(); ++Ri) {
-                    PrefetchEngine::AdvanceJoinOuter(Right, Ri, FullJoinScan);
+                    Superfetch::AdvanceJoinOuter(Right, Ri, FullJoinScan);
                     const auto &Rr = Right[Ri];
+                    Superfetch::BeginInnerRescan(Left, FullJoinScan.Inner);
                     bool AnyInner = false;
                     for(std::size_t Li = 0; Li < Left.size(); ++Li) {
-                        PrefetchEngine::AdvanceJoinInner(Left, Li, FullJoinScan);
+                        Superfetch::AdvanceJoinInner(Left, Li, FullJoinScan.Inner);
                         const auto &Lr = Left[Li];
                         if(IsCross || JoinOnMatchPairs(Lr, Rr, Pairs)) {
                             AnyInner = true;
@@ -4433,7 +4461,7 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             if (StackSlots_.empty()) FailVm("TRIM requires operand");
             std::string str = PopOwnedStringMoved("TRIM");
             std::string result;
-            switch (inst.Opcode) {
+            switch (inst.Opcode_) {
                 case Opcode::TRIM: result = str; break;
                 case Opcode::LTRIM: result = str.substr(str.find_first_not_of(" \t\r\n")); break;
                 case Opcode::RTRIM: result = str.substr(0, str.find_last_not_of(" \t\r\n") + 1); break;
@@ -4509,7 +4537,7 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
 				FailVm("MATCH/AGAINST requires two operands");
             const std::string Query = PopOwnedStringMoved("MATCH query");
             const std::string Text = PopOwnedStringMoved("MATCH text");
-			const bool Hit = inst.Opcode == Opcode::AGAINST ? TextSearch::MatchAgainst(Text, Query) :
+			const bool Hit = inst.Opcode_ == Opcode::AGAINST ? TextSearch::MatchAgainst(Text, Query) :
 			                                                  TextSearch::MatchesQuery(Text, Query);
 			PushOwningStringHeap(new std::string(Hit ? "1" : "0"));
             ++Ic;
@@ -4537,7 +4565,7 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             if(Databases_.empty())
                 Databases_.push_back(std::make_unique<Database>(DatabasePath_));
             Database *DbOlap = Databases_[0].get();
-            const bool Cube = (inst.Opcode == Opcode::CUBE);
+            const bool Cube = (inst.Opcode_ == Opcode::CUBE);
             DbOlap->WithExclusiveBytecodeLock([&]() {
                 auto &Tbl = DbOlap->Tables_[TableName].RowStore;
                 RunOlapModifier(Tbl, inst, Keys, Cube);
@@ -4590,7 +4618,7 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                     auto ItSq = Databases_[0]->Tables_.find(*subqueryTable);
                     const Database::Table &subquery =
                         ItSq == Databases_[0]->Tables_.end() ? kEmptySubquery : ItSq->second.RowStore;
-                    switch(inst.Opcode) {
+                    switch(inst.Opcode_) {
                     case Opcode::EXISTS:
                         result = !subquery.empty();
                         break;
@@ -4624,7 +4652,7 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                                 anyMatch |= itemMatch;
                                 allMatch &= itemMatch;
                             }
-                            result = (inst.Opcode == Opcode::ANY) ? anyMatch : allMatch;
+                            result = (inst.Opcode_ == Opcode::ANY) ? anyMatch : allMatch;
                         }
                         break;
                     default:
@@ -4746,7 +4774,7 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
 			break;
 		}
         default:
-            std::cerr << "Unimplemented opcode: " << static_cast<int>(inst.Opcode) << std::endl;
+            std::cerr << "Unimplemented opcode: " << static_cast<int>(inst.Opcode_) << std::endl;
             FailVm("Unimplemented opcode");
     }
     return true;

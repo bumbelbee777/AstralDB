@@ -4,7 +4,7 @@
 #include <Database/HybridStorageScheduler.hxx>
 #include <Database/Dataset.hxx>
 #include <Database/HybridTable.hxx>
-#include <Database/PrefetchEngine.hxx>
+#include <Database/Superfetch.hxx>
 #include <IO/Limits.hxx>
 #include <IO/Spinlock.hxx>
 #include <mutex>

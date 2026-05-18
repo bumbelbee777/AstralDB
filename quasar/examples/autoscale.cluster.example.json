@@ -1,0 +1,31 @@
+{
+  "shards": [
+    { "name": "shard0", "database": "data/shard0.db" },
+    { "name": "shard1", "database": "data/shard1.db" },
+    { "name": "shard2", "database": "data/shard2.db" }
+  ],
+  "virtual_nodes": 128,
+  "backup_dir": "backups",
+  "pool": {
+    "enabled": true,
+    "max_queue": 10000,
+    "max_workers": 32
+  },
+  "autoscaling": {
+    "enabled": true,
+    "min_shards": 3,
+    "max_shards": 12,
+    "scale_out_step": 1,
+    "cooldown_sec": 600,
+    "auto_apply": false,
+    "rebalance_on_scale": true,
+    "scale_out_pool_rejects": 5,
+    "scale_out_error_rate": 0.1,
+    "scale_out_mean_latency_ms": 500,
+    "scale_out_max_shard_bytes": 5368709120,
+    "scale_in_error_rate": 0.01,
+    "scale_in_mean_latency_ms": 80,
+    "scale_in_max_shard_bytes": 1073741824
+  },
+  "rebalance": { "shard_key_column": "id" }
+}

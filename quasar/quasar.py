@@ -13,6 +13,7 @@ import os
 import shutil
 import sys
 import time
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -27,7 +28,13 @@ from quasar.config import (
     normalize_cluster_config,
     validate_cluster_config,
 )
-from quasar.errors import QuasarCircuitOpenError, QuasarOverloadError, QuasarSecurityError
+from quasar.errors import (
+    QuasarCircuitOpenError,
+    QuasarLockError,
+    QuasarOverloadError,
+    QuasarRestoreError,
+    QuasarSecurityError,
+)
 from quasar.security import (
     SecurityPolicy,
     RateLimiter,
@@ -255,14 +262,41 @@ class QuasarBackup:
         (dest / "manifest.json").write_text(manifest.to_json(), encoding="utf-8")
         return dest
 
-    def restore(self, version: str, target_db: PathLike, *, overwrite: bool = False) -> Path:
+    def _assert_quiescent(self, target_db: Path, *, quiesce_sec: float, force: bool) -> None:
+        """Warn if WAL was touched recently (likely an active writer)."""
+        if force or quiesce_sec <= 0:
+            return
+        wal = self._wal_path(target_db)
+        if not wal.exists():
+            return
+        age = time.time() - wal.stat().st_mtime
+        if age < quiesce_sec:
+            raise QuasarRestoreError(
+                f"refusing restore: {wal.name} modified {age:.1f}s ago "
+                f"(< {quiesce_sec}s quiesce window). Stop writers or pass force=True."
+            )
+
+    def restore(
+        self,
+        version: str,
+        target_db: PathLike,
+        *,
+        overwrite: bool = False,
+        force: bool = False,
+        quiesce_sec: float = 2.0,
+        checkpoint_source: bool = False,
+        client: Optional["AstralDBClient"] = None,
+    ) -> Path:
         src_dir = self.backup_dir / version
         if not src_dir.is_dir():
             raise FileNotFoundError(f"backup version not found: {version}")
 
         target_db = Path(target_db)
+        self._assert_quiescent(target_db, quiesce_sec=quiesce_sec, force=force)
         if target_db.exists() and not overwrite:
             raise FileExistsError(f"refusing to overwrite existing database: {target_db}")
+        if checkpoint_source and client is not None and target_db.exists():
+            client.checkpoint_sql(database=target_db)
 
         target_db.parent.mkdir(parents=True, exist_ok=True)
         main_name = target_db.name
@@ -488,11 +522,15 @@ class QuasarCluster:
                 self.client.warm([n.database for n in self.shard.nodes])
         from quasar.workload import ShardCircuitBreaker, WorkloadGuard
 
+        from quasar.recovery import RetryPolicy
+
         wl = self.config.get("workload", {})
         breaker = ShardCircuitBreaker()
         breaker.config.failure_threshold = int(wl.get("circuit_failure_threshold", 5))
         breaker.config.cooldown_sec = float(wl.get("circuit_cooldown_sec", 30))
-        self.workload = WorkloadGuard(breaker)
+        breaker.config.half_open_max_probes = int(wl.get("circuit_half_open_max_probes", 1))
+        self._retry_policy = RetryPolicy.from_config(self.config.get("recovery"))
+        self.workload = WorkloadGuard(breaker, retry_policy=self._retry_policy)
         self.regions = self._build_regions()
         self.replicas: Dict[str, QuasarReplica] = {}
         for name, spec in self.config.get("replicas", {}).items():
@@ -504,6 +542,15 @@ class QuasarCluster:
         backup_dir = self.config.get("backup_dir")
         self.backup = QuasarBackup(backup_dir) if backup_dir else None
         self.failover = self._build_failover()
+        self.consensus = self._build_consensus()
+        self.dtxn = self._build_dtxn()
+        self.recovery_auto = self._build_recovery_auto()
+        self.autoscale = self._build_autoscale()
+        self.cross_query_api = None
+        if self.config.get("cross_query", {}).get("enabled", True):
+            from quasar.crossquery import QuasarCrossQuery
+
+            self.cross_query_api = QuasarCrossQuery(self)
         self.multimaster = self._build_multimaster()
         rb_cfg = self.config.get("rebalance", {})
         from quasar.rebalance import QuasarRebalance
@@ -514,6 +561,37 @@ class QuasarCluster:
             shard_key_column=rb_cfg.get("shard_key_column", "id"),
             virtual_nodes=int(self.config.get("virtual_nodes", 128)),
         )
+        self.rebalance_auto = self._build_rebalance_auto()
+        locks_cfg = self.config.get("locks", {})
+        self._locks_enabled = bool(locks_cfg.get("enabled", False))
+        self._lock_timeout_sec = float(locks_cfg.get("timeout_sec", 30.0))
+        self._build_financial()
+
+    def _build_financial(self) -> None:
+        from quasar.audit import QuasarJournal
+        from quasar.idempotency import IdempotencyConfig, IdempotencyStore
+        from quasar.ledger import FinancialConfig, QuasarLedger, QuasarReconciler
+        from quasar.saga import QuasarSaga
+
+        fin_raw = self.config.get("financial", {}) or {}
+        self.financial = FinancialConfig.from_config(fin_raw)
+        self.journal: Optional[QuasarJournal] = None
+        self.idempotency: Optional[IdempotencyStore] = None
+        self.saga: Optional[QuasarSaga] = None
+        self.ledger: Optional[QuasarLedger] = None
+        self.reconciler: Optional[QuasarReconciler] = None
+        if not self.financial.enabled:
+            return
+        base = self.config_path.parent if self.config_path else Path.cwd()
+        journal_path = base / str(fin_raw.get("journal_file", ".quasar/journal.jsonl"))
+        self.journal = QuasarJournal(journal_path)
+        idem_dir = base / str(fin_raw.get("idempotency_dir", ".quasar/idempotency"))
+        idem_cfg = IdempotencyConfig.from_config(fin_raw.get("idempotency"))
+        self.idempotency = IdempotencyStore(self, idem_cfg, base_dir=idem_dir)
+        saga_dir = base / str(fin_raw.get("saga_state_dir", ".quasar/sagas"))
+        self.saga = QuasarSaga(self, state_dir=saga_dir, journal=self.journal)
+        self.ledger = QuasarLedger(self, self.financial, saga=self.saga)
+        self.reconciler = QuasarReconciler(self)
 
     def _create_client(self) -> AstralDBClient:
         from quasar.pool import create_client
@@ -525,14 +603,76 @@ class QuasarCluster:
             pool_config=pool_args,
             use_pool=use_pool,
             security_policy=self.security,
+            recovery_config=self.config.get("recovery"),
+            mvcc_config=self.config.get("mvcc"),
         )
 
     def close(self) -> None:
         """Release pool workers, region replicator, etc."""
+        if self.recovery_auto is not None:
+            self.recovery_auto.stop_background()
         if hasattr(self.client, "close"):
             self.client.close()
         if self.regions is not None:
             self.regions.close()
+
+    def recovery_tick(self, *, force: bool = False) -> Dict[str, Any]:
+        """Automated crash recovery (dtxn + rollbacks + pool heal)."""
+        if self.recovery_auto is None:
+            if force:
+                from quasar.recovery_auto import CrashRecoveryManager, RecoveryAutomationConfig
+
+                mgr = CrashRecoveryManager(self, RecoveryAutomationConfig(enabled=True))
+                return mgr.run(force=True)
+            return {"skipped": True}
+        return self.recovery_auto.run(force=force)
+
+    def autoscale_tick(self, *, apply: Optional[bool] = None) -> Dict[str, Any]:
+        """Evaluate metrics and optionally add shards (see ``autoscaling`` config)."""
+        if self.autoscale is None:
+            from quasar.autoscale import AutoscaleConfig, QuasarAutoscale
+
+            mgr = QuasarAutoscale(self, AutoscaleConfig(enabled=True))
+            report = mgr.tick(apply=apply)
+        else:
+            report = self.autoscale.tick(apply=apply)
+        if report.get("applied") and self.rebalance_auto is not None:
+            rb_raw = self.config.get("rebalance", {})
+            if rb_raw.get("auto_apply") or self.config.get("autoscaling", {}).get("rebalance_on_scale"):
+                report["rebalance"] = self.rebalance_auto.tick(force_apply=True)
+        return report
+
+    def rebalance_tick(self, *, force_apply: Optional[bool] = None) -> Dict[str, Any]:
+        """Automatic rebalance plan/apply (see ``rebalance`` automation keys)."""
+        if self.rebalance_auto is None:
+            from quasar.rebalance_auto import QuasarRebalanceAutomator, RebalanceAutomationConfig
+
+            auto = QuasarRebalanceAutomator(self, RebalanceAutomationConfig(enabled=True))
+            return auto.tick(force_apply=force_apply)
+        return self.rebalance_auto.tick(force_apply=force_apply)
+
+    def consensus_status(self) -> Dict[str, Any]:
+        if self.consensus is None:
+            return {"enabled": False}
+        return self.consensus.status()
+
+    def cross_query(
+        self,
+        sql: Optional[str] = None,
+        *,
+        merge: bool = False,
+        queries: Optional[List[Dict[str, str]]] = None,
+        parallel: bool = True,
+    ):
+        if self.cross_query_api is None:
+            from quasar.crossquery import QuasarCrossQuery
+
+            self.cross_query_api = QuasarCrossQuery(self)
+        if queries:
+            return self.cross_query_api.scatter_gather(queries, parallel=parallel)
+        if not sql:
+            raise ValueError("sql or queries required")
+        return self.cross_query_api.fanout(sql, merge=merge, parallel=parallel)
 
     def _build_regions(self):
         if not self.config.get("regions"):
@@ -545,7 +685,7 @@ class QuasarCluster:
         fo = self.config.get("failover", {})
         if not fo.get("enabled"):
             return None
-        from quasar.failover import FailoverTarget, QuasarFailover
+        from quasar.failover import FailoverPolicy, FailoverTarget, QuasarFailover
 
         targets: Dict[str, FailoverTarget] = {}
         for name, spec in fo.get("shards", {}).items():
@@ -560,13 +700,101 @@ class QuasarCluster:
             state_path = Path(state) if Path(state).is_absolute() else base / state
         else:
             state_path = Path(state)
+        policy = FailoverPolicy.from_config(fo)
         return QuasarFailover(
             self.shard,
             targets,
             client=self.client,
             state_file=state_path,
             auto_promote=bool(fo.get("auto_promote", True)),
+            policy=policy,
         )
+
+    def reload_shards(self) -> None:
+        """Reload shard ring and dependent planners after ``cluster.json`` changes."""
+        self.shard = QuasarShard.from_config(
+            self.config, client=self.client, config_path=self.config_path
+        )
+        rb_cfg = self.config.get("rebalance", {})
+        from quasar.rebalance import QuasarRebalance
+
+        self.rebalance = QuasarRebalance(
+            self.shard,
+            client=self.client,
+            shard_key_column=rb_cfg.get("shard_key_column", "id"),
+            virtual_nodes=int(self.config.get("virtual_nodes", 128)),
+        )
+        if self.dtxn is not None:
+            self.dtxn.shard = self.shard
+            self.dtxn._by_name = {n.name: n for n in self.shard.nodes}
+
+    def _build_consensus(self):
+        from quasar.consensus import build_consensus
+
+        cons = build_consensus(self)
+        if cons is not None and not cons.is_leader():
+            cons.elect_leader()
+        return cons
+
+    def _build_rebalance_auto(self):
+        from quasar.rebalance_auto import QuasarRebalanceAutomator, RebalanceAutomationConfig
+
+        rb = self.config.get("rebalance", {})
+        auto_raw = rb.get("automation")
+        if isinstance(auto_raw, dict):
+            cfg = RebalanceAutomationConfig.from_config(auto_raw)
+        else:
+            cfg = RebalanceAutomationConfig(
+                enabled=bool(rb.get("auto_apply")) or float(rb.get("interval_sec", 0)) > 0,
+                auto_apply=bool(rb.get("auto_apply")),
+                interval_sec=float(rb.get("interval_sec", 0)),
+                delete_from_source=bool(rb.get("delete_from_source", False)),
+            )
+        if not cfg.enabled:
+            return None
+        return QuasarRebalanceAutomator(self, cfg)
+
+    def _build_autoscale(self):
+        from quasar.autoscale import AutoscaleConfig, QuasarAutoscale
+
+        raw = self.config.get("autoscaling", {})
+        cfg = AutoscaleConfig.from_config(raw)
+        if not cfg.enabled:
+            return None
+        return QuasarAutoscale(self, cfg)
+
+    def _build_recovery_auto(self):
+        from quasar.recovery_auto import CrashRecoveryManager, RecoveryAutomationConfig
+
+        raw = self.config.get("recovery_automation", {})
+        cfg = RecoveryAutomationConfig.from_config(raw)
+        if not cfg.enabled:
+            return None
+        mgr = CrashRecoveryManager(self, cfg)
+        if cfg.on_start:
+            mgr.run()
+        mgr.start_background()
+        return mgr
+
+    def _build_dtxn(self):
+        from quasar.dtxn import DistributedTransactionCoordinator, DistributedTxnConfig
+
+        raw = self.config.get("distributed_txn", {})
+        base = self.config_path.parent if self.config_path else None
+        cfg = DistributedTxnConfig.from_config(raw, base)
+        if not cfg.enabled:
+            return None
+        coord = DistributedTransactionCoordinator(
+            self.shard,
+            self.client,
+            wal_path=Path(cfg.wal_file),
+            participant_log_dir=Path(cfg.participant_log_dir),
+            config=cfg,
+            consensus=self.consensus,
+        )
+        if cfg.recover_on_start:
+            coord.recover()
+        return coord
 
     def _build_multimaster(self):
         mm = self.config.get("multi_master")
@@ -602,6 +830,12 @@ class QuasarCluster:
         config_path = Path(path)
         return cls(load_cluster_config(config_path), client=client, config_path=config_path)
 
+    def _lock_targets(self, shard_key: Optional[str]) -> List[Path]:
+        active = self.active_shard()
+        if shard_key is not None:
+            return [active.node_for_key(shard_key).database]
+        return [n.database for n in active.nodes]
+
     def execute(
         self,
         sql: str,
@@ -612,6 +846,29 @@ class QuasarCluster:
         validate_sql(sql, self.security)
         if shard_key is not None:
             validate_shard_key(shard_key, self.security)
+        return self._execute_unlocked(sql, shard_key=shard_key, multi_master=multi_master)
+
+    def execute_merged(
+        self,
+        sql: str,
+        *,
+        shard_key: Optional[str] = None,
+    ):
+        from quasar.merge import merge_routed_results
+
+        results = self._execute_unlocked(sql, shard_key=shard_key, multi_master=False)
+        merged = merge_routed_results(results, sql=sql)
+        if not merged.all_ok:
+            raise RuntimeError("fan-out merge: one or more shards failed")
+        return merged
+
+    def _execute_unlocked(
+        self,
+        sql: str,
+        *,
+        shard_key: Optional[str] = None,
+        multi_master: bool = False,
+    ) -> List[RoutedResult]:
         if multi_master and shard_key and self.multimaster:
             mm = self.multimaster.write(sql, shard_key=shard_key)
             writers = self.multimaster.groups[mm.shard].writers
@@ -623,24 +880,47 @@ class QuasarCluster:
                 self.monitor.record(r.result)
             return routed
 
-        active = self.active_shard()
-        if shard_key:
-            node = active.node_for_key(shard_key)
-            if not self.workload.check(node.name):
-                raise QuasarCircuitOpenError(f"circuit breaker open for shard: {node.name}")
+        lock_ctx = nullcontext()
+        if self._locks_enabled:
+            from quasar.locks import lock_databases
+
+            lock_ctx = lock_databases(
+                self._lock_targets(shard_key),
+                timeout_sec=self._lock_timeout_sec,
+            )
         try:
-            results = active.execute(sql, shard_key=shard_key)
-        except Exception:
-            if shard_key:
-                self.workload.failure(active.node_for_key(shard_key).name)
-            raise
-        for r in results:
-            self.monitor.record(r.result)
-            if r.result.ok:
-                self.workload.success(r.node)
-            else:
-                self.workload.failure(r.node)
-        return results
+            with lock_ctx:
+                active = self.active_shard()
+
+                def _run() -> List[RoutedResult]:
+                    return active.execute(sql, shard_key=shard_key)
+
+                routed_via_workload = False
+                if shard_key:
+                    node = active.node_for_key(shard_key)
+                    results = self.workload.run(node.name, _run)
+                    routed_via_workload = True
+                elif self._retry_policy.max_retries > 0:
+                    from quasar.recovery import execute_with_retry
+
+                    results = execute_with_retry(
+                        _run,
+                        self._retry_policy,
+                        stats=self.workload.retry_stats,
+                    )
+                else:
+                    results = _run()
+
+                for r in results:
+                    self.monitor.record(r.result)
+                    if not routed_via_workload:
+                        if r.result.ok:
+                            self.workload.success(r.node)
+                        else:
+                            self.workload.failure(r.node)
+                return results
+        except QuasarLockError:
+            raise QuasarOverloadError("could not acquire database lock") from None
 
     def cross_join(self, spec_path: PathLike) -> List[Dict[str, Any]]:
         from quasar.crossjoin import CrossJoinSpec, QuasarCrossShardJoin
@@ -679,11 +959,20 @@ class QuasarCluster:
     def cross_shard_transaction(self, statements: Optional[List[Dict[str, str]]] = None):
         from quasar.xtxn import CrossShardTransaction, TxnStatement
 
-        txn = CrossShardTransaction(self.active_shard(), client=self.client)
         if statements:
             stmts = [TxnStatement(sql=s["sql"], shard_key=s["shard_key"]) for s in statements]
+            if self.dtxn is not None:
+                return self.dtxn.run(stmts)
+            txn = CrossShardTransaction(self.active_shard(), client=self.client)
             return txn.run(stmts)
-        return txn
+        if self.dtxn is not None:
+            return self.dtxn
+        return CrossShardTransaction(self.active_shard(), client=self.client)
+
+    def dtxn_recover(self) -> List[Dict[str, Any]]:
+        if self.dtxn is None:
+            raise RuntimeError("distributed_txn not enabled in cluster config")
+        return self.dtxn.recover()
 
     def pool_stats(self) -> Dict[str, float]:
         if hasattr(self.client, "pool_stats"):
@@ -691,10 +980,14 @@ class QuasarCluster:
         return {}
 
     def workload_stats(self) -> Dict[str, Any]:
-        return {
+        out: Dict[str, Any] = {
             "stats": self.workload.stats.to_dict(),
             "circuits": self.workload.breaker.snapshot(),
+            "retry": self.workload.retry_stats.to_dict(),
         }
+        if hasattr(self.client, "retry_stats"):
+            out["pool_retry"] = self.client.retry_stats.to_dict()
+        return out
 
     def region_write(self, sql: str, *, shard_key: str):
         if self.regions is None:
@@ -791,16 +1084,113 @@ class QuasarCluster:
             "config_path": str(self.config_path) if self.config_path else None,
         }
 
+    def execute_idempotent(
+        self,
+        sql: str,
+        *,
+        shard_key: str,
+        idempotency_key: str,
+    ) -> List[RoutedResult]:
+        """Run SQL once per idempotency key (file or table store)."""
+        if self.idempotency is None:
+            raise RuntimeError("financial.idempotency not enabled in cluster config")
+        from quasar.idempotency import digest_result
+
+        existing = self.idempotency.get(idempotency_key, shard_key=shard_key)
+        if existing and existing.get("status") == "completed":
+            if self.journal:
+                self.journal.record(
+                    "IDEMPOTENT_REPLAY",
+                    detail=idempotency_key,
+                    idempotency_key=idempotency_key,
+                )
+            node = self.shard.node_for_key(shard_key)
+            from quasar.client import QueryResult
+
+            cached = QueryResult(
+                stdout=f"IDEMPOTENT:{existing.get('response_digest', '')}",
+                stderr="",
+                returncode=0,
+                elapsed_ms=0.0,
+            )
+            return [RoutedResult(node=node.name, database=node.database, result=cached)]
+        self.idempotency.begin(idempotency_key, shard_key=shard_key)
+        try:
+            results = self.execute(sql, shard_key=shard_key)
+            digest = digest_result([r.result.stdout for r in results])
+            self.idempotency.complete(idempotency_key, shard_key=shard_key, digest=digest)
+            if self.journal:
+                self.journal.record(
+                    "IDEMPOTENT_OK",
+                    detail=idempotency_key,
+                    idempotency_key=idempotency_key,
+                )
+            return results
+        except Exception:
+            self.idempotency.fail(idempotency_key, shard_key=shard_key)
+            if self.journal:
+                self.journal.record(
+                    "IDEMPOTENT_FAIL",
+                    detail=idempotency_key,
+                    outcome="FAIL",
+                    idempotency_key=idempotency_key,
+                )
+            raise
+
+    def run_saga(self, spec: Dict[str, Any]):
+        if self.saga is None:
+            raise RuntimeError("financial not enabled in cluster config")
+        return self.saga.run_spec(spec)
+
+    def transfer(self, request: Dict[str, Any]):
+        if self.ledger is None:
+            raise RuntimeError("financial not enabled in cluster config")
+        from quasar.ledger import TransferRequest
+
+        req = TransferRequest(
+            txn_id=str(request["txn_id"]),
+            from_account=str(request["from_account"]),
+            to_account=str(request["to_account"]),
+            amount_cents=int(request["amount_cents"]),
+            from_shard_key=str(request["from_shard_key"]),
+            to_shard_key=str(request["to_shard_key"]),
+            currency=str(request.get("currency", self.financial.currency)),
+        )
+        if self.journal:
+            self.journal.record("TRANSFER_START", detail=req.txn_id, extra=request)
+        result = self.ledger.transfer(req)
+        if self.journal:
+            self.journal.record("TRANSFER_END", detail=req.txn_id, outcome=result.status)
+        return result
+
+    def reconcile(self, *, probe_sql: Optional[str] = None):
+        if self.reconciler is None:
+            raise RuntimeError("financial not enabled in cluster config")
+        if probe_sql:
+            return self.reconciler.probe(probe_sql)
+        return self.reconciler.sum_balances()
+
+    def region_write_strict(self, sql: str, *, shard_key: str):
+        if self.regions is None:
+            raise RuntimeError("regions not configured")
+        from quasar.distribute import strict_region_replicate
+
+        return strict_region_replicate(self.regions, sql, shard_key=shard_key)
+
     def check_drift(
         self,
         *,
         probe_sql: Optional[str] = None,
         use_hashes: bool = True,
+        check_replicas: bool = False,
     ) -> List[Dict[str, Any]]:
         from quasar.drift import QuasarDrift
 
         drift = QuasarDrift(self.shard, client=self.client)
-        return [r.to_dict() for r in drift.check(probe_sql=probe_sql, use_hashes=use_hashes)]
+        reports = [r.to_dict() for r in drift.check(probe_sql=probe_sql, use_hashes=use_hashes)]
+        if check_replicas and self.replicas:
+            reports.extend(r.to_dict() for r in QuasarDrift.check_all_replicas(self.replicas))
+        return reports
 
 
 def format_prometheus_metrics(cluster: QuasarCluster) -> str:
@@ -845,10 +1235,16 @@ def create_gateway_app(cluster: QuasarCluster, *, api_key: Optional[str] = None)
     def _handle_error(err):
         if isinstance(err, QuasarSecurityError):
             return jsonify({"error": "bad request"}), 400
+        if isinstance(err, QuasarRestoreError):
+            return jsonify({"error": "unsafe restore"}), 409
         if isinstance(err, QuasarOverloadError):
-            return jsonify({"error": "overloaded"}), 503
+            resp = jsonify({"error": "overloaded"})
+            resp.headers["Retry-After"] = "1"
+            return resp, 503
         if isinstance(err, QuasarCircuitOpenError):
-            return jsonify({"error": "shard unavailable"}), 503
+            resp = jsonify({"error": "shard unavailable"})
+            resp.headers["Retry-After"] = "5"
+            return resp, 503
         return jsonify({"error": "internal error"}), 500
 
     def _rate_limit() -> Optional[tuple]:
@@ -909,7 +1305,11 @@ def create_gateway_app(cluster: QuasarCluster, *, api_key: Optional[str] = None)
         shard_key = body.get("shard_key")
         if shard_key is not None and not isinstance(shard_key, str):
             return jsonify({"error": "invalid shard_key"}), 400
+        merge = bool(body.get("merge"))
         try:
+            if merge and shard_key is None:
+                merged = cluster.execute_merged(sql, shard_key=None)
+                return jsonify(merged.to_dict())
             results = cluster.execute(sql, shard_key=shard_key)
             return jsonify(
                 [
@@ -926,9 +1326,14 @@ def create_gateway_app(cluster: QuasarCluster, *, api_key: Optional[str] = None)
             )
         except QuasarSecurityError:
             return jsonify({"error": "bad request"}), 400
+        except ValueError:
+            return jsonify({"error": "merge not allowed for this SQL"}), 400
         except (RuntimeError, QuasarCircuitOpenError, QuasarOverloadError) as err:
             code = 503 if isinstance(err, (QuasarCircuitOpenError, QuasarOverloadError)) else 500
-            return jsonify({"error": str(err)}), code
+            resp = jsonify({"error": str(err)})
+            if code == 503:
+                resp.headers["Retry-After"] = "5" if isinstance(err, QuasarCircuitOpenError) else "1"
+            return resp, code
 
     @app.route("/cross-join", methods=["POST"])
     def cross_join_route():
@@ -966,6 +1371,105 @@ def create_gateway_app(cluster: QuasarCluster, *, api_key: Optional[str] = None)
             return auth
         return jsonify(cluster.failover_tick())
 
+    @app.route("/dtxn/recover", methods=["POST"])
+    def dtxn_recover_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        try:
+            return jsonify({"recovered": cluster.dtxn_recover()})
+        except RuntimeError as err:
+            return jsonify({"error": str(err)}), 400
+
+    @app.route("/recover", methods=["POST"])
+    def recover_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        body = request.get_json(force=True, silent=True) or {}
+        force = bool(body.get("force"))
+        return jsonify(cluster.recovery_tick(force=force))
+
+    @app.route("/consensus", methods=["GET", "POST"])
+    def consensus_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        if request.method == "POST":
+            body = request.get_json(force=True, silent=True) or {}
+            if body.get("elect"):
+                if cluster.consensus:
+                    cluster.consensus.elect_leader()
+            return jsonify(cluster.consensus_status())
+        return jsonify(cluster.consensus_status())
+
+    @app.route("/rebalance-auto", methods=["POST"])
+    def rebalance_auto_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        body = request.get_json(force=True, silent=True) or {}
+        apply = body.get("apply")
+        return jsonify(cluster.rebalance_tick(force_apply=bool(apply) if apply is not None else None))
+
+    @app.route("/autoscale", methods=["GET", "POST"])
+    def autoscale_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        body = request.get_json(force=True, silent=True) or {} if request.method == "POST" else {}
+        apply = body.get("apply") if request.method == "POST" else None
+        if apply is not None:
+            apply = bool(apply)
+        return jsonify(cluster.autoscale_tick(apply=apply))
+
+    @app.route("/cross-query", methods=["POST"])
+    def cross_query_route():
+        blocked = _rate_limit() or _check_auth()
+        if blocked:
+            return blocked
+        body = request.get_json(force=True, silent=True) or {}
+        try:
+            from quasar.crossquery import CrossQuerySpec
+
+            spec = CrossQuerySpec.from_dict(body)
+            api = cluster.cross_query_api
+            if api is None:
+                from quasar.crossquery import QuasarCrossQuery
+
+                api = QuasarCrossQuery(cluster)
+            result = api.execute(spec)
+            return jsonify(result.to_dict())
+        except ValueError as err:
+            return jsonify({"error": str(err)}), 400
+        except (RuntimeError, QuasarCircuitOpenError, QuasarOverloadError) as err:
+            code = 503 if isinstance(err, (QuasarCircuitOpenError, QuasarOverloadError)) else 500
+            return jsonify({"error": str(err)}), code
+
+    @app.route("/status", methods=["GET"])
+    def status():
+        auth = _check_auth()
+        if auth:
+            return auth
+        hash_files = request.args.get("hash", "").lower() in ("1", "true", "yes")
+        return jsonify(cluster.status(hash_files=hash_files))
+
+    @app.route("/drift", methods=["GET"])
+    def drift():
+        auth = _check_auth()
+        if auth:
+            return auth
+        probe_sql = request.args.get("probe_sql")
+        use_hashes = request.args.get("no_hash", "").lower() not in ("1", "true", "yes")
+        check_replicas = request.args.get("replicas", "").lower() in ("1", "true", "yes")
+        reports = cluster.check_drift(
+            probe_sql=probe_sql,
+            use_hashes=use_hashes,
+            check_replicas=check_replicas,
+        )
+        consistent = all(r["consistent"] for r in reports) if reports else True
+        return jsonify({"consistent": consistent, "reports": reports}), 200 if consistent else 409
+
     @app.route("/shards", methods=["GET"])
     def shards():
         auth = _check_auth()
@@ -988,6 +1492,45 @@ def create_gateway_app(cluster: QuasarCluster, *, api_key: Optional[str] = None)
             return jsonify({"error": "missing key query param"}), 400
         node = cluster.shard.node_for_key(key)
         return jsonify({"shard_key": key, "node": node.name, "database": str(node.database)})
+
+    @app.route("/transfer", methods=["POST"])
+    def transfer_route():
+        blocked = _rate_limit() or _check_auth()
+        if blocked:
+            return blocked
+        body = request.get_json(force=True, silent=True) or {}
+        try:
+            result = cluster.transfer(body)
+            code = 200 if result.status == "posted" else 409
+            return jsonify(result.to_dict()), code
+        except RuntimeError as err:
+            return jsonify({"error": str(err)}), 400
+
+    @app.route("/saga", methods=["POST"])
+    def saga_route():
+        blocked = _rate_limit() or _check_auth()
+        if blocked:
+            return blocked
+        body = request.get_json(force=True, silent=True) or {}
+        try:
+            result = cluster.run_saga(body)
+            code = 200 if result.status == "completed" else 409
+            return jsonify(result.to_dict()), code
+        except RuntimeError as err:
+            return jsonify({"error": str(err)}), 400
+
+    @app.route("/reconcile", methods=["GET"])
+    def reconcile_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        probe = request.args.get("probe_sql")
+        try:
+            report = cluster.reconcile(probe_sql=probe)
+            code = 200 if report.consistent else 409
+            return jsonify(report.to_dict()), code
+        except RuntimeError as err:
+            return jsonify({"error": str(err)}), 400
 
     @app.route("/batch", methods=["POST"])
     def batch():
@@ -1093,6 +1636,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_shard.add_argument("sql")
     p_shard.add_argument("--shard-key", help="Route to one shard")
     p_shard.add_argument("--multi-master", action="store_true", help="Quorum write to all masters")
+    p_shard.add_argument(
+        "--merge",
+        action="store_true",
+        help="Broadcast read: merge per-shard stdout into one stream",
+    )
     p_shard.set_defaults(func=_cmd_shard)
 
     p_script = sub.add_parser("script", help="Run a .sql file on a cluster or single DB")
@@ -1121,6 +1669,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_restore.add_argument("version", help="Backup folder name")
     p_restore.add_argument("target_db", type=Path)
     p_restore.add_argument("--overwrite", action="store_true")
+    p_restore.add_argument(
+        "--force",
+        action="store_true",
+        help="Restore even if WAL was modified recently (active writer risk)",
+    )
     p_restore.set_defaults(func=_cmd_restore)
 
     p_blist = sub.add_parser("backup-list", help="List backup versions")
@@ -1173,6 +1726,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_drift.add_argument("config", type=Path)
     p_drift.add_argument("--probe-sql", help="SQL run on each shard; compare stdout")
     p_drift.add_argument("--no-hash", action="store_true", help="Skip file hash comparison")
+    p_drift.add_argument("--replicas", action="store_true", help="Compare replica files to masters")
     p_drift.set_defaults(func=_cmd_drift)
 
     p_ring = sub.add_parser("ring", help="Show shard routing for sample keys")
@@ -1198,7 +1752,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_watch.add_argument("--backup", action="store_true")
     p_watch.add_argument("--incremental", action="store_true")
     p_watch.add_argument("--failover", action="store_true", help="Run failover tick each interval")
+    p_watch.add_argument("--drift", action="store_true", help="Run drift check each tick")
+    p_watch.add_argument("--probe-sql", help="Drift probe SQL (with --drift)")
+    p_watch.add_argument("--replicas", action="store_true", help="Include replica hash drift in --drift")
+    p_watch.add_argument("--recover", action="store_true", help="Run crash recovery each tick")
+    p_watch.add_argument("--autoscale", action="store_true", help="Evaluate autoscale metrics each tick")
+    p_watch.add_argument(
+        "--autoscale-apply",
+        action="store_true",
+        help="Apply scale-out when recommended (or use autoscaling.auto_apply)",
+    )
+    p_watch.add_argument("--rebalance-auto", action="store_true", help="Run automatic rebalance each tick")
+    p_watch.add_argument(
+        "--rebalance-apply",
+        action="store_true",
+        help="Apply rebalance moves (or use rebalance.automation.auto_apply)",
+    )
     p_watch.set_defaults(func=_cmd_watch)
+
+    p_as = sub.add_parser("autoscale", help="Shard autoscaling (evaluate or apply scale-out)")
+    p_as.add_argument("config", type=Path)
+    p_as.add_argument("--apply", action="store_true", help="Add shard(s) when scale-out is recommended")
+    p_as.add_argument("--metrics", action="store_true", help="Print metrics only (no decision)")
+    p_as.set_defaults(func=_cmd_autoscale)
+
+    p_cons = sub.add_parser("consensus", help="Distributed consensus status and leader election")
+    p_cons.add_argument("config", type=Path)
+    p_cons.add_argument("--elect", action="store_true", help="Force leader election for this node")
+    p_cons.set_defaults(func=_cmd_consensus)
+
+    p_rba = sub.add_parser("rebalance-auto", help="Automatic rebalance plan/apply for current ring")
+    p_rba.add_argument("config", type=Path)
+    p_rba.add_argument("--apply", action="store_true", help="Apply moves when plan is non-empty")
+    p_rba.set_defaults(func=_cmd_rebalance_auto)
 
     p_repair = sub.add_parser("repair-replica", help="Copy master DB to replica files")
     p_repair.add_argument("config", type=Path)
@@ -1220,6 +1806,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_fo_run.set_defaults(func=_cmd_failover_run)
     p_fo_reset = p_fo_sub.add_parser("reset")
     p_fo_reset.set_defaults(func=_cmd_failover_reset)
+    p_fo_failback = p_fo_sub.add_parser("fail-back", help="Route shard back to primary when healthy")
+    p_fo_failback.add_argument("shard", help="Shard name")
+    p_fo_failback.set_defaults(func=_cmd_failover_failback)
 
     p_rb = sub.add_parser("rebalance", help="Plan/apply shard rebalancing")
     p_rb.add_argument("config", type=Path)
@@ -1250,11 +1839,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_wl.add_argument("config", type=Path)
     p_wl.set_defaults(func=_cmd_workload_stats)
 
-    p_xtxn = sub.add_parser("xtxn", help="Cross-shard transaction")
+    p_xtxn = sub.add_parser("xtxn", help="Cross-shard ACID transaction (coordinator 2PC)")
     p_xtxn.add_argument("config", type=Path)
     p_xtxn.add_argument("--spec", type=Path, help='JSON: {"statements":[{"sql":"…","shard_key":"…"}]}')
-    p_xtxn.add_argument("--all-shards", action="store_true", help="Begin on every shard")
+    p_xtxn.add_argument("--all-shards", action="store_true", help="Begin on every shard (legacy mode)")
     p_xtxn.set_defaults(func=_cmd_xtxn)
+
+    p_dtxn_rec = sub.add_parser("dtxn-recover", help="Abort in-doubt distributed transactions")
+    p_dtxn_rec.add_argument("config", type=Path)
+    p_dtxn_rec.set_defaults(func=_cmd_dtxn_recover)
+
+    p_recover = sub.add_parser("recover", help="Automated crash recovery (dtxn + rollbacks + pool heal)")
+    p_recover.add_argument("config", type=Path)
+    p_recover.add_argument("--force", action="store_true", help="Run even when recovery_automation is disabled")
+    p_recover.set_defaults(func=_cmd_recover)
+
+    p_xq = sub.add_parser("cross-query", help="Cross-shard fan-out or scatter-gather reads")
+    p_xq.add_argument("config", type=Path)
+    p_xq.add_argument("sql", nargs="?", help="SQL to fan out to all shards")
+    p_xq.add_argument("--merge", action="store_true", help="Merge read results (like shard --merge)")
+    p_xq.add_argument("--spec", type=Path, help="JSON: {sql} or {queries:[{sql,shard_key}]}")
+    p_xq.add_argument("--no-parallel", action="store_true", help="Run shard queries sequentially")
+    p_xq.set_defaults(func=_cmd_cross_query)
 
     p_reg = sub.add_parser("region", help="Multi-region read/write")
     p_reg.add_argument("config", type=Path)
@@ -1264,6 +1870,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_reg.add_argument("--region", help="Target region name for reads")
     p_reg.add_argument("--health", action="store_true", help="Print region health only")
     p_reg.set_defaults(func=_cmd_region)
+
+    p_saga = sub.add_parser("saga", help="Run compensating saga from JSON spec")
+    p_saga.add_argument("config", type=Path)
+    p_saga.add_argument("spec", type=Path)
+    p_saga.set_defaults(func=_cmd_saga)
+
+    p_xfer = sub.add_parser("transfer", help="Cross-shard ledger transfer (saga-backed)")
+    p_xfer.add_argument("config", type=Path)
+    p_xfer.add_argument("spec", type=Path, help="Transfer JSON spec")
+    p_xfer.set_defaults(func=_cmd_transfer)
+
+    p_recon = sub.add_parser("reconcile", help="Cross-shard balance / probe reconciliation")
+    p_recon.add_argument("config", type=Path)
+    p_recon.add_argument("--probe-sql", help="Custom reconciliation SQL")
+    p_recon.set_defaults(func=_cmd_reconcile)
+
+    p_fin_init = sub.add_parser("financial-init", help="Bootstrap accounts/ledger schema on all shards")
+    p_fin_init.add_argument("config", type=Path)
+    p_fin_init.set_defaults(func=_cmd_financial_init)
+
+    p_journal = sub.add_parser("journal", help="Tail Quasar operation journal")
+    p_journal.add_argument("config", type=Path)
+    p_journal.add_argument("--limit", type=int, default=50)
+    p_journal.set_defaults(func=_cmd_journal)
 
     args = parser.parse_args(argv)
     return int(args.func(args))
@@ -1315,6 +1945,10 @@ def _cmd_shard(args: argparse.Namespace) -> int:
             print(f"--- {routed.node} ({routed.database}) ---")
             sys.stdout.write(routed.result.stdout)
         return 0
+    if getattr(args, "merge", False) and not args.shard_key:
+        merged = cluster.execute_merged(args.sql)
+        sys.stdout.write(merged.merged_stdout)
+        return 0 if merged.all_ok else 1
     shard = cluster.active_shard()
     for routed in shard.execute(args.sql, shard_key=args.shard_key):
         print(f"--- {routed.node} ({routed.database}) ---")
@@ -1366,7 +2000,16 @@ def _cmd_backup(args: argparse.Namespace) -> int:
 
 def _cmd_restore(args: argparse.Namespace) -> int:
     backup = QuasarBackup(args.backup_dir)
-    path = backup.restore(args.version, args.target_db, overwrite=args.overwrite)
+    try:
+        path = backup.restore(
+            args.version,
+            args.target_db,
+            overwrite=args.overwrite,
+            force=getattr(args, "force", False),
+        )
+    except QuasarRestoreError as err:
+        print(str(err), file=sys.stderr)
+        return 1
     print(str(path))
     return 0
 
@@ -1439,7 +2082,11 @@ def _cmd_status(args: argparse.Namespace) -> int:
 
 def _cmd_drift(args: argparse.Namespace) -> int:
     cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
-    reports = cluster.check_drift(probe_sql=args.probe_sql, use_hashes=not args.no_hash)
+    reports = cluster.check_drift(
+        probe_sql=args.probe_sql,
+        use_hashes=not args.no_hash,
+        check_replicas=getattr(args, "replicas", False),
+    )
     print(json.dumps(reports, indent=2))
     consistent = all(r["consistent"] for r in reports) if reports else True
     return 0 if consistent else 1
@@ -1490,9 +2137,78 @@ def _cmd_watch(args: argparse.Namespace) -> int:
         backup=args.backup,
         incremental=args.incremental,
         failover=getattr(args, "failover", False),
+        drift=getattr(args, "drift", False),
+        probe_sql=getattr(args, "probe_sql", None),
+        check_replicas=getattr(args, "replicas", False),
+        recover=getattr(args, "recover", False),
+        autoscale=getattr(args, "autoscale", False),
+        autoscale_apply=getattr(args, "autoscale_apply", False),
+        rebalance_auto=getattr(args, "rebalance_auto", False),
+        rebalance_apply=getattr(args, "rebalance_apply", False),
         on_tick=_print_tick,
     )
     return 0
+
+
+def _cmd_consensus(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    if getattr(args, "elect", False) and cluster.consensus:
+        cluster.consensus.elect_leader()
+    print(json.dumps(cluster.consensus_status(), indent=2))
+    return 0
+
+
+def _cmd_rebalance_auto(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    apply = True if getattr(args, "apply", False) else None
+    report = cluster.rebalance_tick(force_apply=apply)
+    print(json.dumps(report, indent=2))
+    return 0 if report.get("action") != "blocked" else 1
+
+
+def _cmd_autoscale(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    if getattr(args, "metrics", False):
+        from quasar.autoscale import AutoscaleConfig, QuasarAutoscale
+
+        mgr = cluster.autoscale or QuasarAutoscale(cluster, AutoscaleConfig(enabled=True))
+        print(json.dumps(mgr.collect_metrics().to_dict(), indent=2))
+        return 0
+    apply = True if getattr(args, "apply", False) else None
+    report = cluster.autoscale_tick(apply=apply)
+    print(json.dumps(report, indent=2))
+    action = report.get("decision", {}).get("action", "none")
+    return 0 if action in ("none", "scale_out", "blocked") else 1
+
+
+def _cmd_recover(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    report = cluster.recovery_tick(force=getattr(args, "force", False))
+    print(json.dumps(report, indent=2))
+    return 0 if report.get("ok") or report.get("skipped") else 1
+
+
+def _cmd_cross_query(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    parallel = not getattr(args, "no_parallel", False)
+    if args.spec:
+        spec = json.loads(args.spec.read_text(encoding="utf-8"))
+        if spec.get("queries"):
+            result = cluster.cross_query(queries=spec["queries"], parallel=parallel)
+        elif spec.get("sql"):
+            result = cluster.cross_query(
+                spec["sql"], merge=bool(spec.get("merge", args.merge)), parallel=parallel
+            )
+        else:
+            print(json.dumps({"error": "spec needs sql or queries"}))
+            return 1
+    elif args.sql:
+        result = cluster.cross_query(args.sql, merge=args.merge, parallel=parallel)
+    else:
+        print(json.dumps({"error": "sql or --spec required"}))
+        return 1
+    print(json.dumps(result.to_dict(), indent=2))
+    return 0 if result.all_ok else 1
 
 
 def _cmd_repair_replica(args: argparse.Namespace) -> int:
@@ -1539,6 +2255,26 @@ def _cmd_failover_reset(args: argparse.Namespace) -> int:
     if cluster.failover is None:
         return 1
     cluster.failover.reset()
+    return 0
+
+
+def _cmd_failover_failback(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    if cluster.failover is None:
+        print(json.dumps({"error": "failover not enabled"}))
+        return 1
+    path = cluster.failover.fail_back(args.shard)
+    if path is None:
+        print(json.dumps({"shard": args.shard, "fail_back": False}))
+        return 1
+    print(json.dumps({"shard": args.shard, "fail_back": str(path)}))
+    return 0
+
+
+def _cmd_dtxn_recover(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    actions = cluster.dtxn_recover()
+    print(json.dumps({"recovered": actions}, indent=2))
     return 0
 
 
@@ -1646,6 +2382,51 @@ def _cmd_region(args: argparse.Namespace) -> int:
             indent=2,
         )
     )
+    return 0
+
+
+def _cmd_saga(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    spec = json.loads(args.spec.read_text(encoding="utf-8"))
+    result = cluster.run_saga(spec)
+    print(json.dumps(result.to_dict(), indent=2))
+    return 0 if result.status == "completed" else 1
+
+
+def _cmd_transfer(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    spec = json.loads(args.spec.read_text(encoding="utf-8"))
+    result = cluster.transfer(spec)
+    print(json.dumps(result.to_dict(), indent=2))
+    return 0 if result.status == "posted" else 1
+
+
+def _cmd_reconcile(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    report = cluster.reconcile(probe_sql=args.probe_sql)
+    print(json.dumps(report.to_dict(), indent=2))
+    return 0 if report.consistent else 1
+
+
+def _cmd_financial_init(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    if cluster.ledger is None:
+        cluster.config.setdefault("financial", {})["enabled"] = True
+        cluster._build_financial()
+    if cluster.ledger is None:
+        print(json.dumps({"error": "set financial.enabled in cluster config"}))
+        return 1
+    cluster.ledger.bootstrap()
+    print(json.dumps({"ok": True, "schema": "accounts,ledger_entries"}))
+    return 0
+
+
+def _cmd_journal(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    if cluster.journal is None:
+        print(json.dumps({"error": "financial not enabled"}))
+        return 1
+    print(json.dumps(cluster.journal.tail(args.limit), indent=2))
     return 0
 
 

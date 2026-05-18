@@ -434,14 +434,14 @@ bool BuildWhereDnf(const ExpressionAST *WhereRoot, std::vector<std::vector<RowTr
 
 Instruction MakeFilterDnf(const std::vector<std::vector<RowTriple>> &Dnf) {
 	Instruction I;
-	I.Opcode = Opcode::FILTER_DNF;
+	I.Opcode_ = Opcode::FILTER_DNF;
 	AppendDnfOperands(I.Operands, Dnf);
 	return I;
 }
 
 Instruction MakeDeleteDnf(const std::string &Table, const std::vector<std::vector<RowTriple>> &Dnf) {
 	Instruction I;
-	I.Opcode = Opcode::DELETE_MATCHING;
+	I.Opcode_ = Opcode::DELETE_MATCHING;
 	I.Operands.push_back(Table);
 	AppendDnfOperands(I.Operands, Dnf);
 	return I;
@@ -451,7 +451,7 @@ Instruction MakeUpdateDnf(const std::string &Table,
                             const std::vector<std::pair<std::string, std::unique_ptr<ExpressionAST>>> &Assigns,
                             const std::vector<std::vector<RowTriple>> &Dnf) {
 	Instruction I;
-	I.Opcode = Opcode::UPDATE_MATCHING;
+	I.Opcode_ = Opcode::UPDATE_MATCHING;
 	I.Operands.push_back(Table);
 	I.Operands.push_back(static_cast<int64_t>(Assigns.size()));
 	for(const auto &[C, E] : Assigns) {
@@ -483,7 +483,7 @@ static void EmitCaseEvalInstruction(const CaseExprAST &C, const std::string &Out
 	if(C.Arms.size() > Limits::MaxCaseWhenArms)
 		FailCodegen("CASE WHEN arm count exceeds configured limit (Limits::MaxCaseWhenArms).");
 	Instruction I;
-	I.Opcode = Opcode::CASE_EVAL;
+	I.Opcode_ = Opcode::CASE_EVAL;
 	I.Operands.push_back(OutCol);
 	I.Operands.push_back(static_cast<int64_t>(C.Arms.size()));
 	for(const auto &Arm : C.Arms) {
@@ -513,7 +513,7 @@ static void EmitCastEvalInstruction(const CastExprAST &C, const std::string &Out
 	if(!C.Operand)
 		FailCodegen("CAST missing operand expression.");
 	Instruction I;
-	I.Opcode = Opcode::CAST_EVAL;
+	I.Opcode_ = Opcode::CAST_EVAL;
 	I.Operands.push_back(OutCol);
 	AppendCaseScalarPayload(I, C.Operand.get());
 	I.Operands.push_back(static_cast<int64_t>(C.Target));
@@ -601,7 +601,7 @@ static void EmitScalarFuncEvalInstruction(const ScalarFuncExprAST &F, const std:
 	if(F.Fn != ScalarSqlFn::ConcatVariadic && F.Args.size() != Need)
 		FailCodegen("Scalar builtin argument count mismatch.");
 	Instruction I;
-	I.Opcode = Opcode::SCALAR_FUNC_EVAL;
+	I.Opcode_ = Opcode::SCALAR_FUNC_EVAL;
 	I.Operands.push_back(OutCol);
 	I.Operands.push_back(ScalarSqlFnTag(F.Fn));
 	I.Operands.push_back(static_cast<int64_t>(F.Args.size()));
@@ -616,7 +616,7 @@ static void EmitScalarFuncEvalInstruction(const ScalarFuncExprAST &F, const std:
 static void EmitGroupingEvalInstruction(const GroupingExprAST &G, const std::string &OutCol,
                                       BytecodeScratch &Instructions) {
 	Instruction I;
-	I.Opcode = Opcode::SCALAR_FUNC_EVAL;
+	I.Opcode_ = Opcode::SCALAR_FUNC_EVAL;
 	I.Operands.push_back(OutCol);
 	I.Operands.push_back(ScalarSqlFnTag(ScalarSqlFn::Grouping));
 	I.Operands.push_back(1LL);
@@ -628,7 +628,7 @@ static void EmitGroupingEvalInstruction(const GroupingExprAST &G, const std::str
 static void EmitGroupingIdEvalInstruction(const GroupingIdExprAST &G, const std::string &OutCol,
                                           BytecodeScratch &Instructions) {
 	Instruction I;
-	I.Opcode = Opcode::SCALAR_FUNC_EVAL;
+	I.Opcode_ = Opcode::SCALAR_FUNC_EVAL;
 	I.Operands.push_back(OutCol);
 	I.Operands.push_back(ScalarSqlFnTag(ScalarSqlFn::GroupingId));
 	I.Operands.push_back(static_cast<int64_t>(G.Columns.size()));
@@ -798,13 +798,13 @@ void CreateAST::EmitBytecode(BytecodeScratch& Instructions) const {
 
 void AlterTableAST::EmitBytecode(BytecodeScratch& Instructions) const {
 	Instruction Alter;
-	Alter.Opcode = Opcode::ALTER_TABLE;
+	Alter.Opcode_ = Opcode::ALTER_TABLE;
 	if(Kind == AlterTableKind::AddColumn) {
 		BytecodeScratch Expanded;
 		EmitCodegenColumnConstraints(AddedColumn.Constraints, Expanded);
 		std::vector<Value> ExpandedOps;
 		for(const auto &Ix : Expanded) {
-			if(Ix.Opcode != Opcode::PUSH || Ix.Operands.size() != 1)
+			if(Ix.Opcode_ != Opcode::PUSH || Ix.Operands.size() != 1)
 				FailCodegen("Internal: malformed expanded ALTER constraints.");
 			ExpandedOps.push_back(Ix.Operands[0]);
 		}
@@ -929,7 +929,7 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 		const JoinClause &Jc = JoinSpecs()[Ij];
 		const std::string Dst = JoinDestPrefix + std::to_string(Ij);
 		Instruction Ji;
-		Ji.Opcode = SqlJoinToOpcode(Jc.Kind);
+		Ji.Opcode_ = SqlJoinToOpcode(Jc.Kind);
 		Ji.Operands.push_back(Dst);
 		Ji.Operands.push_back(Work);
 		Ji.Operands.push_back(ResolveRelationLogicalName(Jc.RightTable, Instructions));
@@ -949,7 +949,7 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 
 	if(AsOfTimestamp()) {
 		Instruction AsOfI;
-		AsOfI.Opcode = Opcode::FILTER_AS_OF;
+		AsOfI.Opcode_ = Opcode::FILTER_AS_OF;
 		AsOfI.Operands.push_back(Work);
 		AsOfI.Operands.push_back(*AsOfTimestamp());
 		Instructions.push_back(std::move(AsOfI));
@@ -957,7 +957,7 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 	if(MatchRecognize()) {
 		const MatchRecognizeSpec &Mr = *MatchRecognize();
 		Instruction Mi;
-		Mi.Opcode = Opcode::MATCH_RECOGNIZE;
+		Mi.Opcode_ = Opcode::MATCH_RECOGNIZE;
 		Mi.Operands.push_back(Work);
 		Mi.Operands.push_back(Mr.OrderColumn.empty() ? std::string("_rowid") : Mr.OrderColumn);
 		Mi.Operands.push_back(Mr.Pattern);
@@ -993,13 +993,13 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 	if(!Grp.empty()) {
 		Instruction G;
 		if(OlapKind() == GroupOlapModifier::Rollup)
-			G.Opcode = Opcode::ROLLUP;
+			G.Opcode_ = Opcode::ROLLUP;
 		else if(OlapKind() == GroupOlapModifier::Cube)
-			G.Opcode = Opcode::CUBE;
+			G.Opcode_ = Opcode::CUBE;
 		else if(OlapKind() == GroupOlapModifier::GroupingSets)
-			G.Opcode = Opcode::GROUPING_SETS;
+			G.Opcode_ = Opcode::GROUPING_SETS;
 		else
-			G.Opcode = Opcode::GROUP_BY;
+			G.Opcode_ = Opcode::GROUP_BY;
 		const auto CountStarOutCol = [&]() -> std::string {
 			return CountAggregateOutputColumn().empty() ? std::string("cnt") : CountAggregateOutputColumn();
 		};
@@ -1072,7 +1072,7 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 		   Ws.SourceColumn.empty())
 			FailCodegen("Internal: window aggregate/shift missing source column.");
 		Instruction WI;
-		WI.Opcode = Opcode::WINDOW_ROW_NUMBER;
+		WI.Opcode_ = Opcode::WINDOW_ROW_NUMBER;
 		WI.Operands.push_back(static_cast<int64_t>(Ws.PartitionBy.size()));
 		for(const auto &K : Ws.PartitionBy)
 			WI.Operands.push_back(K);
@@ -1180,7 +1180,7 @@ void CompoundSelectAST::EmitBytecode(BytecodeScratch &Instructions) const {
 		const std::string OutTab = std::string("__AstralCmp_") + std::to_string(Batch) + "_m_" + std::to_string(OpIx);
 
 		Instruction Comb;
-		Comb.Opcode = Opcode::SET_COMBINE;
+		Comb.Opcode_ = Opcode::SET_COMBINE;
 		Comb.Operands.push_back(OutTab);
 		Comb.Operands.push_back(Acc);
 		Comb.Operands.push_back(Rstash);
@@ -1262,7 +1262,7 @@ void InsertAST::EmitBytecode(BytecodeScratch& Instructions) const {
 				Ops.push_back(SerializeSetValueExpr(Asg.Value.get()));
 			}
 			Instruction Up;
-			Up.Opcode = Opcode::UPSERT;
+			Up.Opcode_ = Opcode::UPSERT;
 			Up.Operands = std::move(Ops);
 			AppendInstruction(Instructions, Up);
 		} else {
@@ -1295,7 +1295,7 @@ void MergeAST::EmitBytecode(BytecodeScratch &Instructions) const {
 		Ops.push_back(SerializeSetValueExpr(N.Value.get()));
 	}
 	Instruction Mg;
-	Mg.Opcode = Opcode::MERGE_INTO;
+	Mg.Opcode_ = Opcode::MERGE_INTO;
 	Mg.Operands = std::move(Ops);
 	AppendInstruction(Instructions, Mg);
 }
@@ -1522,7 +1522,7 @@ Bytecode BuildBytecode(Logger *Logger, OptimizationLevel OptLevel, const AstralD
 				Statement->Value->EmitBytecode(Instructions);
 			const size_t BaseIp = Result.size();
 			for(auto &Inst : Instructions) {
-				if(Inst.Opcode == Opcode::RECURSIVE_CTE_FIXPOINT && Inst.Operands.size() >= 4) {
+				if(Inst.Opcode_ == Opcode::RECURSIVE_CTE_FIXPOINT && Inst.Operands.size() >= 4) {
 					if(auto *LoopStart = std::get_if<int64_t>(&Inst.Operands[3]))
 						*LoopStart += static_cast<int64_t>(BaseIp);
 				}
@@ -1531,23 +1531,7 @@ Bytecode BuildBytecode(Logger *Logger, OptimizationLevel OptLevel, const AstralD
 		}
 	}
 
-	if(OptLevel != OptimizationLevel::None) {
-		if(Logger)
-			Logger->Info("Applying optimizations");
-
-		if(OptLevel >= OptimizationLevel::Basic) {
-			ConstantFoldingPass().Run(Result, Logger);
-			DeadCodeEliminationPass().Run(Result, Logger);
-		}
-
-		if(OptLevel >= OptimizationLevel::Advanced) {
-			InstructionCombiningPass().Run(Result, Logger);
-		}
-
-		if(OptLevel >= OptimizationLevel::Aggressive) {
-			RegisterAllocationPass().Run(Result, Logger);
-		}
-	}
+	RunOptimizerPipeline(Result, OptLevel, Logger);
 
 	if(Logger)
 		Logger->Info("Bytecode build complete with " + std::to_string(Result.size()) + " instructions");
@@ -1572,10 +1556,10 @@ void DedupBytecodeStringImmediates(Bytecode &Code, std::vector<std::string> &Poo
 	};
 
 	for(auto &Inst : Code) {
-		if(Inst.Opcode == Opcode::PUSH && Inst.Operands.size() == 1) {
+		if(Inst.Opcode_ == Opcode::PUSH && Inst.Operands.size() == 1) {
 			if(auto *Sv = std::get_if<std::string>(&Inst.Operands[0])) {
 				const int64_t Idx = Intern(*Sv);
-				Inst.Opcode = Opcode::PUSH_POOL;
+				Inst.Opcode_ = Opcode::PUSH_POOL;
 				Inst.Operands[0] = Idx;
 				continue;
 			}

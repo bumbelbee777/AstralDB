@@ -1,0 +1,52 @@
+{
+  "shards": [
+    { "name": "shard0", "database": "data/shard0.db" },
+    { "name": "shard1", "database": "data/shard1.db" },
+    { "name": "shard2", "database": "data/shard2.db" }
+  ],
+  "virtual_nodes": 128,
+  "backup_dir": "backups",
+  "backup_retention": { "keep_last": 30, "keep_days": 90 },
+  "financial": {
+    "enabled": true,
+    "currency": "USD",
+    "journal_file": ".quasar/journal.jsonl",
+    "idempotency_dir": ".quasar/idempotency",
+    "saga_state_dir": ".quasar/sagas",
+    "bootstrap_schema": true,
+    "idempotency": { "store": "file", "require_key": true }
+  },
+  "recovery": { "max_retries": 5, "base_delay_ms": 25, "max_delay_ms": 3000 },
+  "mvcc": { "snapshot_reads": true, "read_immediate": true },
+  "workload": {
+    "circuit_failure_threshold": 3,
+    "circuit_cooldown_sec": 60,
+    "circuit_half_open_max_probes": 1
+  },
+  "locks": { "enabled": true, "timeout_sec": 45 },
+  "pool": {
+    "enabled": true,
+    "rollback_on_batch_failure": true,
+    "read_lane_immediate": true
+  },
+  "regions_global": { "async_replicate": false },
+  "distributed_txn": {
+    "enabled": true,
+    "wal_file": ".quasar/dtxn/wal.jsonl",
+    "recover_on_start": true
+  },
+  "failover": {
+    "enabled": true,
+    "auto_promote": true,
+    "failure_threshold": 3,
+    "cooldown_after_promote_sec": 60,
+    "fail_back_to_primary": true,
+    "state_file": ".quasar/failover.json",
+    "shards": {
+      "shard0": {
+        "primary": "data/shard0.db",
+        "standbys": ["data/shard0_standby.db"]
+      }
+    }
+  }
+}

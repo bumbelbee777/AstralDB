@@ -1,0 +1,9 @@
+{
+  "txn_id": "pay-20260518-0001",
+  "from_account": "acct:1001",
+  "to_account": "acct:2002",
+  "amount_cents": 150000,
+  "from_shard_key": "acct:1001",
+  "to_shard_key": "acct:2002",
+  "currency": "USD"
+}

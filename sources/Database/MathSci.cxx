@@ -36,11 +36,29 @@ struct Entry {
 };
 
 std::optional<double> ToNum(std::string_view S) {
+	if(S.empty())
+		return std::nullopt;
 	try {
 		return std::stod(std::string(S));
 	} catch(...) {
 		return std::nullopt;
 	}
+}
+
+static bool SqlCellIsNull(std::string_view S) {
+	return S.empty();
+}
+
+static bool SqlCellsEqual(std::string_view A, std::string_view B) {
+	if(SqlCellIsNull(A) && SqlCellIsNull(B))
+		return true;
+	if(SqlCellIsNull(A) || SqlCellIsNull(B))
+		return false;
+	const auto Na = ToNum(A);
+	const auto Nb = ToNum(B);
+	if(Na && Nb)
+		return *Na == *Nb;
+	return A == B;
 }
 
 std::string FmtNum(double V) {
@@ -1093,22 +1111,35 @@ std::optional<std::string> EvalScalar(ScalarSqlFn Fn, const std::vector<std::str
 		return AdvancedTypes::FormatListCell(Keys);
 	}
 	case ScalarSqlFn::NullIf: {
-		const auto P = BinaryNum(Cells);
-		if(!P)
+		if(Cells.size() != 2)
 			return std::nullopt;
-		return P->first == P->second ? std::optional<std::string>() : std::optional<std::string>(Cells[0]);
+		if(SqlCellsEqual(Cells[0], Cells[1]))
+			return std::nullopt;
+		if(SqlCellIsNull(Cells[0]))
+			return std::nullopt;
+		return Cells[0];
 	}
 	case ScalarSqlFn::Greatest: {
-		const auto P = BinaryNum(Cells);
-		if(!P)
+		if(Cells.size() != 2)
 			return std::nullopt;
-		return FmtNum(std::max(P->first, P->second));
+		if(SqlCellIsNull(Cells[0]) || SqlCellIsNull(Cells[1]))
+			return std::nullopt;
+		const auto A = ToNum(Cells[0]);
+		const auto B = ToNum(Cells[1]);
+		if(!A || !B)
+			return std::nullopt;
+		return FmtNum(std::max(*A, *B));
 	}
 	case ScalarSqlFn::Least: {
-		const auto P = BinaryNum(Cells);
-		if(!P)
+		if(Cells.size() != 2)
 			return std::nullopt;
-		return FmtNum(std::min(P->first, P->second));
+		if(SqlCellIsNull(Cells[0]) || SqlCellIsNull(Cells[1]))
+			return std::nullopt;
+		const auto A = ToNum(Cells[0]);
+		const auto B = ToNum(Cells[1]);
+		if(!A || !B)
+			return std::nullopt;
+		return FmtNum(std::min(*A, *B));
 	}
 	case ScalarSqlFn::TextContains:
 		if(Cells.size() != 2)

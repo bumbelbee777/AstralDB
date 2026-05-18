@@ -98,6 +98,45 @@ def validate_cluster_config(config: Dict[str, Any], policy: Optional[SecurityPol
     if pool is not None and not isinstance(pool, dict):
         raise ConfigError("pool must be an object")
 
+    locks = root.get("locks")
+    if locks is not None:
+        if not isinstance(locks, dict):
+            raise ConfigError("locks must be an object")
+        if "timeout_sec" in locks and not isinstance(locks["timeout_sec"], (int, float)):
+            raise ConfigError("locks.timeout_sec must be a number")
+
+    recovery = root.get("recovery")
+    if recovery is not None and not isinstance(recovery, dict):
+        raise ConfigError("recovery must be an object")
+
+    mvcc = root.get("mvcc")
+    if mvcc is not None and not isinstance(mvcc, dict):
+        raise ConfigError("mvcc must be an object")
+
+    financial = root.get("financial")
+    if financial is not None and not isinstance(financial, dict):
+        raise ConfigError("financial must be an object")
+
+    dtxn = root.get("distributed_txn")
+    if dtxn is not None and not isinstance(dtxn, dict):
+        raise ConfigError("distributed_txn must be an object")
+
+    recovery_auto = root.get("recovery_automation")
+    if recovery_auto is not None and not isinstance(recovery_auto, dict):
+        raise ConfigError("recovery_automation must be an object")
+
+    cross_query = root.get("cross_query")
+    if cross_query is not None and not isinstance(cross_query, dict):
+        raise ConfigError("cross_query must be an object")
+
+    autoscaling = root.get("autoscaling")
+    if autoscaling is not None and not isinstance(autoscaling, dict):
+        raise ConfigError("autoscaling must be an object")
+
+    consensus = root.get("consensus")
+    if consensus is not None and not isinstance(consensus, dict):
+        raise ConfigError("consensus must be an object")
+
 
 def normalize_cluster_config(
     config: Dict[str, Any],
@@ -181,6 +220,13 @@ def normalize_cluster_config(
 
         out["pool"] = clamp_pool_config(config["pool"])
 
+    if "pool" in out and isinstance(out["pool"], dict):
+        pool = out["pool"]
+        pool.setdefault("rollback_on_batch_failure", True)
+        pool.setdefault("read_lane_immediate", True)
+        pool.setdefault("per_db_max_inflight", 2)
+        pool.setdefault("keepalive_interval_sec", 0)
+
     return out
 
 
@@ -208,9 +254,64 @@ def default_cluster_template(shard_count: int = 3) -> Dict[str, Any]:
             "enabled": False,
             "auto_promote": True,
             "state_file": ".quasar/failover.json",
+            "failure_threshold": 3,
+            "cooldown_after_promote_sec": 30,
+            "fail_back_to_primary": True,
             "shards": {},
         },
-        "rebalance": {"shard_key_column": "id", "auto_apply": False},
+        "distributed_txn": {
+            "enabled": True,
+            "wal_file": ".quasar/dtxn/wal.jsonl",
+            "participant_log_dir": ".quasar/dtxn/participants",
+            "recover_on_start": True,
+            "strict_2pc": True,
+            "require_consensus_for_commit": False,
+        },
+        "consensus": {
+            "enabled": False,
+            "members": ["local"],
+            "self_id": "local",
+            "state_dir": ".quasar/consensus",
+            "require_for_rebalance": True,
+            "require_for_dtxn_commit": True,
+        },
+        "recovery_automation": {
+            "enabled": True,
+            "on_start": True,
+            "rollback_orphan_txns": True,
+            "recover_dtxn": True,
+            "heal_pool": True,
+            "interval_sec": 0,
+        },
+        "cross_query": {"enabled": True},
+        "autoscaling": {
+            "enabled": False,
+            "min_shards": 1,
+            "max_shards": 32,
+            "scale_out_step": 1,
+            "cooldown_sec": 300,
+            "auto_apply": False,
+            "rebalance_on_scale": False,
+            "state_file": ".quasar/autoscale.json",
+            "scale_out_pool_rejects": 1,
+            "scale_out_error_rate": 0.15,
+            "scale_out_mean_latency_ms": 750,
+            "scale_out_max_shard_bytes": 0,
+            "scale_in_error_rate": 0.02,
+            "scale_in_mean_latency_ms": 100,
+            "scale_in_max_shard_bytes": 0,
+        },
+        "rebalance": {
+            "shard_key_column": "id",
+            "auto_apply": False,
+            "automation": {
+                "enabled": False,
+                "auto_apply": False,
+                "interval_sec": 0,
+                "delete_from_source": False,
+                "require_consensus": True,
+            },
+        },
         "pool": {
             "enabled": True,
             "batch_max_statements": 48,
@@ -222,7 +323,30 @@ def default_cluster_template(shard_count: int = 3) -> Dict[str, Any]:
         },
         "regions": {},
         "regions_global": {"async_replicate": True},
-        "workload": {"circuit_failure_threshold": 5, "circuit_cooldown_sec": 30},
+        "workload": {
+            "circuit_failure_threshold": 5,
+            "circuit_cooldown_sec": 30,
+            "circuit_half_open_max_probes": 1,
+        },
+        "recovery": {
+            "max_retries": 3,
+            "base_delay_ms": 50,
+            "max_delay_ms": 2000,
+            "jitter": True,
+        },
+        "mvcc": {
+            "snapshot_reads": True,
+            "read_immediate": True,
+        },
+        "locks": {"enabled": False, "timeout_sec": 30},
+        "financial": {
+            "enabled": False,
+            "currency": "USD",
+            "journal_file": ".quasar/journal.jsonl",
+            "idempotency_dir": ".quasar/idempotency",
+            "saga_state_dir": ".quasar/sagas",
+            "idempotency": {"store": "file", "require_key": False},
+        },
         "security": {
             "max_sql_bytes": 524288,
             "require_gateway_auth": False,

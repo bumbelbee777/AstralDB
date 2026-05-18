@@ -24,28 +24,30 @@ class CrossShardTxnResult:
     participants: List[str]
     statements: int
     errors: List[str] = field(default_factory=list)
+    xid: Optional[str] = None
+    acid: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        out = {
             "committed": self.committed,
             "participants": self.participants,
             "statements": self.statements,
             "errors": self.errors,
         }
+        if self.xid:
+            out["xid"] = self.xid
+        if self.acid:
+            out["acid"] = True
+        return out
 
 
 class CrossShardTransaction:
     """
-    Best-effort distributed transaction across AstralDB shard files.
+    Interactive distributed transaction across AstralDB shard files.
 
-    Protocol:
-      1. ``BEGIN;`` on every participant (parallel)
-      2. Run routed statements
-      3. ``COMMIT;`` on all if no error, else ``ROLLBACK;`` on all
-
-    This is **not** a true distributed atomic commit (no coordinator WAL). Use for
-    orchestration convenience; critical financial workloads need application-level
-    sagas or a single shard.
+    Prefer ``DistributedTransactionCoordinator`` (``distributed_txn`` in config) for
+    coordinator 2PC with a durable WAL. This class remains for manual begin/execute/commit
+    flows when the coordinator is disabled.
     """
 
     def __init__(
@@ -106,11 +108,13 @@ class CrossShardTransaction:
             raise RuntimeError("transaction not open")
         errors: List[str] = []
         try:
-            for node, result in self._run_on_all("COMMIT;", self._participants):
+            commit_outcomes = self._run_on_all("COMMIT;", self._participants)
+            for node, result in commit_outcomes:
                 if not result.ok:
-                    errors.append(f"{node.name}: commit failed")
+                    errors.append(f"{node.name}: commit failed (rc={result.returncode})")
         except Exception as exc:
             errors.append(str(exc))
+        if errors:
             self.rollback()
             self._open = False
             return CrossShardTxnResult(
@@ -121,10 +125,10 @@ class CrossShardTransaction:
             )
         self._open = False
         return CrossShardTxnResult(
-            committed=len(errors) == 0,
+            committed=True,
             participants=[n.name for n in self._participants],
             statements=0,
-            errors=errors,
+            errors=[],
         )
 
     def rollback(self) -> None:

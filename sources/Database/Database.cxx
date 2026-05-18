@@ -2746,7 +2746,7 @@ std::future<void> Database::Insert(const std::string &TableName, const Item &Row
 			RejectRowIfTypesFailAssumeLocked(TableName, MutableRow);
 			RejectRowIfForeignKeysFailAssumeLocked(TableName, MutableRow);
 			HybridTableSlot &Slot = Tables_[TableName];
-			PrefetchEngine::PrefetchAppendTarget(Slot.RowStore);
+			Superfetch::PrefetchAppendTarget(Slot.RowStore);
 			Slot.RowStore.push_back(MutableRow);
 			Slot.RecordWrite();
 			Slot.SyncColumnarAfterRowMutation();
@@ -2867,7 +2867,7 @@ std::future<void> Database::Upsert(const std::string &TableName, const Database:
 				RequireSessionInsertAssumeLocked(TableName, InsertRow);
 				RejectRowIfChecksFailAssumeLocked(TableName, InsertRow);
 				RejectRowIfForeignKeysFailAssumeLocked(TableName, InsertRow);
-				PrefetchEngine::PrefetchAppendTarget(TableRef);
+				Superfetch::PrefetchAppendTarget(TableRef);
 				TableRef.push_back(InsertRow);
 				auto IdxOuter = Indexes_.find(TableName);
 				if(IdxOuter != Indexes_.end()) {
@@ -2988,7 +2988,7 @@ std::future<void> Database::MergeUsing(const std::string &TargetTable, const std
 					RequireSessionInsertAssumeLocked(TargetTable, NewR);
 					RejectRowIfChecksFailAssumeLocked(TargetTable, NewR);
 					RejectRowIfForeignKeysFailAssumeLocked(TargetTable, NewR);
-					PrefetchEngine::PrefetchAppendTarget(TRef);
+					Superfetch::PrefetchAppendTarget(TRef);
 					TRef.push_back(NewR);
 					auto IdxOuter = Indexes_.find(TargetTable);
 					if(IdxOuter != Indexes_.end()) {
@@ -3193,8 +3193,8 @@ std::future<Database::Table> Database::Select(const std::string &TableName, cons
 			RequireSessionTablePermissionAssumeLocked(Permissions::Select, TableName);
 			const HybridTableSlot &Slot = TableIt->second;
 			const Table &TableRef = Slot.RowsForRead(std::nullopt, false);
-			PrefetchEngine::RowScanSession Scan;
-			PrefetchEngine::BeginRowScan(TableRef, Scan);
+			Superfetch::RowScanSession Scan;
+			Superfetch::BeginRowScan(TableRef, Scan);
 			auto IdxOuter = Indexes_.find(TableName);
 			if(IdxOuter != Indexes_.end() && !IdxOuter->second.empty()) {
 				for(const auto& ColumnIndexes : IdxOuter->second) {
@@ -3212,9 +3212,14 @@ std::future<Database::Table> Database::Select(const std::string &TableName, cons
 						}
 					}
 				}
+			} else if(!Scan.Armed) {
+				for(const Item &Row : TableRef) {
+					if(Condition(Row) && RowAllowsAssumeLocked(Permissions::Select, TableName, Row))
+						Result.push_back(MaskRowForSelectAssumeLocked(TableName, Row));
+				}
 			} else {
 				for(std::size_t Ri = 0; Ri < TableRef.size(); ++Ri) {
-					PrefetchEngine::AdvanceRowScan(TableRef, Ri, Scan);
+					Superfetch::AdvanceRowScan(TableRef, Ri, Scan);
 					const Item &Row = TableRef[Ri];
 					if(Condition(Row) && RowAllowsAssumeLocked(Permissions::Select, TableName, Row))
 						Result.push_back(MaskRowForSelectAssumeLocked(TableName, Row));
@@ -3428,13 +3433,14 @@ std::future<Database::Table> Database::JoinTables(const std::string &LeftTable, 
 				            "\").");
 			const Table &LeftData = LeftIt->second.RowStore;
 			const Table &RightData = RightIt->second.RowStore;
-			PrefetchEngine::JoinScanSession JoinScan;
-			PrefetchEngine::BeginJoinScan(LeftData, RightData, JoinScan);
+			Superfetch::JoinScanSession JoinScan;
+			Superfetch::BeginJoinScan(LeftData, RightData, JoinScan);
 			for(std::size_t Li = 0; Li < LeftData.size(); ++Li) {
-				PrefetchEngine::AdvanceJoinOuter(LeftData, Li, JoinScan);
+				Superfetch::AdvanceJoinOuter(LeftData, Li, JoinScan);
 				const Item &LeftRow = LeftData[Li];
+				Superfetch::BeginInnerRescan(RightData, JoinScan.Inner);
 				for(std::size_t Ri = 0; Ri < RightData.size(); ++Ri) {
-					PrefetchEngine::AdvanceJoinInner(RightData, Ri, JoinScan);
+					Superfetch::AdvanceJoinInner(RightData, Ri, JoinScan.Inner);
 					const Item &RightRow = RightData[Ri];
 					if(JoinCondition(LeftRow, RightRow)) {
 						Item JoinedRow = RightRow;

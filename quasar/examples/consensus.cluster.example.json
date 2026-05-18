@@ -1,0 +1,33 @@
+{
+  "shards": [
+    { "name": "shard0", "database": "data/shard0.db" },
+    { "name": "shard1", "database": "data/shard1.db" },
+    { "name": "shard2", "database": "data/shard2.db" }
+  ],
+  "virtual_nodes": 128,
+  "consensus": {
+    "enabled": true,
+    "members": ["shard0", "shard1", "shard2"],
+    "self_id": "shard0",
+    "state_dir": ".quasar/consensus",
+    "require_for_rebalance": true,
+    "require_for_dtxn_commit": true
+  },
+  "distributed_txn": {
+    "enabled": true,
+    "wal_file": ".quasar/dtxn/wal.jsonl",
+    "participant_log_dir": ".quasar/dtxn/participants",
+    "strict_2pc": true,
+    "require_consensus_for_commit": true,
+    "recover_on_start": true
+  },
+  "rebalance": {
+    "shard_key_column": "id",
+    "automation": {
+      "enabled": true,
+      "auto_apply": false,
+      "require_consensus": true,
+      "delete_from_source": true
+    }
+  }
+}

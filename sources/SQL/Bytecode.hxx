@@ -156,22 +156,22 @@ enum class Opcode : uint8_t {
 using Value = std::variant<int64_t, double, std::string>;
 
 struct Instruction {
-    Opcode Opcode;
+    Opcode Opcode_;
     std::vector<Value> Operands;
 
     // Default constructor
-    constexpr Instruction() : Opcode(Opcode::NOP) {}
+    constexpr Instruction() : Opcode_(Opcode::NOP) {}
 
     // Constructor with opcode and initializer list
     constexpr Instruction(enum Opcode Op, std::initializer_list<Value> Ops)
-        : Opcode(Op), Operands(Ops) {}
+        : Opcode_(Op), Operands(Ops) {}
 
     bool operator==(const Instruction &Other) const {
-        return Opcode == Other.Opcode && Operands == Other.Operands;
+        return Opcode_ == Other.Opcode_ && Operands == Other.Operands;
     }
 
     bool IsPure() const {
-        switch (Opcode) {
+        switch (Opcode_) {
             case Opcode::ADD:
             case Opcode::SUB:
             case Opcode::MUL:
@@ -193,7 +193,7 @@ struct Instruction {
     }
 
     bool HasSideEffects() const {
-        switch (Opcode) {
+        switch (Opcode_) {
             case Opcode::CREATE_TABLE:
             case Opcode::DROP_TABLE:
             case Opcode::CREATE_VIEW:
@@ -262,7 +262,7 @@ struct Instruction {
     }
 
     bool IsTerminator() const {
-        switch (Opcode) {
+        switch (Opcode_) {
             case Opcode::HALT:
             case Opcode::JMP:
             case Opcode::RET:
@@ -284,8 +284,8 @@ struct BytecodeComparator {
             return A.size() < B.size();
         for (size_t i = 0; i < A.size(); ++i) {
             // Compare Opcode.
-            if (A[i].Opcode != B[i].Opcode)
-                return A[i].Opcode < B[i].Opcode;
+            if (A[i].Opcode_ != B[i].Opcode_)
+                return A[i].Opcode_ < B[i].Opcode_;
             if (A[i].Operands.size() != B[i].Operands.size())
                 return A[i].Operands.size() < B[i].Operands.size();
             for (size_t j = 0; j < A[i].Operands.size(); ++j) {
@@ -314,7 +314,7 @@ inline std::string Disassemble(const Bytecode &Code) {
     std::ostringstream Out;
     for(size_t i = 0; i < Code.size(); ++i) {
         const Instruction &Inst = Code[i];
-        Out << i << ": " << static_cast<int>(Inst.Opcode);
+        Out << i << ": " << static_cast<int>(Inst.Opcode_);
         if(!Inst.Operands.empty()) {
             Out << " [";
             for(const auto &Operand : Inst.Operands) {
@@ -333,7 +333,7 @@ inline std::ostream& operator<<(std::ostream& os, const Bytecode& bc);
 
 inline std::ostream& operator<<(std::ostream& os, const Bytecode& bc) {
     for (const auto& instr : bc) {
-        os << "[" << static_cast<int>(instr.Opcode) << " ";
+        os << "[" << static_cast<int>(instr.Opcode_) << " ";
         for (const auto& operand : instr.Operands) {
             std::visit([&os](auto &&arg) {
                 os << arg << " ";
@@ -344,12 +344,13 @@ inline std::ostream& operator<<(std::ostream& os, const Bytecode& bc) {
     return os;
 }
 
-// Optimization flags
+/** Bytecode optimization tiers (\c -O0 … \c -O4 on the CLI). */
 enum class OptimizationLevel : uint8_t {
-    None = 0,
-    Basic = 1,    // Basic optimizations (constant folding, dead code elimination)
-    Advanced = 2, // Advanced optimizations (instruction combining, register allocation)
-    Aggressive = 3 // Aggressive optimizations (loop unrolling, instruction reordering)
+	None = 0,
+	Basic = 1,
+	Advanced = 2,
+	Aggressive = 3,
+	Maximum = 4
 };
 
 // Basic block structure for control flow analysis
@@ -376,14 +377,30 @@ public:
     const char* GetName() const override { return "ConstantFolding"; }
 };
 
-// Dead code elimination
+// Dead code elimination (conservative: NOPs, unreachable tails; preserves CTE loop bodies)
 class DeadCodeEliminationPass : public OptimizationPass {
 public:
     bool Run(Bytecode& Code, Logger* Logger = nullptr) override;
     const char* GetName() const override { return "DeadCodeElimination"; }
 };
 
-// Instruction combining
+/** Stack-machine peephole: fold PUSH/PUSH/op triples, drop redundant NOPs. */
+class PeepholePass : public OptimizationPass {
+public:
+    bool Run(Bytecode& Code, Logger* Logger = nullptr) override;
+    const char* GetName() const override { return "Peephole"; }
+};
+
+/** Re-map \c JMP/\c CALL/\c RECURSIVE_CTE_FIXPOINT IP operands after bytecode compaction. */
+void RemapBytecodeIpOperands(Bytecode &Code);
+
+/** Verify fixpoint/jump targets are in range (after optimization). */
+bool ValidateBytecodeControlFlow(const Bytecode &Code) noexcept;
+
+/** Run the optimization pipeline for \a OptLevel (reverts on broken control flow). */
+void RunOptimizerPipeline(Bytecode &Code, OptimizationLevel OptLevel, Logger *Logger = nullptr);
+
+// Instruction combining (alias: advanced peephole sweep)
 class InstructionCombiningPass : public OptimizationPass {
 public:
     bool Run(Bytecode& Code, Logger* Logger = nullptr) override;

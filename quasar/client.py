@@ -90,11 +90,13 @@ class AstralDBClient:
         timeout_sec: Optional[float] = 300.0,
         extra_args: Optional[Sequence[str]] = None,
         security_policy: Optional[SecurityPolicy] = None,
+        audit_file: Optional[PathLike] = None,
     ) -> None:
         self.executable = find_astraldb(executable)
         self.cwd = Path(cwd).resolve() if cwd else None
         self.user = user or os.environ.get("ASTRALDB_USER")
         self.password = password or os.environ.get("ASTRALDB_PASSWORD")
+        self.audit_file = Path(audit_file).resolve() if audit_file else None
         if optimization not in ("O0", "O1", "O2", "O3"):
             raise ValueError("optimization must be O0, O1, O2, or O3")
         self.optimization = optimization
@@ -114,6 +116,8 @@ class AstralDBClient:
             cmd.extend(["-U", self.user])
         if self.password:
             cmd.extend(["-P", self.password])
+        if self.audit_file is not None:
+            cmd.extend(["--audit-file", str(self.audit_file)])
         return cmd
 
     def run(
@@ -180,6 +184,39 @@ class AstralDBClient:
 
     def checkpoint_sql(self, *, database: PathLike) -> QueryResult:
         return self.query("BEGIN; COMMIT;", database=database, immediate=True)
+
+    def query_snapshot(
+        self,
+        sql: str,
+        *,
+        database: Optional[PathLike] = None,
+        memory: bool = False,
+    ) -> QueryResult:
+        """Run a read inside AstralDB's BEGIN snapshot (one consistent view per call)."""
+        from quasar.mvcc import prepare_read_sql, MvccConfig
+
+        mvcc = getattr(self, "_quasar_mvcc", None) or MvccConfig()
+        body = prepare_read_sql(sql, mvcc)
+        return self.query(body, database=database, memory=memory, immediate=True)
+
+    def query_with_retry(
+        self,
+        sql: str,
+        *,
+        database: Optional[PathLike] = None,
+        memory: bool = False,
+        immediate: bool = False,
+    ) -> QueryResult:
+        from quasar.recovery import RetryPolicy, execute_with_retry
+
+        policy = getattr(self, "_quasar_retry_policy", None) or RetryPolicy()
+        if policy.max_retries <= 0:
+            return self.query(sql, database=database, memory=memory, immediate=immediate)
+
+        return execute_with_retry(
+            lambda: self.query(sql, database=database, memory=memory, immediate=immediate),
+            policy,
+        )
 
     def export_bundle(
         self,

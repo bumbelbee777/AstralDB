@@ -1,4 +1,4 @@
--- Transactions, ORDER BY, and unary numeric literals (+/- digits / -.fraction).
+-- Transactions and unary literals; full SQL-92/03 edge suite: examples/sql92_03_coverage.sql
 
 CREATE TABLE edge_nums (id INTEGER, n INTEGER);
 

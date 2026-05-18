@@ -31,7 +31,7 @@ Instruction ReadInstruction(std::istream &In) {
 	std::uint32_t NumOperands = 0;
 	In.read(reinterpret_cast<char *>(&NumOperands), sizeof(NumOperands));
 	Instruction Inst;
-	Inst.Opcode = static_cast<Opcode>(OpcodeByte);
+	Inst.Opcode_ = static_cast<Opcode>(OpcodeByte);
 	Inst.Operands.reserve(NumOperands);
 	for(std::uint32_t J = 0; J < NumOperands; ++J) {
 		std::uint8_t Type = 0;
@@ -110,7 +110,7 @@ void SaveAbcFile(const std::filesystem::path &Path, const Bytecode &Code, const 
 	const std::uint32_t NumInstructions = static_cast<std::uint32_t>(Code.size());
 	Out.write(reinterpret_cast<const char *>(&NumInstructions), sizeof(NumInstructions));
 	for(const Instruction &Inst : Code) {
-		const std::uint8_t OpcodeByte = static_cast<std::uint8_t>(Inst.Opcode);
+		const std::uint8_t OpcodeByte = static_cast<std::uint8_t>(Inst.Opcode_);
 		Out.write(reinterpret_cast<const char *>(&OpcodeByte), sizeof(OpcodeByte));
 		const std::uint32_t NumOperands = static_cast<std::uint32_t>(Inst.Operands.size());
 		Out.write(reinterpret_cast<const char *>(&NumOperands), sizeof(NumOperands));

@@ -1,6 +1,6 @@
 {
   "statements": [
-    { "sql": "INSERT INTO orders (id, customer_id) VALUES (1, 10);", "shard_key": "customer:10" },
-    { "sql": "INSERT INTO inventory (sku, qty) VALUES ('ABC', 1);", "shard_key": "sku:ABC" }
+    { "sql": "INSERT INTO orders VALUES (1, 'pending');", "shard_key": "user:10" },
+    { "sql": "INSERT INTO audit_log VALUES ('order_created', 'user:10');", "shard_key": "tenant:acme" }
   ]
 }

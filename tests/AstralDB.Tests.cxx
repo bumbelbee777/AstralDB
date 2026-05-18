@@ -4,7 +4,7 @@
 #include <Database/ColumnarStorage.hxx>
 #include <Database/HybridStorageScheduler.hxx>
 #include <Database/HybridTable.hxx>
-#include <Database/PrefetchEngine.hxx>
+#include <Database/Superfetch.hxx>
 #include <Database/MathSci.hxx>
 #include <Database/MathSciAutograd.hxx>
 #include <Database/MathSciSignal.hxx>
@@ -102,6 +102,12 @@ AstralDB::Database::Table AllRows(const AstralDB::Database *Db, const std::strin
 
 bool TableExists(const AstralDB::Database *Db, const std::string &Name) {
 	return Db != nullptr && Db->TableSchemaSnapshot(Name).has_value();
+}
+
+/** Off-CI stress harnesses (see file headers); run via CLI with \c -O2, not the fast examples sweep. */
+bool IsOffCiStressHarness(const std::string &FileName) {
+	return FileName.starts_with("benchmark_") || FileName.starts_with("stress_") || FileName == "torture_unhinged.sql" ||
+	       FileName == "torture_advanced.sql";
 }
 
 } // namespace
@@ -258,7 +264,7 @@ TEST_CASE("SQL: INSERT BULK uses INSERT_BULK opcode and fills rows") {
 	REQUIRE(Code.size() >= 2);
 	bool SawBulk = false;
 	for(const auto &Inst : Code)
-		if(Inst.Opcode == AstralDB::SQL::Opcode::INSERT_BULK)
+		if(Inst.Opcode_ == AstralDB::SQL::Opcode::INSERT_BULK)
 			SawBulk = true;
 	REQUIRE(SawBulk);
 	AstralDB::SQL::BytecodeInterpreter Interp(&Log);
@@ -658,6 +664,56 @@ TEST_CASE("SQL: COALESCE uses first non-null scalar") {
 	REQUIRE(Rows[0].at("v") == "7");
 }
 
+TEST_CASE("SQL: SQL-92 through SQL:2003 standard edge cases") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_sqlstd_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "sqlstd.log").string(), false);
+	const char *Scalars =
+	    "CREATE TABLE n (id INT, tag TEXT, nval INT); "
+	    "INSERT INTO n VALUES (1,'',10),(2,'x',20),(3,'',30); "
+	    "SELECT id, NULLIF(nval, 20) AS nz, GREATEST(nval, 15) AS hi, LEAST(nval, 25) AS lo FROM n ORDER BY id;";
+	AstralDB::SQL::Parser P1(Scalars);
+	AstralDB::SQL::Bytecode Code1 =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code1));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	{
+		const auto Rows = AllRows(Db, "n");
+		REQUIRE(Rows.size() == 3);
+		REQUIRE(Rows[0].at("nz") == "10");
+		REQUIRE(Rows[0].at("hi") == "15");
+		REQUIRE(Rows[0].at("lo") == "10");
+		REQUIRE(Rows[1].find("nz") == Rows[1].end());
+		REQUIRE(Rows[1].at("hi") == "20");
+		REQUIRE(Rows[1].at("lo") == "20");
+		REQUIRE(Rows[2].at("nz") == "30");
+	}
+	const char *BetweenNull =
+	    "CREATE TABLE b (id INT, nval INT); INSERT INTO b VALUES (1,10),(2,20); "
+	    "SELECT id FROM b WHERE nval BETWEEN NULL AND 100;";
+	AstralDB::SQL::Parser P2(BetweenNull);
+	AstralDB::SQL::Bytecode Code2 =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	REQUIRE_NOTHROW(I.Execute(Code2));
+	REQUIRE(AllRows(Db, "b").empty());
+	const char *Predicates =
+	    "CREATE TABLE p (id INT, tag TEXT); INSERT INTO p VALUES (1,''),(2,'x'); "
+	    "SELECT id FROM p WHERE tag IS NOT NULL ORDER BY id;";
+	AstralDB::SQL::Parser P3(Predicates);
+	AstralDB::SQL::Bytecode Code3 =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	REQUIRE_NOTHROW(I.Execute(Code3));
+	{
+		const auto Rows = AllRows(Db, "p");
+		REQUIRE(Rows.size() == 1);
+		REQUIRE(Rows[0].at("id") == "2");
+	}
+}
+
 TEST_CASE("SQL: RANK with ties skips after duplicate order values") {
 	AstralDB::SQL::SetParserDiagnostics(false);
 	fs::path Dir = UniqueTempDir("astral_rank_");
@@ -747,7 +803,7 @@ TEST_CASE("SQL: SUM OVER explicit ROWS BETWEEN frame") {
 	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
 	int WinOps = 0;
 	for(const AstralDB::SQL::Instruction &In : Code) {
-		if(In.Opcode == AstralDB::SQL::Opcode::WINDOW_ROW_NUMBER)
+		if(In.Opcode_ == AstralDB::SQL::Opcode::WINDOW_ROW_NUMBER)
 			++WinOps;
 	}
 	REQUIRE(WinOps == 1);
@@ -1385,7 +1441,7 @@ TEST_CASE("SQL: LIMIT with OFFSET skips then caps rows") {
 	AstralDB::SQL::Bytecode Code =
 	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
 	REQUIRE(std::find_if(Code.begin(), Code.end(), [](const AstralDB::SQL::Instruction &In) {
-		        return In.Opcode == AstralDB::SQL::Opcode::SLICE_RANGE;
+		        return In.Opcode_ == AstralDB::SQL::Opcode::SLICE_RANGE;
 	        }) != Code.end());
 	AstralDB::SQL::BytecodeInterpreter I(&Log);
 	I.Execute(Code);
@@ -2467,7 +2523,7 @@ TEST_CASE("MathSci: signal FFT conv Laplacian autograd") {
 	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
 	size_t ScalarEvalOps = 0;
 	for(const auto &Ins : Code) {
-		if(Ins.Opcode == AstralDB::SQL::Opcode::SCALAR_FUNC_EVAL)
+		if(Ins.Opcode_ == AstralDB::SQL::Opcode::SCALAR_FUNC_EVAL)
 			++ScalarEvalOps;
 	}
 	REQUIRE(ScalarEvalOps >= 2);
@@ -2722,8 +2778,8 @@ TEST_CASE("Simd: dot product matches scalar reference") {
 	REQUIRE(Sim == AstralTest::Approx(Ref).epsilon(0.001));
 }
 
-TEST_CASE("PrefetchEngine: arms on large scans and adapts lookahead") {
-	AstralDB::PrefetchEngine::ResetTelemetry();
+TEST_CASE("Superfetch: arms on large scans and stages prefetch") {
+	AstralDB::Superfetch::ResetTelemetry();
 	using Item = AstralDB::Database::Item;
 	using Table = AstralDB::Database::Table;
 	Table Rows;
@@ -2734,21 +2790,190 @@ TEST_CASE("PrefetchEngine: arms on large scans and adapts lookahead") {
 		R["payload"] = std::string(48, 'a');
 		Rows.push_back(std::move(R));
 	}
-	AstralDB::PrefetchEngine::RowScanSession Scan;
-	AstralDB::PrefetchEngine::BeginRowScan(Rows, Scan);
+	AstralDB::Superfetch::RowScanSession Scan;
+	AstralDB::Superfetch::BeginRowScan(Rows, Scan);
 	REQUIRE(Scan.Armed);
 	std::size_t Bytes = 0;
 	for(std::size_t Ri = 0; Ri < Rows.size(); ++Ri) {
-		AstralDB::PrefetchEngine::AdvanceRowScan(Rows, Ri, Scan);
+		AstralDB::Superfetch::AdvanceRowScan(Rows, Ri, Scan);
 		Bytes += Rows[Ri].at("payload").size();
 	}
 	REQUIRE(Bytes == 128u * 48u);
-	const auto Stats = AstralDB::PrefetchEngine::Stats();
+	const auto Stats = AstralDB::Superfetch::Stats();
 	REQUIRE(Stats.PrefetchIssued > 0);
 	Table Tiny{{{"x", "1"}}};
-	AstralDB::PrefetchEngine::RowScanSession TinyScan;
-	AstralDB::PrefetchEngine::BeginRowScan(Tiny, TinyScan);
+	AstralDB::Superfetch::RowScanSession TinyScan;
+	AstralDB::Superfetch::BeginRowScan(Tiny, TinyScan);
 	REQUIRE_FALSE(TinyScan.Armed);
+}
+
+namespace {
+
+AstralDB::SQL::Bytecode BuildSqlBytecode(const std::string &Sql, AstralDB::SQL::OptimizationLevel Level) {
+	AstralDB::Logger Log("opt_unit.log", false);
+	AstralDB::SQL::Parser P(Sql);
+	return AstralDB::SQL::BuildBytecode(&Log, Level);
+}
+
+bool RecursiveCteControlFlowOk(const AstralDB::SQL::Bytecode &Code) {
+	if(!AstralDB::SQL::ValidateBytecodeControlFlow(Code))
+		return false;
+	for(size_t I = 0; I < Code.size(); ++I) {
+		if(Code[I].Opcode_ != AstralDB::SQL::Opcode::RECURSIVE_CTE_FIXPOINT)
+			continue;
+		if(Code[I].Operands.size() < 4)
+			return false;
+		const auto *LoopStart = std::get_if<int64_t>(&Code[I].Operands[3]);
+		if(!LoopStart || *LoopStart < 0)
+			return false;
+		if(static_cast<size_t>(*LoopStart) >= I)
+			return false;
+	}
+	return true;
+}
+
+bool BytecodeHasPushInt64(const AstralDB::SQL::Bytecode &Code, int64_t Value) {
+	for(const AstralDB::SQL::Instruction &Inst : Code) {
+		if(Inst.Opcode_ != AstralDB::SQL::Opcode::PUSH || Inst.Operands.size() != 1)
+			continue;
+		if(const auto *V = std::get_if<int64_t>(&Inst.Operands[0])) {
+			if(*V == Value)
+				return true;
+		}
+	}
+	return false;
+}
+
+void ExecuteSqlInDir(const fs::path &Dir, const std::string &Sql, AstralDB::SQL::OptimizationLevel Level) {
+	AstralDB::Logger Log((Dir / "run.log").string(), false);
+	AstralDB::SQL::Parser P(Sql);
+	AstralDB::SQL::Bytecode Code = AstralDB::SQL::BuildBytecode(&Log, Level);
+	REQUIRE(!Code.empty());
+	AstralDB::SQL::BytecodeInterpreter Interp(&Log);
+	Interp.DatabasePath(Dir / "astral.db");
+	REQUIRE_NOTHROW(Interp.Execute(Code));
+}
+
+} // namespace
+
+TEST_CASE("optimizer: O0 skips pipeline and O1 folds literal triples") {
+	AstralDB::SQL::Bytecode Raw = {
+	    AstralDB::SQL::MakeInstruction(AstralDB::SQL::Opcode::PUSH, static_cast<int64_t>(2)),
+	    AstralDB::SQL::MakeInstruction(AstralDB::SQL::Opcode::PUSH, static_cast<int64_t>(3)),
+	    AstralDB::SQL::MakeInstruction(AstralDB::SQL::Opcode::ADD),
+	    AstralDB::SQL::MakeInstruction(AstralDB::SQL::Opcode::HALT),
+	};
+	const AstralDB::SQL::Bytecode Unopt = Raw;
+	AstralDB::SQL::RunOptimizerPipeline(Raw, AstralDB::SQL::OptimizationLevel::None);
+	REQUIRE(Raw == Unopt);
+	AstralDB::SQL::RunOptimizerPipeline(Raw, AstralDB::SQL::OptimizationLevel::Basic);
+	REQUIRE(Raw.size() == 2);
+	REQUIRE(Raw[0].Opcode_ == AstralDB::SQL::Opcode::PUSH);
+	REQUIRE(BytecodeHasPushInt64(Raw, 5));
+	REQUIRE(Raw[1].Opcode_ == AstralDB::SQL::Opcode::HALT);
+}
+
+TEST_CASE("optimizer: peephole folds double-NOT and identical-literal compares") {
+	AstralDB::SQL::Bytecode Code = {
+	    AstralDB::SQL::MakeInstruction(AstralDB::SQL::Opcode::PUSH, static_cast<int64_t>(7)),
+	    AstralDB::SQL::MakeInstruction(AstralDB::SQL::Opcode::NOT),
+	    AstralDB::SQL::MakeInstruction(AstralDB::SQL::Opcode::NOT),
+	    AstralDB::SQL::MakeInstruction(AstralDB::SQL::Opcode::PUSH, static_cast<int64_t>(4)),
+	    AstralDB::SQL::MakeInstruction(AstralDB::SQL::Opcode::PUSH, static_cast<int64_t>(4)),
+	    AstralDB::SQL::MakeInstruction(AstralDB::SQL::Opcode::EQ),
+	    AstralDB::SQL::MakeInstruction(AstralDB::SQL::Opcode::HALT),
+	};
+	AstralDB::SQL::RunOptimizerPipeline(Code, AstralDB::SQL::OptimizationLevel::Basic);
+	REQUIRE(Code.size() == 3);
+	REQUIRE(Code[0].Opcode_ == AstralDB::SQL::Opcode::PUSH);
+	REQUIRE(BytecodeHasPushInt64(Code, 7));
+	REQUIRE(BytecodeHasPushInt64(Code, 1));
+}
+
+TEST_CASE("optimizer: all levels preserve recursive CTE control flow") {
+	const std::string Script = ReadExampleFile(RepoRoot() / "examples" / "sql99_recursive.sql");
+	REQUIRE(!Script.empty());
+	const AstralDB::SQL::OptimizationLevel Levels[] = {
+	    AstralDB::SQL::OptimizationLevel::Basic,
+	    AstralDB::SQL::OptimizationLevel::Advanced,
+	    AstralDB::SQL::OptimizationLevel::Aggressive,
+	    AstralDB::SQL::OptimizationLevel::Maximum,
+	};
+	bool SawFixpoint = false;
+	for(AstralDB::SQL::OptimizationLevel Level : Levels) {
+		INFO("level=", static_cast<int>(Level));
+		AstralDB::SQL::Bytecode Code = BuildSqlBytecode(Script, Level);
+		REQUIRE(!Code.empty());
+		REQUIRE(RecursiveCteControlFlowOk(Code));
+		for(size_t I = 0; I < Code.size(); ++I) {
+			if(Code[I].Opcode_ == AstralDB::SQL::Opcode::RECURSIVE_CTE_FIXPOINT)
+				SawFixpoint = true;
+		}
+	}
+	REQUIRE(SawFixpoint);
+}
+
+TEST_CASE("optimizer: Maximum shrinks bytecode versus O0 on simple script") {
+	const std::string Sql =
+	    "CREATE TABLE lit (x INT); INSERT INTO lit VALUES (1); INSERT INTO lit VALUES (2);";
+	const AstralDB::SQL::Bytecode Raw = BuildSqlBytecode(Sql, AstralDB::SQL::OptimizationLevel::None);
+	const AstralDB::SQL::Bytecode Max = BuildSqlBytecode(Sql, AstralDB::SQL::OptimizationLevel::Maximum);
+	REQUIRE(AstralDB::SQL::ValidateBytecodeControlFlow(Raw));
+	REQUIRE(AstralDB::SQL::ValidateBytecodeControlFlow(Max));
+	REQUIRE(Max.size() <= Raw.size());
+}
+
+TEST_CASE("optimizer: Maximum matches O0 row counts on DML") {
+	const std::string Sql = "CREATE TABLE om (v INT); INSERT INTO om VALUES (1), (2), (3);";
+	fs::path DirNone = UniqueTempDir("astral_opt_o0_");
+	fs::path DirMax = UniqueTempDir("astral_opt_o4_");
+	ExecuteSqlInDir(DirNone, Sql, AstralDB::SQL::OptimizationLevel::None);
+	ExecuteSqlInDir(DirMax, Sql, AstralDB::SQL::OptimizationLevel::Maximum);
+	AstralDB::Logger LogNone((DirNone / "n.log").string(), false);
+	AstralDB::Logger LogMax((DirMax / "m.log").string(), false);
+	AstralDB::SQL::BytecodeInterpreter INone(&LogNone);
+	AstralDB::SQL::BytecodeInterpreter IMax(&LogMax);
+	INone.DatabasePath(DirNone / "astral.db");
+	IMax.DatabasePath(DirMax / "astral.db");
+	INone.EnsurePrimaryDatabaseOpened();
+	IMax.EnsurePrimaryDatabaseOpened();
+	REQUIRE(INone.PrimaryDatabase() != nullptr);
+	REQUIRE(IMax.PrimaryDatabase() != nullptr);
+	REQUIRE(AllRows(INone.PrimaryDatabase(), "om").size() == 3);
+	REQUIRE(AllRows(IMax.PrimaryDatabase(), "om").size() == 3);
+}
+
+TEST_CASE("optimizer: SAVEPOINT survives Maximum optimization") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_opt_sp_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "sp.log").string(), false);
+	const char *Q = "CREATE TABLE sp (x INT); INSERT INTO sp VALUES (10); SAVEPOINT a; "
+	                  "UPDATE sp SET x = 99 WHERE x = 10; ROLLBACK TO SAVEPOINT a;";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::Maximum);
+	AstralDB::SQL::BytecodeInterpreter Interp(&Log);
+	Interp.DatabasePath(Dir / "astral.db");
+	REQUIRE_NOTHROW(Interp.Execute(Code));
+	REQUIRE(Interp.PrimaryDatabase() != nullptr);
+	REQUIRE(AllRows(Interp.PrimaryDatabase(), "sp").size() == 1);
+	REQUIRE(AllRows(Interp.PrimaryDatabase(), "sp")[0].at("x") == "10");
+}
+
+TEST_CASE("optimizer: invalid control flow after pass reverts bytecode") {
+	AstralDB::SQL::Bytecode Code = {
+	    AstralDB::SQL::MakeInstruction(AstralDB::SQL::Opcode::PUSH, static_cast<int64_t>(0)),
+	    AstralDB::SQL::MakeInstruction(AstralDB::SQL::Opcode::NOP),
+	    AstralDB::SQL::MakeInstruction(AstralDB::SQL::Opcode::RECURSIVE_CTE_FIXPOINT, std::string("w"),
+	                                  std::string("d"), static_cast<int64_t>(4), static_cast<int64_t>(99)),
+	    AstralDB::SQL::MakeInstruction(AstralDB::SQL::Opcode::HALT),
+	};
+	const size_t Before = Code.size();
+	AstralDB::SQL::RunOptimizerPipeline(Code, AstralDB::SQL::OptimizationLevel::Basic);
+	REQUIRE(!AstralDB::SQL::ValidateBytecodeControlFlow(Code));
+	REQUIRE(Code.size() == Before);
 }
 
 TEST_CASE("examples: every *.sql parses, compiles, runs") {
@@ -2764,18 +2989,20 @@ TEST_CASE("examples: every *.sql parses, compiles, runs") {
 	}
 	REQUIRE(!Files.empty());
 	std::sort(Files.begin(), Files.end());
+	fs::path Dir = UniqueTempDir("astral_ex_all_");
+	ScopedCwd Cwd(Dir);
+	AstralDB::Logger Log((Dir / "ex.log").string(), false);
 	for(const fs::path &F : Files) {
 		const std::string Name = F.filename().string();
+		if(IsOffCiStressHarness(Name))
+			continue;
 		INFO("example: ", Name);
-		fs::path Dir = UniqueTempDir("astral_ex_");
-		ScopedCwd Cwd(Dir);
 		RemoveEphemeralDb(Dir);
-		AstralDB::Logger Log((Dir / "ex.log").string(), false);
 		const std::string Script = ReadExampleFile(F);
 		REQUIRE_MESSAGE(!Script.empty(), Name.c_str());
 		AstralDB::SQL::Parser P(Script);
 		AstralDB::SQL::Bytecode Code =
-		    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+		    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::Basic);
 		REQUIRE_MESSAGE(!Code.empty(), Name.c_str());
 		AstralDB::SQL::BytecodeInterpreter Interp(&Log);
 		REQUIRE_NOTHROW(Interp.Execute(Code));

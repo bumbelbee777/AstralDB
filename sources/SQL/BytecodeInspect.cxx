@@ -139,7 +139,7 @@ void HarvestOperands(const Instruction &Inst, BytecodeAnalysis &Analysis) {
 				return S;
 		return nullptr;
 	};
-	switch(Inst.Opcode) {
+	switch(Inst.Opcode_) {
 	case Opcode::CREATE_TABLE:
 	case Opcode::DROP_TABLE:
 	case Opcode::INSERT:
@@ -453,7 +453,7 @@ std::string DisassemblePretty(const Bytecode &Code) {
 	std::ostringstream Out;
 	for(std::size_t I = 0; I < Code.size(); ++I) {
 		const Instruction &Inst = Code[I];
-		Out << std::setw(5) << I << "  " << OpcodeName(Inst.Opcode);
+		Out << std::setw(5) << I << "  " << OpcodeName(Inst.Opcode_);
 		if(!Inst.Operands.empty()) {
 			Out << "  ";
 			for(std::size_t O = 0; O < Inst.Operands.size(); ++O) {
@@ -471,26 +471,26 @@ BytecodeAnalysis AnalyzeBytecode(const Bytecode &Code) {
 	BytecodeAnalysis Analysis;
 	Analysis.InstructionCount = Code.size();
 	for(const Instruction &Inst : Code) {
-		++Analysis.OpcodeHistogram[OpcodeName(Inst.Opcode)];
+		++Analysis.OpcodeHistogram[OpcodeName(Inst.Opcode_)];
 		if(Inst.IsPure())
 			++Analysis.PureInstructionCount;
 		if(Inst.HasSideEffects())
 			++Analysis.SideEffectInstructionCount;
-		if(Inst.Opcode == Opcode::HALT)
+		if(Inst.Opcode_ == Opcode::HALT)
 			Analysis.HasHalt = true;
-		if(OpcodeIsDdl(Inst.Opcode))
+		if(OpcodeIsDdl(Inst.Opcode_))
 			Analysis.HasDdl = true;
-		if(OpcodeIsDml(Inst.Opcode))
+		if(OpcodeIsDml(Inst.Opcode_))
 			Analysis.HasDml = true;
-		if(OpcodeIsJoin(Inst.Opcode))
+		if(OpcodeIsJoin(Inst.Opcode_))
 			Analysis.HasJoins = true;
-		if(OpcodeIsAggregate(Inst.Opcode))
+		if(OpcodeIsAggregate(Inst.Opcode_))
 			Analysis.HasAggregates = true;
-		if(Inst.Opcode == Opcode::WINDOW_ROW_NUMBER)
+		if(Inst.Opcode_ == Opcode::WINDOW_ROW_NUMBER)
 			Analysis.HasWindowAnalytics = true;
-		if(OpcodeIsSecurity(Inst.Opcode))
+		if(OpcodeIsSecurity(Inst.Opcode_))
 			Analysis.HasSecurityGrants = true;
-		switch(Inst.Opcode) {
+		switch(Inst.Opcode_) {
 		case Opcode::BEGIN:
 		case Opcode::COMMIT:
 		case Opcode::ROLLBACK:
@@ -636,15 +636,15 @@ BytecodeValidationReport ValidateBytecode(const Bytecode &Code) {
 	BytecodeValidationReport Report;
 	if(Code.empty())
 		Report.Warnings.push_back("Bytecode program is empty.");
-	if(!Code.empty() && Code.back().Opcode != Opcode::HALT)
+	if(!Code.empty() && Code.back().Opcode_ != Opcode::HALT)
 		Report.Warnings.push_back("Program does not end with HALT (last opcode is " +
-		                          OpcodeName(Code.back().Opcode) + ").");
+		                          OpcodeName(Code.back().Opcode_) + ").");
 	const auto Analysis = AnalyzeBytecode(Code);
 	if(!Analysis.HasHalt)
 		Report.Warnings.push_back("No HALT instruction found.");
 	for(const Instruction &Inst : Code) {
-		if(static_cast<int>(Inst.Opcode) > static_cast<int>(Opcode::SCALAR_FUNC_EVAL))
-			Report.Errors.push_back("Unknown opcode value " + std::to_string(static_cast<int>(Inst.Opcode)));
+		if(static_cast<int>(Inst.Opcode_) > static_cast<int>(Opcode::SCALAR_FUNC_EVAL))
+			Report.Errors.push_back("Unknown opcode value " + std::to_string(static_cast<int>(Inst.Opcode_)));
 	}
 	Report.Ok = Report.Errors.empty();
 	return Report;

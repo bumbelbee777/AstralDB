@@ -1,112 +1,139 @@
 # AstralDB Overview
 
-## What it is
+AstralDB is a compact relational engine in modern C++ built around **modern SQL**: a growing, test-backed dialect aligned with **SQL-92 core DML/DDL**, **SQL-99 analytics**, and selected **SQL:2003** features—not a full standards certification on the three, but a deliberate path toward readable, executable SQL without a heavyweight runtime.
 
-AstralDB is a compact relational database engine written in modern C++. SQL text is parsed into an AST, lowered to **bytecode**, and executed by a small virtual machine that drives the storage layer (tables, WAL, indexes, optional encryption on disk). A command-line program (`astraldb`) is the main way to run scripts, ad hoc queries, a simple REPL, or **compile** queries to `.abc` files for later execution.
+SQL text is tokenized and parsed into an AST, lowered to **bytecode**, and executed by a small virtual machine that drives tables, indexes, a **write-ahead log**, and optional encryption at rest. The **`astraldb`** CLI runs scripts, ad hoc queries, a simple REPL, and can **compile** queries to **`.abc`** bytecode for later execution or inspection.
 
-> **Heads up:** the project is still under heavy development. Treat it as experimental—**not** something to wire into production until you have audited it yourself.
+> **Experimental:** development is active. Treat AstralDB as **research-grade** until you have audited the code and run your own workloads. **`examples/*.sql`** and **`tests/AstralDB.Tests.cxx`** are the living contract; this document summarizes them and calls out gaps honestly.
 
-## What works today
+---
 
-Rough inventory of what the codebase is built around right now (details drift as development continues; the **`examples/*.sql`** scripts are the honest contract):
-- **SQL surface (growing subset):** `CREATE TABLE`, `DROP TABLE`, `INSERT` (including multi-row and **bulk** expansion, optional **`ON CONFLICT … DO NOTHING | DO UPDATE SET`** row upserts when a **primary key** or explicit conflict column list applies; **`DO UPDATE SET col = EXCLUDED.col`** copies from the proposed insert row), restricted **`MERGE INTO … USING … ON …`** with optional **`WHEN MATCHED THEN UPDATE SET …`** and/or **`WHEN NOT MATCHED THEN INSERT …`** (join predicate must be **`target_alias.col = source_alias.col`**; `UPDATE`/`INSERT` values are literals or **`source_alias.column`** copies), `SELECT` with column lists (including **`CAST`** and searched **`CASE`**), **`FROM`** accepting **comma-separated tables** interpreted as chained **`CROSS JOIN`** entries (mixed with explicit **`JOIN`** syntax afterward), `WHERE`, `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`, **`AS`** as a tokenizer keyword (`WITH alias AS (...)`, optional `ROW_NUMBER … AS rn`), basic expressions, transactions (`BEGIN` / `COMMIT` / `ROLLBACK`), unary numeric literals (e.g. `-1`, `+.5`).
-- **`JOIN`** (**experimental** subset): **`INNER`/`LEFT`/`RIGHT`/`FULL`/`CROSS JOIN`** with `ON` **`=`** predicates (possibly `column = column`, including optional `tbl.col` qualifiers) and **`AND`**. Rows merge with **left-preference** when both sides expose the same column name. Results materialize scratch tables **`__AstralJoin_0`** (chain suffix **`_1`**, …).
-- **`GROUP BY`** (experimental): collapsing rows sharing the same grouping key columns. Keys may be plain identifiers or **`table.column`** spellings; the engine groups on the **final column name** (the part after **`.`**) so it matches merged join row keys. With **`COUNT(*)`**, the grouped result exposes a count column named **`cnt`** by default, or the name you give with **`COUNT(*) AS alias`** (e.g. **`COUNT(*) AS order_count`**). **`COUNT(DISTINCT column)`** (single column name inside parentheses) counts **distinct non-key cell values per group** and uses the same default or **`AS`** naming rule; it cannot yet be combined in the same **`SELECT`** list with **`SUM`/`MIN`/`MAX`/`AVG`** in this dialect. **`SUM`/`MIN`/`MAX`/`AVG(column)`** with optional **`AS alias`** compile to a grouped aggregate pass alongside optional **`COUNT(*)`** / **`COUNT(*) AS …`** when both appear (ordering stays deterministic on grouped keys). **OLAP modifiers:** **`GROUP BY … WITH ROLLUP`**, **`WITH CUBE`**, and **`GROUPING SETS ((…), …)`** append subtotal / cube / explicit-set rows ( **`CUBE`** capped at **8** key columns). Rolled-up dimension cells are stored as **empty strings**; each output row includes **`_olap_level`** (ROLLUP: number of active keys in the set, **0** = grand total; CUBE: bitmask of active keys; GROUPING SETS: set index). **`GROUPING(col)`** in the **`SELECT`** list returns **1** when that dimension is aggregated in the current OLAP row (via internal **`_grouping_<col>`** metadata). **`COUNT(DISTINCT)`** cannot be combined with ROLLUP/CUBE/GROUPING SETS yet.
-- **`EXISTS`** / **`NOT EXISTS`** (**correlation supported**): inner `WHERE` is serialized as DNF. For each candidate **outer** row, the VM tests whether **any inner row** satisfies the inner DNF against a **merged** row (enclosing row plus inner cells whose keys are declared columns on the inner `FROM` table; among those, inner wins on duplicate names). Column–column comparisons in the inner `WHERE` (e.g. `inner_fk = outer_pk`) are encoded explicitly so both sides read from that merged row. Nested `EXISTS` uses the same merge rule at each level.
-- **`WITH` (CTE) subset:** syntax `WITH [RECURSIVE] alias [( col, … )] AS ( SELECT … )` with commas between definitions; **`FROM`** rewrites logical aliases onto internal scratch tables (`__astral_cte_<n>_<alias>`). Non-recursive bodies are a single **`SELECT`**. **`WITH RECURSIVE`** adds **`anchor SELECT UNION ALL recursive SELECT`**; the VM runs a fixpoint loop (**`RECURSIVE_CTE_FIXPOINT`**, capped by **`Limits::MaxCteRecursionDepth`**) that appends only new row signatures from each recursive step. **`UNION` / `UNION ALL` / `INTERSECT` / `INTERSECT ALL` / `EXCEPT` / `EXCEPT ALL`** between full **`SELECT`** arms are supported (distinct variants dedupe row signatures; **`ALL`** variants use multiset counts).
-- **`FOREIGN KEY` / `REFERENCES`:** column and **table-level** constraints (including **composite** keys with matching column arity) are enforced on **`INSERT`** / **`UPDATE`** (parent row must exist; **SQL NULL** / absent FK cells skip the check). **Self-referencing** inserts may reference the row’s own **single-column primary key** on the same insert. **`ON DELETE RESTRICT`** rejects parent **`DELETE`** while children reference that key; **`ON DELETE CASCADE`** removes or adjusts dependent rows; **`ON DELETE SET NULL`** clears nullable FK columns. FK metadata is written to the WAL as **`F|`** records and to the main snapshot (trailer **`<<<ASTRAL_DB_FOREIGN_KEYS>>>`** between the security catalog and view blocks) so enforcement survives **`SyncToFile`** and reopen; plain **`.wal` replay** also restores foreign keys.
-- **`TRUE` / `FALSE` in predicates:** SQL boolean keywords (not string literals) in **`WHERE`**, **`HAVING`**, **`CHECK`**, and **`CASE WHEN`** arms—bare **`TRUE`** / **`FALSE`**, **`NOT TRUE`**, and comparisons like **`flag = TRUE`**. Lowered to DNF sentinels evaluated by the same **`FILTER_DNF`** path as other atoms.
-- **Sequences:** **`CREATE SEQUENCE name [START WITH n] [INCREMENT BY m]`** (defaults **1** / **1**), **`DROP SEQUENCE name [IF EXISTS]`**, and **`NEXTVAL(seq)`** in **`INSERT … VALUES`** (lowercased identifiers are fine). Sequence state is stored in memory, logged to the WAL as **`SQ|`** / **`SD|`**, and persisted in snapshots under **`<<<ASTRAL_DB_SEQUENCES>>>`** after foreign keys.
-- **Identity columns:** **`GENERATED ALWAYS AS IDENTITY`** or **`GENERATED BY DEFAULT AS IDENTITY`** on a column definition, with optional **`(START WITH n INCREMENT BY m)`** on the identity clause. Each identity column binds an internal sequence **`__astral_id_<table>_<column>`**; **`INSERT`** may omit the column (or supply **SQL NULL** / an empty cell) to take the next value. **`GENERATED ALWAYS`** rejects explicit non-null inserts. **`GENERATED BY DEFAULT`** accepts a caller-supplied value when provided.
-- **Window analytics:** **`ROW_NUMBER()` / `RANK()` / `DENSE_RANK()`** (empty **`()`**), **`SUM(col)` / `MIN(col)` / `MAX(col)` / `AVG(col)`** with **`OVER ( [ PARTITION BY … ] ORDER BY col [ASC|DESC] [ frame ] )`**, and **`LAG(col [, offset])` / `LEAD(col [, offset])`** (default offset **1**). Optional **`AS alias`** after the **`OVER`** clause. Multiple window functions may appear in one **`SELECT`** (up to **`Limits::MaxWindowFunctionsPerSelect`**, 16). Running aggregates default to **`ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`**; explicit **`ROWS BETWEEN <bound> AND <bound>`** after **`ORDER BY`** uses **`UNBOUNDED PRECEDING`**, **`n PRECEDING`**, **`CURRENT ROW`**, **`n FOLLOWING`**, or **`UNBOUNDED FOLLOWING`**. Ordinal functions (**`ROW_NUMBER` / `RANK` / `DENSE_RANK`**) ignore frame clauses. **`RANGE`** / **`GROUPS`** frames are not implemented.
-- **`COALESCE(expr, …)`** **(SELECT list):** two or more arguments; each argument is a **literal**, **`NULL`**, or **plain column reference** (same scalar subset as **`CASE`** **`THEN`**). It is lowered to **`CASE`** with **`WHEN expr IS NOT NULL THEN expr`** arms; leading **`NULL`** arguments are skipped so **`NULL IS NOT NULL`** never reaches the DNF builder. Omitted **`AS`** uses **`_coalesce0`**, **`_coalesce1`**, ….
-- **`CASE` expressions (searched subset, SELECT list):** `CASE WHEN <predicate> THEN <scalar> [ WHEN … THEN … ] [ ELSE <scalar> ] END [ AS alias ]`. Each **`WHEN`** uses the same predicate subset as **`WHERE`** (DNF comparisons, **`NULL`/`IS NULL`/`IN`/…). **`THEN`/`ELSE` scalars** in this dialect are **literals**, **plain column references**, or **`NULL`** (no nested **`CASE`** or arithmetic in **`THEN`** yet). If **`AS`** is omitted, output column names default to **`_case0`**, **`_case1`**, …. Without **`ELSE`**, non-matching rows yield **SQL NULL** (stored as absent/empty-cell semantics). Predicate packing is capped by **`Limits::MaxCaseWhenArms`** (32).
-- **`CAST` (`SELECT` list):** `CAST ( <literal | column | NULL> AS <sql type> ) [ AS alias ]`. The `<sql type>` text is parsed with the same **`ParseDataType()`** rules as **`CREATE TABLE`** (including lengths like **`VARCHAR(10)`**, **`DOUBLE PRECISION`**, parameterized **`DECIMAL`**). It is lowered to one of four **conversion families** in the VM: **text** (**`TEXT`**, **`CHAR`**…, **`VARCHAR`**…—leading/trailing ASCII whitespace trimmed), **integer-ish** (**`INTEGER`**, **`SMALLINT`**, **`BIGINT`**), **floating-ish** (**`REAL`**, **`FLOAT`**, **`DOUBLE`**, **`NUMERIC`** / **`DECIMAL`**…), and **`BOOLEAN`**. **Date/time** names (**`DATE`**, **`TIMESTAMP`**, …) use the **text** rules only—no calendar or clock arithmetic. Booleans coerce recognized tokens (**`TRUE`/`FALSE`**, **`0`/`1`**, **`YES`/`NO`**, **`ON`/`OFF`**) and otherwise try a numeric interpretation; **`INTEGER`** trims and parses (decimal literals truncate toward zero to a 64‑bit signed integer); invalid or **SQL NULL** inputs yield **NULL** (cell absent). Omitted **`AS`** uses **`_cast0`**, **`_cast1`**, …. Unsupported type spellings fail at parse time.
-- **`CHECK` constraints (`CREATE TABLE`):** Supports **column** definitions with **`CHECK (...)`** and optional **table-level** **`CHECK (...)`** (after optional **`CONSTRAINT`** names). Predicate text must compile into the same DNF-backed subset as **`WHERE`** (comparisons, **`AND`**/**`OR`**, **`IS`**/**`IS NOT NULL`**, **`IN`/`NOT IN`** lists where supported, **`LIKE`**—see codegen `BuildWhereDnf`). At **DDL compile** time the body is parsed and packed; **`INSERT`**, **`UPDATE`** (against the **merged** row), and **`ALTER TABLE … ADD COLUMN`** row backfill run the same evaluator as **`FILTER_DNF`**. Unsupported CHECK shapes fail at **bytecode build** for `CREATE TABLE`. **`T|`** WAL rows and the snapshot schema section store optional packed CHECK SQL/DNF so **CHECK constraints are restored from WAL replay and from the main database file** (older WAL rows without the extended column fields may omit checks until the table is recreated).
-- **Execution pipeline:** tokenizer → parser → AST → bytecode (`BuildBytecode`) → **BytecodeInterpreter** → **Database** operations. Optimization passes are selectable at the CLI (`-O0` … `-O3`): constant folding, dead-code elimination, and instruction combining run at higher levels; **register allocation is disabled** on this stack VM (the old pass was unsound for `PUSH`/`POP` semantics). **`UPDATE`** is always lowered to **`UPDATE_MATCHING`** with a **`WHERE`** DNF argument; when **`WHERE`** is omitted, the compiler supplies a tautology (`FILTER_Dnf` equivalent of matching all rows) so the mutating path is one code path (`Opcode::UPDATE` legacy remains for compatibility with older bytecode only).
-- **Bytecode I/O and tooling (v1.0):** `-cc` / `-fb` use **`.abc` container version 1** (`sources/SQL/BytecodeFormat.*`). Optional **`--compile-pool` / `-cp`** appends a deduplicated string-operand pool for `PUSH_POOL`. **Inspection** (`--inspect-bytecode` / `-ib`, `--bytecode-aspect` / `-ba`, `--disasm-bytecode` / `-db`, `--validate-bytecode` / `-vb`) and **VM debugging** (`--debug-bytecode` / `-dbg`, `--trace-bytecode` / `-tb`, `--debug-steps` / `-ds`, `--breakpoint` / `-bp`) live in `BytecodeInspect.*` and `BytecodeDebug.*`. **Stored procedures:** SQL **`CREATE PROCEDURE … AS ( … );`**, **`CALL`**, **`DROP PROCEDURE`** compile bodies to **`astraldb_procs_cache/<name>.abc`** and register relations in **`astraldb_procs.json`** (`BytecodeProcedures.*`, WAL **`PR|`** / **`PD|`**). The catalog tracks **`depends_on` / `called_by`**, table references, and an **`abc_index`** from each `.abc` back to procedure names; CLI **`--proc-relations` / `-pg`** prints the graph. Register external `.abc` files with **`--proc-register` / `-pr`**; run with **`--proc-call` / `-px`** or SQL **`CALL`**. See [`Usage.md`](Usage.md) and **`examples/sql_procedure.sql`**.
-- **Storage engine:** in-memory table representation with a **write-ahead log** for durability, periodic snapshot sync, spinlock-backed concurrency, and bounded **async** fan-out for database work (`std::async` with a global outstanding-job guard).
-- **WAL on-disk format:** each logical record is written as a line prefixed **`W1|`** and base64 payload: **FEC** (compact GF(256) parity in **`DS/ErrorCorrection.hxx`**) is applied to the UTF-8 record, then the blob is sealed with **XChaCha20** (nonce + ciphertext). The key is the same **`kAtRestXChaChaKey`** shared with the main database snapshot encryptor (`sources/Database/AtRestKey.hxx`). **`Replay`** accepts legacy **plaintext** lines (no `W1|`) for older files. After **`SyncToFile`**, the WAL file is truncated.
-- **Session identity (multi-user catalog):** each `Database` keeps a **registered user list** (seeded with **`Admin0` / `admin`** on first open) plus an optional **current session user** set by `AuthenticateUser`, `SetCurrentUser`, or `Logout`. Successful authentication **copies** the matched catalog entry into the session slot so other registered users are never moved or destroyed by a login (earlier builds incorrectly `move`d the catalog row, which broke multi-user). `AddUser` rejects duplicate names; `RemoveUser` drops a catalog entry and clears the session if it pointed at that user. **Snapshots** (`SyncToFile`) append, after table data, **`<<<ASTRAL_DB_USER_ACL>>>`** (encrypted users, ACL map, roles, role ACLs, membership, fine grants), then optional **`<<<ASTRAL_DB_FOREIGN_KEYS>>>`**, then optional **`<<<ASTRAL_DB_VIEWS>>>`**; load strips those trailers in reverse order. Legacy files without newer markers still restore rows and may re-seed **`Admin0`** when the ACL block is absent. **`AddUser` / `RemoveUser` / `GrantPermission` / `RevokePermission`** append WAL records `UU` / `UD` / `UG` / `UR`; roles and fine grants use `CR` / `DR` / `GM` / `RM` / `RG` / `RR` / `UF` / `XF`; foreign keys use **`F|`**. **`.wal`‑only** recovery rebuilds security state, FK metadata, and DDL/DML together. The **`astraldb`** CLI wires **`-U` / `--user`** and **`-P` / `--password`** (or **`ASTRALDB_USER`** / **`ASTRALDB_PASSWORD`**) into `AuthenticateUser` after the session path is chosen—see [`Usage.md`](Usage.md). **`--audit-file PATH`** enables an append-only **security audit log** (logins, denials, grants, user/role changes) separate from debug logging via **`-l`**. When a **session user** is established (`AuthenticateUser` / CLI `-U`), **DML and SELECT** enforce table ACLs (global `""` grants union with per-table grants **and** permissions inherited from assigned **roles**). **Row-level** rules on `User::FineGrainedPermissions` further restrict which primary-key values are visible or mutable (`GrantRowPermission` / SQL `GRANT … (col)` / API); rows without a matching rule are hidden when row-only rules exist for that table. **Column-level** rules use the same structure with a non-empty `Column` name: when any column rule exists for `(user, table)`, **SELECT** omits columns without an explicit matching grant (default-deny for unspecified columns); **INSERT** / **UPDATE** reject writes to forbidden columns. Unauthenticated sessions skip ACL checks (legacy scripts and examples). **DDL** and **GRANT/REVOKE** require **ALL** on the session user.
-- **RBAC (roles):** `CREATE ROLE` / `DROP ROLE`; `GRANT SELECT ON t TO ROLE reader` (and other permission keywords) store ACLs on the role; `GRANT ROLE reader TO alice` / `REVOKE ROLE reader FROM alice` assign membership. Effective permissions for a user are the bitwise OR of direct user ACLs and every assigned role’s ACLs (global `""` plus per-table). See **`examples/security_rbac.sql`**.
-- **Column grants (SQL):** `GRANT SELECT (col1, col2) ON table TO user` and `REVOKE SELECT (col1) ON table FROM user` map to fine-grained rules (empty `RowId` = all rows). `GRANT … TO ROLE name` targets role ACLs instead of a catalog user.
-- **Indexes:** B+-tree (and related DS) hooks for indexed columns; full table scans when no usable index is registered.
-- **Tooling:** InsurgeNT-based builds (`insurgent build`), unit tests plus **every `examples/*.sql` parse / compile / run** in CI-style checks, and optional scripts such as an isolated torture run so heavy jobs do not hammer your working tree.
+## Modern SQL: what the dialect is for
 
-## Vision
+AstralDB targets the SQL most teams actually write today: **joins and set operations**, **grouped analytics**, **window functions**, **CTEs (including recursion)**, **upsert-style DML**, and **role-based security**—implemented on a single static binary with predictable bytecode semantics rather than an opaque external planner.
 
-The long-term goal is a **fast, small, readable** RDBMS where performance comes from tight data structures, deliberate concurrency (async where it helps, locks where they are unavoidable), and a clear separation between **language front end**, **bytecode**, and **storage**—not from opaque megabytes of dependencies.
+| Layer | Focus | Representative surface |
+|-------|--------|-------------------------|
+| **SQL-92 core** | Tables, predicates, DML, constraints | `CREATE`/`DROP TABLE`, `INSERT` (multi-row, bulk, `ON CONFLICT`), `UPDATE`/`DELETE`, `SELECT` with `WHERE`/`GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT`/`OFFSET`, joins, `UNION`/`INTERSECT`/`EXCEPT`, `CASE`/`COALESCE`/`CAST`, transactions |
+| **SQL-99 analytics** | Reporting and recursion | `WITH` / `WITH RECURSIVE`, window functions (`ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`/`LEAD`, framed aggregates), OLAP (`ROLLUP`/`CUBE`/`GROUPING SETS`, `GROUPING()`), sequences, identity columns, correlated `EXISTS` |
+| **SQL:2003+ extensions** | Temporal, semi-structured, search | `FOR SYSTEM TIME AS OF`, `MATCH_RECOGNIZE`, JSON/XML scalars, full-text `MATCH`, vector indexes, advanced cell types (`STRUCT`, `MAP`, `LIST`, `VECTOR`, …) |
+| **Operational SQL** | Durability and governance | RBAC (`GRANT`/`REVOKE`, roles), row/column grants, views, stored procedures (`.abc` cache), `EXPORT`/`IMPORT` bundles |
 
-Near-term work tends to mean: widening SQL coverage, hardening semantics, improving the optimizer and bytecode, and keeping operational knobs (logging, session DB paths, bytecode I/O) predictable so operators and contributors are not guessing.
+Runnable scripts for each band live under **`examples/`** (for example **`sql92_03_coverage.sql`**, **`sql92_analytics.sql`**, **`sql99_recursive.sql`**, **`sql_olap.sql`**, **`sql_window_frames.sql`**, **`sql_merge_upsert.sql`**, **`sql_standard_features.sql`**). When this overview and the scripts disagree, **trust the scripts and tests**.
 
-### Performance posture (SQLite as a directional target)
+---
 
-SQLite is referenced as **a benchmarking yardstick**, not something this tree claims to dominate out of the box. The codebase favors predictable hot paths (`GROUP BY` hash maps with `reserve`, stable sorts only where correctness or testability demands) and tightening VM overhead—but **no audited workload yet proves parity.** When you tune for speed, instrument with fixed scripts (bulk inserts already exist under `examples/`) and compare against `sqlite3` on the **same synthetic batch** rather than quoting relative speed without harnesses.
+## SQL-92 core
 
-See also **`examples/sql_advanced_subset.sql`**, **`examples/sql92_analytics.sql`**, **`examples/sql99_recursive.sql`**, **`examples/sql_merge_upsert.sql`**, **`examples/sql_merge_exprs.sql`**, **`examples/sql_olap.sql`**, **`examples/sql_olap_grouping.sql`**, **`examples/sql_sequence_identity.sql`**, **`examples/sql_window_frames.sql`**, **`examples/sql_timeseries.sql`**, **`examples/sql_hybrid_storage.sql`**, **`examples/sql_advanced_types.sql`**, **`examples/sql_math_sci.sql`**, **`examples/sql_standard_features.sql`**, **`examples/sql_text_search.sql`**, **`examples/sql_xml.sql`**, **`examples/sql_indexes.sql`**, and **`examples/join_bench.sql`** with **`astraldb --time-sql`**.
+**Queries and predicates.** `SELECT` with column lists (including `CAST`, searched `CASE`, `COALESCE`, `NULLIF`, `GREATEST`/`LEAST`), `DISTINCT`, comma-`FROM` (chained `CROSS JOIN` before explicit joins), `WHERE`, `ORDER BY`, `LIMIT`/`OFFSET` (including `FETCH FIRST` and comma `LIMIT offset, count`). Predicates support comparisons, `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `IN`/`NOT IN`, `LIKE`, `BETWEEN`, `TRUE`/`FALSE`, and **`EXISTS` / `NOT EXISTS`** (including correlation via merged outer/inner rows).
 
-## SQL-92 / SQL-99 / SQL:2003 surface
+**Joins (experimental).** `INNER` / `LEFT` / `RIGHT` / `FULL` / `CROSS JOIN` with `ON` equality (and `AND`); duplicate column names resolve with **left preference**. Results land in scratch tables such as **`__AstralJoin_0`**.
 
-AstralDB targets a **readable, testable** dialect aligned with SQL-92 core DML/DDL, SQL-99 analytics (`WITH`, window functions, sequences, identity), and selected SQL:2003 features—not a full conformance suite. **`examples/*.sql`** and **`tests/AstralDB.Tests.cxx`** are the contract.
+**Grouping.** `GROUP BY` on plain or `table.column` keys (grouping uses the **final column name** after `.`). Aggregates include `COUNT(*)`, `COUNT(DISTINCT col)`, `SUM`/`MIN`/`MAX`/`AVG` with optional `AS`. **`HAVING`** is lowered only for aggregates that appear in the `SELECT` list (see caveats).
 
-### SQL-92 core (polished)
+**Set operations.** `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT` (with `ALL` multiset variants where implemented).
 
-- **Predicates:** comparisons, **`AND`/`OR`**, **`NOT`**, **`IS [NOT] NULL`**, **`IN`/`NOT IN`**, **`LIKE`/`NOT LIKE`**, **`BETWEEN … AND …`**, **`EXISTS`/`NOT EXISTS`** (correlated).
-- **Query:** **`SELECT`** projections, **`DISTINCT`**, **`FROM`** (comma = cross join + explicit joins), **`WHERE`**, **`GROUP BY`** (+ **`HAVING`** on lowered aggregates), **`ORDER BY`**, **`LIMIT`/`OFFSET`** (including comma form **`LIMIT offset, count`** and **`FETCH FIRST`**).
-- **Set ops:** **`UNION`/`UNION ALL`**, **`INTERSECT`**, **`EXCEPT`** (with **`ALL`** multiset variants).
-- **Scalars in SELECT:** searched **`CASE`**, **`COALESCE`**, **`CAST`**, **`NULLIF(a,b)`**, **`GREATEST`/`LEAST`**, SQL-99 string/datetime builtins (**`SUBSTRING … FROM …`**, **`POSITION … IN …`**, **`TRIM`**, **`EXTRACT`**, **`DATE_ADD`/`DATE_SUB`/`DATE_DIFF`**, extended time-series helpers in **`TimeSeries.*`**).
-- **DML/DDL:** **`INSERT`** (multi-row, **`ON CONFLICT`**, bulk), **`UPDATE`/`DELETE`**, **`MERGE`**, **`CREATE`/`DROP TABLE`**, constraints (**`PRIMARY KEY`**, **`FOREIGN KEY`**, **`CHECK`**, **`UNIQUE`**, **`NOT NULL`**), **`CREATE VIEW`**, transactions, RBAC **`GRANT`/`REVOKE`**.
+**DML and constraints.** Multi-row and **bulk** `INSERT`, restricted **`MERGE INTO … USING … ON …`**, `UPDATE`/`DELETE`, `CREATE`/`DROP TABLE`, `PRIMARY KEY`, **`FOREIGN KEY`** (including composite keys, `ON DELETE` actions, WAL + snapshot persistence), **`CHECK`** (DNF-packed at DDL; enforced on `INSERT`/`UPDATE`), `CREATE VIEW`, and basic **`GRANT` / `REVOKE`**.
 
-### SQL-99 analytics (documented)
+**Scalars and strings.** SQL-99 string/datetime builtins (`SUBSTRING … FROM …`, `POSITION … IN …`, `TRIM`, `EXTRACT`, `DATE_ADD`/`DATE_SUB`/`DATE_DIFF`, plus time-series helpers documented with **`TimeSeries.*`**).
 
-- **`WITH` / `WITH RECURSIVE`**, window functions (**`ROW_NUMBER`/`RANK`/`DENSE_RANK`**, **`LAG`/`LEAD`**, framed **`SUM`/`AVG`/`MIN`/`MAX` OVER`**), OLAP **`ROLLUP`/`CUBE`/`GROUPING SETS`**, **`GROUPING()`** / SQL:2003 **`GROUPING_ID(col, …)`** (plus per-row **`_grouping_id`** metadata on OLAP output), sequences, identity columns — see existing sections above.
+---
 
-### SQL:2003 additions
+## SQL-99 analytics
 
-- **`FOR SYSTEM TIME AS OF <timestamp>`** and shorthand **`FROM t AS OF '…'`** — filters rows using optional columns **`valid_from`** / **`valid_to`** (epoch seconds or values understood by **`TimeSeries::ParseEpochSeconds`**). Tables without those columns yield an empty snapshot under **`AS OF`**.
-- **`MATCH_RECOGNIZE`** — row-pattern matching over an ordered table: **`ORDER BY col`**, **`PATTERN ( A B+ … )`**, **`DEFINE sym AS <predicate>`** (DNF-backed, same subset as **`WHERE`**). Matching rows are retained in-place before **`WHERE`**/projections.
-- **JSON:** cell payloads parsed via **`DS::JSONCodec`**; scalars **`JSON_EXTRACT(json, path)`** (dot / `[index]` paths), **`JSON_CONTAINS`**, **`JSON_MERGE`** (shallow object merge), **`JSON_ARRAY_LENGTH`**, **`JSON_KEYS`** (returns a **`LIST`**). Bundle **`EXPORT`/`IMPORT DATABASE … FORMAT JSON`** unchanged.
-- **Full-text search (reuses DNF + scalars):** **`WHERE col MATCH 'term1 term2'`** (AND of tokens; **`|`** for OR branches), scalars **`TEXT_CONTAINS`**, **`TEXT_RANK(text, query)`** (coverage score), and **`MATCH_AGAINST(text, '"phrase" terms')`**. **`CREATE INDEX idx ON t(col) USING FTS`** builds an inverted index in **`sources/Database/TextIndex.*`**; simple single-**`MATCH`** filters can use it as a row prefilter. VM opcodes **`MATCH`** / **`AGAINST`** in **`sources/SQL/TextSearch.*`**.
-- **Vector indexes:** **`CREATE INDEX idx ON t(col) USING VECTOR [METRIC COSINE|L2]`** maintains a flat ANN-friendly store in **`sources/Database/VectorIndex.*`**. Scalar **`VECTOR_TOPK('idx', query_vec, k)`** returns a **`LIST`** of matching row indices (0-based positions in the table).
-- **XML (SQL scalars):** cell payloads use **`DS::ParseXML` / `SerializeXML`** (**`sources/DS/XMLCodec.hxx`**, **`sources/SQL/XmlSql.*`**). **`XML_EXTRACT(xml, path)`** reads element text via dot or slash paths (**`book.title`**, **`/book/title`**) or attributes (**`book/@id`**). **`XML_SERIALIZE(xml)`** returns a canonical element tree; invalid input is returned unchanged. **`XML_VALID(xml)`** returns **`1`** / **`0`**. See **`examples/sql_xml.sql`**.
+**Common table expressions.** `WITH [RECURSIVE] name [(cols…)] AS ( … )` with comma-separated definitions. Non-recursive bodies are a single `SELECT`. **`WITH RECURSIVE`** uses anchor `UNION ALL` recursive arms; the VM runs a **`RECURSIVE_CTE_FIXPOINT`** loop (bounded by **`Limits::MaxCteRecursionDepth`**) that appends only new row signatures each iteration.
 
-### Advanced types & math/sci (see also prior sections)
+**Windows.** `ROW_NUMBER()` / `RANK()` / `DENSE_RANK()`, `SUM`/`MIN`/`MAX`/`AVG(col)` and `LAG`/`LEAD` with **`OVER ( [ PARTITION BY … ] ORDER BY … [ frame ] )`**. Default running frames use **`ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`**; explicit `ROWS BETWEEN` bounds are supported. **`RANGE` / `GROUPS` frames are not implemented.**
 
-- **DuckDB-style types:** **`STRUCT`**, **`MAP`**, **`LIST`**, **`VECTOR`**, **`MATRIX`**, **`COMPLEX`** with wire formats and **`CAST`**.
-- **`MathSci` platform:** elementary math, statistics, ML activations/losses, RNG, vector similarity, **`MATVEC`**, SIMD signal processing (**`FFT`**, **`CONV_FULL`**, …), real autograd (**`AD_GRAD_*`**, **`AD_CHAIN`**), **Hessian** and **Wirtinger** complex AD (**`AD_HESSIAN*`**, **`AD_WIRTINGER_*`**), and differential-equation solvers (**`ODE_*`**, **`SDE_*`**, **`PDE_*`**) — see **`examples/sql_math_sci.sql`**, **`docs/MathSciSignal.md`**, **`docs/MathSciAutograd.md`**, **`docs/MathSciSolves.md`**.
+**OLAP.** `GROUP BY … WITH ROLLUP`, `WITH CUBE` (capped at **8** key columns), and `GROUPING SETS ((…), …)`. Rolled-up dimensions appear as **empty strings**; metadata columns **`_olap_level`** / grouping helpers support `GROUPING(col)` and **`GROUPING_ID(…)`**. **`COUNT(DISTINCT)` cannot be combined with ROLLUP/CUBE/GROUPING SETS yet.**
 
-### Build quality
+**Sequences and identity.** `CREATE SEQUENCE`, `NEXTVAL(seq)`, and **`GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY`** columns with optional `(START WITH … INCREMENT BY …)`.
 
-- **`ASTRALDB_WARNINGS_AS_ERRORS`** defaults to **ON** (`-Werror` / **`/WX`**). Shared **`SafeDiv()`** in **`sources/IO/MathUtil.hxx`** avoids divide-by-zero in analytics kernels.
+---
 
-### SQL-92 caveats (still apply)
+## SQL:2003 and extended types
 
-- **Identifiers and keywords** are effectively **ASCII case-insensitive** for reserved words; unquoted identifiers that collide with new keywords (e.g. **`RANK`**) tokenize as keywords, not column names—prefer safer names or plan for quoting once quoted identifiers exist.
-- **`SELECT *`** is supported in simple **`SELECT`** arms but is **rejected** inside **`UNION`/`INTERSECT`/`EXCEPT`** (name columns explicitly).
-- **`HAVING`** is accepted only with **`GROUP BY`** and is compiled with the same **DNF** machinery as **`WHERE`** after **lowering** a small set of aggregate calls into grouped output columns: **`COUNT(*)`**, **`COUNT(DISTINCT col)`** (must match the **`SELECT`** aggregate), and **`SUM`/`MIN`/`MAX`/`AVG(col)`** (must match a grouped **`SUM`/`MIN`/`MAX`/`AVG(col)`** in the **`SELECT`** list, including its **`AS`** output name). You can also compare **`HAVING`** to the count column by its real name (**`cnt`** or your **`COUNT(*) AS …`** alias). Arbitrary expressions inside **`HAVING`** (nested calls, arithmetic on aggregates, mismatched columns) still fail at bytecode build until the grammar is extended.
-- **`NULL`**: on disk and in many paths, **“missing cell”** and **empty string** interact closely; **`IS NULL`** / **`IS NOT NULL`** in predicates follow the VM’s **`CellIsSqlNull`** rules—treat edge cases as **dialect-specific** until you have regression tests for your workload.
-- **Transactions** use a filesystem snapshot of the primary DB file at **`BEGIN`**; **`ROLLBACK`** restores that snapshot and clears adjacent **`.wal`** sidecars. Long transactions and large DB files are constrained by the same snapshot copy limits as other whole-file operations.
-- **Date/time types** in **`CAST`** apply **string coercion only**—no timezone-aware calendar math.
-- **`COUNT`**: besides **`COUNT(*)`** (optional **`AS alias`**), only **`COUNT(DISTINCT one_column)`** with the same optional alias is implemented—no **`COUNT(ALL col)`**, no **`COUNT`** of arbitrary expressions, and no **`DISTINCT`** over multiple columns yet.
-- **`MERGE` / `ON CONFLICT`:** **`MERGE`** supports **`INTO … USING … ON t.col = s.col [AND …]`** (composite correlation) with **either or both** of **`WHEN MATCHED THEN UPDATE SET …`** and **`WHEN NOT MATCHED THEN INSERT …`**. **`SET`** / **`INSERT`** values may be literals, **`source_alias.column`**, **`target_alias.column`**, **`EXCLUDED.column`** (upsert only), or simple **`+ - * /`** expressions over those scalars. **`INSERT … ON CONFLICT`** resolves conflicts by primary-key columns, an optional **`(col, …)`** list, **`DO NOTHING`**, or **`DO UPDATE SET`** with the same expression subset (including **`EXCLUDED.column`**). **`UPDATE … SET`** uses the same expression evaluator per matching row.
+**Temporal.** `FOR SYSTEM TIME AS OF <timestamp>` and `FROM t AS OF '…'` filter rows using optional **`valid_from` / `valid_to`** columns (epoch seconds or values understood by **`TimeSeries::ParseEpochSeconds`**). Tables without those columns yield an empty snapshot under `AS OF`.
 
-## Analytics patterns (cookbook)
+**Row patterns.** `MATCH_RECOGNIZE` with `ORDER BY`, `PATTERN ( … )`, and `DEFINE` predicates (DNF-backed, same subset as `WHERE`).
 
-Small recipes that map cleanly onto today’s bytecode (see **`examples/sql92_analytics.sql`**):
+**JSON, XML, search.** `JSON_EXTRACT`, `JSON_CONTAINS`, `JSON_MERGE`, and related scalars; XML extract/serialize/validate; **`WHERE col MATCH '…'`** with optional FTS indexes; **`CREATE INDEX … USING VECTOR`** and **`VECTOR_TOPK`**.
 
-1. **Distinct counts per bucket:** `SELECT key, COUNT(DISTINCT visitor_id) FROM events GROUP BY key` — each group’s **`cnt`** is the number of **distinct** string values observed in the named column (SQL **`NULL`** / absent cells typically become empty strings for this count).
-2. **First non-empty / fallback column:** `COALESCE(priority_col, backup_col, '0')` — literals and columns only; for richer expressions, use an explicit **`CASE`** once the predicate and **`THEN`** subsets cover your shape.
-3. **Top-N within a partition:** `ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score DESC) AS rn` then wrap with an outer filter in a future release, or materialize to a scratch table and filter with **`WHERE`** / **`LIMIT`** in a second statement today.
-4. **Competition ranks vs dense leaderboards:** use **`RANK()`** when ties should consume numeric places (medals: two silvers, no bronze), and **`DENSE_RANK()`** when you only need contiguous tiers. Use **`ROW_NUMBER()`** when every row needs a unique index after sorting.
-5. **One window per `SELECT`:** plan **`WITH`** chains or multiple statements if you need **`ROW_NUMBER`** and **`RANK`** on the same intermediate row set.
+**Advanced cells and MathSci.** DuckDB-style **`STRUCT`**, **`MAP`**, **`LIST`**, **`VECTOR`**, **`MATRIX`**, **`COMPLEX`**; geospatial and dataset opcodes; SIMD signal/FFT, autograd, and differential-equation solvers—see **`examples/sql_math_sci.sql`**, **`docs/MathSciSignal.md`**, **`docs/MathSciAutograd.md`**, **`docs/MathSciSolves.md`**.
 
-## Security and durability (intent)
+---
 
-Design direction includes **data at rest**: the main database file is written as **XChaCha20** payloads (random 24-byte nonce per sync) under **`kAtRestXChaChaKey`** (`sources/Database/AtRestKey.hxx`); the WAL uses the same key plus **FEC** and a **`W1|`** line encoding (see **WAL on-disk format** above). User password blobs use their own per-user key material. Hashing/salting and WAL-backed recovery limit silent loss of acknowledged work after a crash. Exact threat models and guarantees should be validated per release; until then, assume **best effort** and read the code paths you care about. Passing passwords on the command line exposes them to shell history and process listings; prefer **`ASTRALDB_PASSWORD`** (and **`ASTRALDB_USER`** if you want the name out of argv) for automation, and treat the default **`Admin0`** password as **development-only**.
+## Caveats (read before relying on semantics)
+
+These limits are intentional guardrails until the grammar and VM catch up. If your workload hits one of them, add an **`examples/`** regression or extend the compiler—do not assume “standard SQL” behavior by default.
+
+| Area | Limitation |
+|------|------------|
+| **Identifiers** | Reserved words are **ASCII case-insensitive**; unquoted names that collide with keywords (e.g. `RANK`) parse as keywords—use safer names until quoted identifiers exist. |
+| **`SELECT *`** | Allowed in simple `SELECT` arms; **rejected inside** `UNION` / `INTERSECT` / `EXCEPT`—name columns explicitly. |
+| **`HAVING`** | Only with **`GROUP BY`**, and only for aggregates **already present** in the `SELECT` list (or `COUNT(*)` / `COUNT(DISTINCT)` shapes the compiler recognizes). Arbitrary `HAVING` expressions fail at bytecode build. |
+| **`NULL`** | Missing cells and empty strings interact closely in storage; `IS NULL` follows VM **`CellIsSqlNull`** rules—validate edge cases for your data. |
+| **Transactions** | `BEGIN` snapshots the primary DB file; `ROLLBACK` restores that copy and clears adjacent **`.wal`** sidecars. Large databases and long transactions are bounded by whole-file copy limits. |
+| **`CAST` date/time** | Type names parse, but conversion is **string coercion only**—no timezone-aware calendar math. |
+| **`COUNT`** | `COUNT(*)`, optional `AS`, and **`COUNT(DISTINCT one_column)`** only—no `COUNT(ALL …)`, no multi-column `DISTINCT`, no arbitrary expressions inside `COUNT`. |
+| **`MERGE` / upsert** | `MERGE` needs **`target.col = source.col`**-style `ON` keys (composite allowed); `SET`/`INSERT` values are literals, alias columns, `EXCLUDED.*`, or simple `+ - * /` over those. `INSERT … ON CONFLICT` uses PK or an explicit column list. |
+| **`CASE` / `COALESCE` in SELECT** | `THEN`/`ELSE` scalars are literals, plain columns, or `NULL` in the documented subset—no nested `CASE` or arithmetic in `THEN` yet. |
+| **Joins / OLAP** | Join subset is **experimental**; OLAP rolled-up cells are **empty strings**, not SQL `NULL`. |
+| **Optimizer** | Levels **`-O0` … `-O4`** run bytecode passes (peephole, constant fold, DCE, and extra rounds at **`-O4` Maximum**). Invalid control flow **reverts** the pre-pass bytecode. The stack VM does **not** use classical register allocation. |
+| **Security** | Unauthenticated sessions skip ACL checks (legacy scripts). Default **`Admin0`** credentials are **development-only**. |
+
+---
+
+## How a query runs
+
+1. **Tokenizer → parser → AST** (`sources/SQL/Parser.cxx`, `AST` in `SQL.hxx`).
+2. **Codegen → bytecode** (`BuildBytecode` in `Codegen.cxx`).
+3. **Optimizer pipeline** (`RunOptimizerPipeline` in `Optimizer.cxx`), selected by **`-O0` (none)** through **`-O4` (maximum)** on the CLI.
+4. **BytecodeInterpreter** executes opcodes against **`Database`** (tables, WAL, indexes, optional hybrid columnar paths).
+
+**Bytecode tooling (v1.0 `.abc`).** Compile with **`-cc`**, inspect/disassemble/validate with **`-ib` / `-db` / `-vb`**, debug with **`-dbg` / `-tb` / `-bp`**. Stored procedures compile to **`astraldb_procs_cache/<name>.abc`** with catalog **`astraldb_procs.json`**—see [`Usage.md`](Usage.md) and **`examples/sql_procedure.sql`**.
+
+**Build quality.** **`ASTRALDB_WARNINGS_AS_ERRORS`** defaults to **ON**; shared **`SafeDiv()`** in **`sources/IO/MathUtil.hxx`** guards analytics kernels.
+
+---
+
+## Storage, durability, and security (intent)
+
+**Durability.** In-memory tables with a **WAL** (`W1|` lines: FEC + **XChaCha20** under **`kAtRestXChaKey`**, with legacy plaintext replay). Periodic **`SyncToFile`** encrypts the main snapshot and truncates the WAL. Spinlock-backed concurrency and bounded **`std::async`** work guard hot paths.
+
+**Sessions and RBAC.** A catalog of users (seed **`Admin0` / `admin`** on first open), optional authenticated session (**`-U` / `-P`** or env vars), table ACLs unioned with **role** grants, plus **row-** and **column-level** fine grants. DDL and privilege changes require **ALL** on the session user. Snapshots and WAL replay restore users, ACLs, foreign keys, views, and sequences—see **`examples/security_rbac.sql`**.
+
+**Threat model.** Design direction is **best-effort** encryption and auditability, not a certified product. Read the paths you depend on; prefer **`ASTRALDB_PASSWORD`** over argv passwords for automation.
+
+---
+
+## Analytics patterns (quick recipes)
+
+Patterns that map cleanly to today’s bytecode (see **`examples/sql92_analytics.sql`**):
+
+1. **Distinct per bucket:** `SELECT key, COUNT(DISTINCT visitor_id) FROM events GROUP BY key`.
+2. **Fallback scalar:** `COALESCE(priority_col, backup_col, '0')` (literals/columns only—or explicit `CASE` when you need more).
+3. **Partition ranking:** `ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score DESC) AS rn`—filter top-N via a follow-up statement or materialized scratch table today.
+4. **Ties:** `RANK()` vs `DENSE_RANK()` vs unique `ROW_NUMBER()`—pick the function that matches your reporting rules.
+
+---
+
+## Vision and performance posture
+
+The long-term goal is a **fast, small, readable** RDBMS: performance from tight structures, deliberate concurrency, and a clear split between **language front end**, **bytecode**, and **storage**—not from opaque dependencies.
+
+**SQLite** is a **directional benchmark**, not a claim of dominance. Tune with fixed scripts under **`examples/`** (bulk loads, join benches) and compare on the **same synthetic batch** with **`astraldb --time-sql`** and, when useful, `sqlite3` on the same machine.
+
+Near-term work: widen SQL coverage, harden semantics (especially `NULL` and optimizer safety), and keep operator knobs (logging, session DB paths, bytecode I/O) predictable.
+
+---
 
 ## Where to look next
 
-- **CLI and flags:** [`Usage.md`](Usage.md) (same folder as this file).
-- **C++ conventions in-tree:** [`CodingStyle.md`](CodingStyle.md).
-- **Runnable surface area:** `examples/` and the tests under `tests/`.
-- **Build:** see the root `README.md` for InsurgeNT / `insurgent build`.
+| Topic | Location |
+|-------|----------|
+| CLI flags and examples | [`Usage.md`](Usage.md) |
+| C++ conventions | [`CodingStyle.md`](CodingStyle.md) |
+| Cluster orchestration | [`Quasar.md`](Quasar.md) |
+| Runnable contract | `examples/`, `tests/` |
+| Build | Root [`README.md`](../README.md) (InsurgeNT / CMake / CI) |

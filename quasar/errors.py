@@ -21,3 +21,11 @@ class QuasarOverloadError(QuasarError):
 
 class QuasarCircuitOpenError(QuasarError):
     """Circuit breaker rejected request for a shard."""
+
+
+class QuasarRestoreError(QuasarError):
+    """Unsafe restore (database may be in use)."""
+
+
+class QuasarLockError(QuasarError):
+    """Advisory database lock could not be acquired."""

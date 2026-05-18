@@ -212,6 +212,10 @@ def clamp_pool_config(raw: Dict[str, Any]) -> Dict[str, Any]:
     out["batch_window_ms"] = max(0.5, min(float(out.get("batch_window_ms", 3.0)), 1000.0))
     out["max_inflight_batches"] = max(1, min(int(out.get("max_inflight_batches", 24)), 256))
     out["max_queue"] = max(100, min(int(out.get("max_queue", 10_000)), 500_000))
+    if "per_db_max_inflight" in out:
+        out["per_db_max_inflight"] = max(1, min(int(out["per_db_max_inflight"]), 64))
+    if "keepalive_interval_sec" in out:
+        out["keepalive_interval_sec"] = max(0.0, min(float(out["keepalive_interval_sec"]), 3600.0))
     return out
 
 

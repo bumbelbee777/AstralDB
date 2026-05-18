@@ -48,13 +48,44 @@ class QuasarWatch:
         backup: bool = False,
         incremental: bool = False,
         failover: bool = False,
+        drift: bool = False,
+        probe_sql: Optional[str] = None,
+        check_replicas: bool = False,
+        recover: bool = False,
+        autoscale: bool = False,
+        autoscale_apply: bool = False,
+        rebalance_auto: bool = False,
+        rebalance_apply: bool = False,
     ) -> Dict[str, Any]:
         report = self.cluster.health()
         backup_result = None
         if backup and self.cluster.backup:
             backup_result = self.cluster.backup_all(incremental=incremental)
         failover_actions = self.cluster.failover_tick() if failover else None
-        return {"health": report, "backups": backup_result, "failover": failover_actions}
+        drift_reports = None
+        if drift:
+            drift_reports = self.cluster.check_drift(
+                probe_sql=probe_sql,
+                check_replicas=check_replicas,
+            )
+        recovery_report = self.cluster.recovery_tick() if recover else None
+        autoscale_report = None
+        if autoscale:
+            autoscale_report = self.cluster.autoscale_tick(apply=autoscale_apply if autoscale_apply else None)
+        rebalance_report = None
+        if rebalance_auto:
+            rebalance_report = self.cluster.rebalance_tick(
+                force_apply=True if rebalance_apply else None
+            )
+        return {
+            "health": report,
+            "backups": backup_result,
+            "failover": failover_actions,
+            "drift": drift_reports,
+            "recovery": recovery_report,
+            "autoscale": autoscale_report,
+            "rebalance_auto": rebalance_report,
+        }
 
     def run(
         self,
@@ -64,11 +95,31 @@ class QuasarWatch:
         backup: bool = False,
         incremental: bool = False,
         failover: bool = False,
+        drift: bool = False,
+        probe_sql: Optional[str] = None,
+        check_replicas: bool = False,
+        recover: bool = False,
+        autoscale: bool = False,
+        autoscale_apply: bool = False,
+        rebalance_auto: bool = False,
+        rebalance_apply: bool = False,
         on_tick: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         count = 0
         while iterations is None or count < iterations:
-            snapshot = self.tick(backup=backup, incremental=incremental, failover=failover)
+            snapshot = self.tick(
+                backup=backup,
+                incremental=incremental,
+                failover=failover,
+                drift=drift,
+                probe_sql=probe_sql,
+                check_replicas=check_replicas,
+                recover=recover,
+                autoscale=autoscale,
+                autoscale_apply=autoscale_apply,
+                rebalance_auto=rebalance_auto,
+                rebalance_apply=rebalance_apply,
+            )
             if on_tick:
                 on_tick(snapshot)
             count += 1
