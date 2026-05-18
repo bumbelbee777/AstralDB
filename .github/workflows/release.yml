@@ -1,4 +1,4 @@
-# Tagged releases (v*): build Release CLI binaries and attach them to the GitHub Release.
+# Tagged releases (v*): build Release CLI binaries, Quasar wheel, and attach to GitHub Release.
 name: Release
 
 on:
@@ -29,6 +29,18 @@ jobs:
               -DCMAKE_BUILD_TYPE=Release
             build: cmake --build build-ci --target astraldb
             binary: build-ci/astraldb
+            staged: dist/astraldb
+
+          - name: macos-arm64
+            os: macos-14
+            artifact: astraldb-macos-arm64
+            configure: >-
+              cmake -S . -B build-ci
+              -G Ninja
+              -DCMAKE_BUILD_TYPE=Release
+            build: cmake --build build-ci --target astraldb
+            binary: build-ci/astraldb
+            staged: dist/astraldb
 
           - name: windows-amd64
             os: windows-latest
@@ -40,6 +52,7 @@ jobs:
               -DCMAKE_CXX_COMPILER=clang++
             build: cmake --build build-ci --target astraldb
             binary: build-ci/astraldb.exe
+            staged: dist/astraldb.exe
 
     steps:
       - name: Checkout
@@ -51,6 +64,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build g++
 
+      - name: Install toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja
+
       - name: Install toolchain (Windows)
         if: runner.os == 'Windows'
         run: choco install llvm ninja -y --no-progress
@@ -61,19 +78,19 @@ jobs:
       - name: Build CLI
         run: ${{ matrix.build }}
 
-      - name: Stage artifact (Linux)
-        if: runner.os == 'Linux'
+      - name: Stage artifact (Unix)
+        if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          cp "${{ matrix.binary }}" dist/astraldb
-          chmod +x dist/astraldb
+          cp "${{ matrix.binary }}" "${{ matrix.staged }}"
+          chmod +x "${{ matrix.staged }}"
 
       - name: Stage artifact (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "${{ matrix.binary }}" dist/astraldb.exe
+          Copy-Item "${{ matrix.binary }}" "${{ matrix.staged }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -81,9 +98,35 @@ jobs:
           name: ${{ matrix.artifact }}
           path: dist/*
 
+  quasar-wheel:
+    name: quasar-wheel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel --outdir dist
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: quasar-wheel
+          path: dist/*.whl
+          if-no-files-found: error
+
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, quasar-wheel]
     runs-on: ubuntu-latest
 
     steps:
@@ -93,8 +136,35 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: List release assets
+        run: find artifacts -type f | sort
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/**
           generate_release_notes: true
+          body: |
+            ## AstralDB v1.0
+
+            ### `astraldb` CLI (single static executable, no runtime deps)
+
+            | Platform | Asset |
+            |----------|-------|
+            | Linux x86_64 | `astraldb-linux-amd64/astraldb` |
+            | macOS Apple Silicon (arm64) | `astraldb-macos-arm64/astraldb` |
+            | Windows x86_64 | `astraldb-windows-amd64/astraldb.exe` |
+
+            Download the binary for your OS, mark it executable on Unix (`chmod +x astraldb`), and run `./astraldb -v`.
+
+            ### Quasar orchestration (Python)
+
+            Install from the attached wheel (version matches this tag):
+
+            ```bash
+            pip install quasar-1.0.0-py3-none-any.whl
+            export QUASAR_ASTRALDB=/path/to/astraldb
+            python -m quasar --help
+            ```
+
+            See [docs/Quasar.md](https://github.com/${{ github.repository }}/blob/main/docs/Quasar.md) for cluster setup.

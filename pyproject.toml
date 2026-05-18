@@ -12,7 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "AstralDB contributors" }]
 keywords = ["astraldb", "database", "orchestration", "sharding"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Stable",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",

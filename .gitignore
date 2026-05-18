@@ -10,9 +10,12 @@ build/
 build-cmake/
 .pytest_cache/
 __pycache__/
+.quasar/
 app/
 *.pyc
 build-ci/
+dist/
+quasar.egg-info/
 .vscode/
 .build/
 buildtmp/

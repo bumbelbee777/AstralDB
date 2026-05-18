@@ -125,6 +125,8 @@ See [`examples/sql_dataset.sql`](examples/sql_dataset.sql) and [`examples/sql_da
 
 ## Build
 
+AstralDB uses the [InsurgeNT build system](https://github.com/bumbelbee777/insurgent) for building:
+
 ```bash
 pip install insurgent && cd AstralDB && insurgent build
 ```
@@ -139,4 +141,19 @@ ctest --test-dir build-ci --output-on-failure
 
 On Linux/macOS you can also run `bash scripts/ci/build_and_test.sh`.
 
-**CI** (every push/PR to `main`): GCC and Clang on Ubuntu 24.04, Clang on Windows — full `run_tests` plus a `torture_test.sql` CLI smoke check. **Releases**: pushing a `v*` tag builds `astraldb` / `astraldb.exe` artifacts via [`.github/workflows/release.yml`](.github/workflows/release.yml).
+**CI** (every push/PR to `main`): GCC and Clang on Ubuntu 24.04, Clang on macOS 14 (arm64) and Windows — full `run_tests` plus a `torture_test.sql` CLI smoke check and Quasar pytest suite.
+
+**Releases** ([`v1.0`](https://github.com/bumbelbee777/AstralDB/releases/tag/v1.0) and later): push a `v*` tag to build platform binaries and a Quasar wheel via [`.github/workflows/release.yml`](.github/workflows/release.yml):
+
+| Asset | Platform |
+|-------|----------|
+| `astraldb-linux-amd64/astraldb` | Linux x86_64 |
+| `astraldb-macos-arm64/astraldb` | macOS Apple Silicon (arm64) |
+| `astraldb-windows-amd64/astraldb.exe` | Windows x86_64 |
+| `quasar-1.0.0-py3-none-any.whl` | Quasar (Python ≥3.10, all platforms) |
+
+```bash
+# After downloading from GitHub Releases:
+pip install quasar-1.0.0-py3-none-any.whl
+export QUASAR_ASTRALDB=/path/to/astraldb
+```
