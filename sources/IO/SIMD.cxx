@@ -6,6 +6,8 @@ namespace AstralDB {
 namespace Simd {
 namespace {
 
+#if !defined(__AVX2__) && !defined(__ARM_NEON) && !defined(__aarch64__)
+
 void DotScalar(const float *A, const float *B, size_t Count, float &Acc) {
 	for(size_t I = 0; I < Count; ++I)
 		Acc += A[I] * B[I];
@@ -45,6 +47,8 @@ void ComplexMulAccumulateScalar(const float *ARe, const float *AIm, const float 
 		OutIm[I] += Im;
 	}
 }
+
+#endif // scalar-only fallbacks
 
 } // namespace
 
