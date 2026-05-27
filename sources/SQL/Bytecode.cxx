@@ -1879,6 +1879,23 @@ void BytecodeInterpreter::ReloadPrimaryDatabaseFromDisk() {
 	Databases_.push_back(std::make_unique<Database>(P, L));
 }
 
+void BytecodeInterpreter::RestorePrimaryDatabaseFromSnapshotFile(
+    const std::filesystem::path &SnapshotPath) {
+	std::filesystem::path DbPath = DatabasePath_;
+	Logger *L = Logger_;
+	if(!Databases_.empty()) {
+		DbPath = Databases_[0]->DbPath_;
+		L = Databases_[0]->GetLogger();
+		Databases_[0]->QuiesceBackgroundIOForFilesystemRollback();
+		Databases_[0]->ClearDirtyForFilesystemRollback();
+		Databases_[0]->SetSkipExitSyncOnDestroy(true);
+		Databases_.clear();
+	}
+	VmCopyWholeFileOverwrite(SnapshotPath, DbPath);
+	RemoveWalAdjacent(DbPath);
+	Databases_.push_back(std::make_unique<Database>(DbPath, L));
+}
+
 void BytecodeInterpreter::Execute(const Bytecode &Code) {
 	Execute(Code, nullptr);
 }
@@ -1903,13 +1920,8 @@ void BytecodeInterpreter::VmRollbackToSavepoint(const std::string &Name) {
 		Databases_.push_back(std::make_unique<Database>(DatabasePath_, Logger_));
 	if(const auto It = Savepoints_.find(Name); It != Savepoints_.end()) {
 		const std::filesystem::path SnapshotPath = It->second;
-		if(std::filesystem::exists(SnapshotPath)) {
-			Databases_[0]->QuiesceBackgroundIOForFilesystemRollback();
-			Databases_[0]->ClearDirtyForFilesystemRollback();
-			VmCopyWholeFileOverwrite(SnapshotPath, Databases_[0]->DbPath_);
-			RemoveWalAdjacent(Databases_[0]->DbPath_);
-			ReloadPrimaryDatabaseFromDisk();
-		}
+		if(std::filesystem::exists(SnapshotPath))
+			RestorePrimaryDatabaseFromSnapshotFile(SnapshotPath);
 	}
 }
 
@@ -4326,16 +4338,12 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 if (Databases_.empty()) {
                     Databases_.push_back(std::make_unique<Database>(DatabasePath_));
 				}
-                if (std::filesystem::exists(snapshotPath)) {
+                if(std::filesystem::exists(snapshotPath)) {
 					try {
-						Databases_[0]->QuiesceBackgroundIOForFilesystemRollback();
-						Databases_[0]->ClearDirtyForFilesystemRollback();
-						VmCopyWholeFileOverwrite(snapshotPath, Databases_[0]->DbPath_);
+						RestorePrimaryDatabaseFromSnapshotFile(snapshotPath);
 					} catch(const std::exception &Err) {
 						FailVm(std::string("ROLLBACK copy failed: ") + Err.what());
 					}
-					RemoveWalAdjacent(Databases_[0]->DbPath_);
-					ReloadPrimaryDatabaseFromDisk();
                 }
                 if(Logger_) Logger_->Info("Transaction rolled back");
             }

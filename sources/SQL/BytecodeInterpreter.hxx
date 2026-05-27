@@ -148,6 +148,8 @@ public:
 
 	/** Recreate primary database connection from DbPath disk state (used after WAL/snapshot restores). */
 	void ReloadPrimaryDatabaseFromDisk();
+	/** Close the live connection, overwrite the main DB file from \a SnapshotPath, drop WAL, reopen. */
+	void RestorePrimaryDatabaseFromSnapshotFile(const std::filesystem::path &SnapshotPath);
 
 	void DumpRegs() const {
 		std::cout << "Registers:\n";
