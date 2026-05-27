@@ -324,13 +324,7 @@ inline JSON DecodeJSONStrict(std::string_view S) {
 	return Root;
 }
 
-inline std::optional<JSON> TryDecodeJSON(std::string_view S) noexcept {
-	try {
-		return DecodeJSONStrict(S);
-	} catch(...) {
-		return std::nullopt;
-	}
-}
+std::optional<JSON> TryDecodeJSON(std::string_view S) noexcept;
 
 inline std::string JsonEscape(std::string_view S) {
 	std::string O;

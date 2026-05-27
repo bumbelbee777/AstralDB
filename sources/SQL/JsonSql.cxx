@@ -39,31 +39,12 @@ std::vector<std::string> SplitPath(std::string_view Path) {
 	return Parts;
 }
 
-#if defined(__GNUC__) && !defined(__clang__)
-__attribute__((noinline))
-#endif
-static std::optional<DS::JSON> ParseCellJsonNoexcept(std::string_view Cell) {
-	try {
-		return DS::DecodeJSONStrict(Cell);
-	} catch(...) {
-		return std::nullopt;
-	}
-}
-
 } // namespace
 
 std::optional<DS::JSON> ParseCellJson(std::string_view Cell) {
 	if(Cell.empty())
 		return std::nullopt;
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wfree-nonheap-object"
-#endif
-	const std::optional<DS::JSON> Out = ParseCellJsonNoexcept(Cell);
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
-	return Out;
+	return DS::TryDecodeJSON(Cell);
 }
 
 std::optional<DS::JSON> ExtractPath(const DS::JSON &Root, std::string_view Path) {

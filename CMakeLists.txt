@@ -35,6 +35,7 @@ add_library(astraldb_core STATIC
     sources/DS/glTF.cxx
     sources/DS/Geometry2D.cxx
     sources/DS/Regex.cxx
+    sources/DS/JSONCodec.cxx
     sources/IO/SIMD.cxx
     sources/IO/MemoryGuard.cxx
     sources/SQL/AST.cxx

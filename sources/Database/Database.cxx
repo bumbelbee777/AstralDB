@@ -320,17 +320,20 @@ Database::Database(const std::filesystem::path &DbPath, Logger* Logger)
 	, StopFlushWorker_(false)
 	, DbPath_(DbPath) {
 	/** Replay / first SyncToFile must finish before the flush worker can call SyncToFileUnlocked. */
+	const bool WalHadPayload =
+	    Wal_.Exists() && std::filesystem::file_size(Wal_.Path()) > 0;
+	bool LoadedSnapshot = false;
 	if(std::filesystem::exists(DbPath_)) {
 		std::filesystem::path SnapshotPath = DbPath_;
-		if(!LoadSnapshotFromDiskPathSynchronously(std::move(SnapshotPath)) && Logger_)
+		LoadedSnapshot = LoadSnapshotFromDiskPathSynchronously(std::move(SnapshotPath));
+		if(!LoadedSnapshot && Logger_)
 			Logger_->Warn("Could not load existing database snapshot; attempting WAL replay only");
-	} else {
-		const bool WalHadPayload =
-		    Wal_.Exists() && std::filesystem::file_size(Wal_.Path()) > 0;
+	}
+	if(WalHadPayload) {
 		WalSuspended_.store(true, std::memory_order_release);
 		Wal_.Replay(*this);
 		WalSuspended_.store(false, std::memory_order_release);
-		if(WalHadPayload)
+		if(!LoadedSnapshot)
 			SyncToFile();
 	}
 	if(Users_.empty())
