@@ -1,6 +1,7 @@
 #include <Database/WriteAheadLog.hxx>
 #include <Database/HybridStorageScheduler.hxx>
 #include <Database/Database.hxx>
+#include <Database/EmbeddingStorage.hxx>
 #include <IO/Error.hxx>
 #include <DS/ErrorCorrection.hxx>
 #include <DS/XChaCha20.hxx>
@@ -309,6 +310,26 @@ void WriteAheadLog::Replay(Database &Db) {
 				FailWal("Corrupt WAL line: CREATE PROCEDURE (PR) record incomplete - delete or repair " +
 				        WalPath_.string());
 			Db.ReplayWalDefineProcedure(Tok[1], WalDecodeSqlBody(Tok[2]));
+		} else if(Tok[0] == "TR") {
+			if(Tok.size() < 3)
+				FailWal("Corrupt WAL line: CREATE TRIGGER (TR) record incomplete - delete or repair " +
+				        WalPath_.string());
+			Db.ReplayWalDefineTrigger(Tok[1], WalDecodeSqlBody(Tok[2]));
+		} else if(Tok[0] == "TD") {
+			if(Tok.size() < 2)
+				FailWal("Corrupt WAL line: DROP TRIGGER (TD) record incomplete - delete or repair " +
+				        WalPath_.string());
+			Db.ReplayWalDropTrigger(Tok[1]);
+		} else if(Tok[0] == "TE") {
+			if(Tok.size() < 2)
+				FailWal("Corrupt WAL line: ENABLE TRIGGER (TE) record incomplete - delete or repair " +
+				        WalPath_.string());
+			Db.ReplayWalSetTriggerEnabled(Tok[1], true);
+		} else if(Tok[0] == "TX") {
+			if(Tok.size() < 2)
+				FailWal("Corrupt WAL line: DISABLE TRIGGER (TX) record incomplete - delete or repair " +
+				        WalPath_.string());
+			Db.ReplayWalSetTriggerEnabled(Tok[1], false);
 		} else if(Tok[0] == "PD") {
 			if(Tok.size() < 2)
 				FailWal("Corrupt WAL line: DROP PROCEDURE (PD) record incomplete - delete or repair " +
@@ -437,6 +458,13 @@ void WriteAheadLog::Replay(Database &Db) {
 			Req.BaseGraphName = Tok[2];
 			Req.EdgeLabelFilter = Tok[3];
 			Db.ReplayWalGraphProjection(Req);
+		} else if(Tok[0] == "ER") {
+			Db.ReplayWalEmbeddingRegister(ParseEmbeddingWalRegisterTokens(Tok));
+		} else if(Tok[0] == "ED") {
+			if(Tok.size() < 2)
+				FailWal("Corrupt WAL line: EMBEDDING DROP (ED) record incomplete - delete or repair " +
+				        WalPath_.string());
+			Db.ReplayWalEmbeddingDrop(Tok[1]);
 		}
 	}
 }

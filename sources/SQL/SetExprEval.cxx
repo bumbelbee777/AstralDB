@@ -99,6 +99,11 @@ std::optional<std::string> EvalNode(std::string_view &In, const RowEvalContext &
 			return std::to_string(static_cast<long long>(std::llround(A * B)));
 		if(Op == "/" && Na && Nb && B != 0)
 			return std::to_string(static_cast<long long>(std::llround(A / B)));
+		if(Op == "//" && Na && Nb && B != 0) {
+			const long long Ai = static_cast<long long>(std::llround(A));
+			const long long Bi = static_cast<long long>(std::llround(B));
+			return std::to_string(Ai / Bi);
+		}
 		return std::nullopt;
 	}
 	return std::nullopt;
@@ -136,8 +141,8 @@ void SerializeNode(const ExpressionAST *Expr, std::ostringstream &Out) {
 		return;
 	}
 	if(const auto *B = dynamic_cast<const BinaryOpAST *>(Expr)) {
-		if(B->Op != "+" && B->Op != "-" && B->Op != "*" && B->Op != "/")
-			FailSetExpr("SET expression supports only + - * /");
+		if(B->Op != "+" && B->Op != "-" && B->Op != "*" && B->Op != "/" && B->Op != "//")
+			FailSetExpr("SET expression supports only + - * / //");
 		Out << 'B' << B->Op << '|';
 		SerializeNode(B->LHS.get(), Out);
 		SerializeNode(B->RHS.get(), Out);
@@ -182,6 +187,11 @@ std::optional<std::string> EvalSetValueExpr(const ExpressionAST *Expr, const Row
 				return std::to_string(static_cast<long long>(std::llround(A * Bv)));
 			if(B->Op == "/" && Bv != 0)
 				return std::to_string(static_cast<long long>(std::llround(A / Bv)));
+			if(B->Op == "//" && Bv != 0) {
+				const long long Ai = static_cast<long long>(std::llround(A));
+				const long long Bi = static_cast<long long>(std::llround(Bv));
+				return std::to_string(Ai / Bi);
+			}
 		}
 		if(B->Op == "+")
 			return *L + *R;
@@ -190,9 +200,48 @@ std::optional<std::string> EvalSetValueExpr(const ExpressionAST *Expr, const Row
 	return std::nullopt;
 }
 
+std::unique_ptr<ExpressionAST> BindLambdaParameter(const ExpressionAST *Root, std::string_view Param,
+                                                   std::string_view BindingCol) {
+	if(!Root)
+		return nullptr;
+	if(const auto *C = dynamic_cast<const ColumnRefAST *>(Root)) {
+		if(C->Name == Param)
+			return std::make_unique<ColumnRefAST>(std::string(BindingCol));
+		return std::make_unique<ColumnRefAST>(C->Name);
+	}
+	if(const auto *L = dynamic_cast<const LiteralAST *>(Root))
+		return std::make_unique<LiteralAST>(L->Value);
+	if(dynamic_cast<const NullLiteralAST *>(Root))
+		return std::make_unique<NullLiteralAST>();
+	if(const auto *B = dynamic_cast<const BinaryOpAST *>(Root)) {
+		auto L = BindLambdaParameter(B->LHS.get(), Param, BindingCol);
+		auto R = BindLambdaParameter(B->RHS.get(), Param, BindingCol);
+		return std::make_unique<BinaryOpAST>(std::move(L), B->Op, std::move(R));
+	}
+	return nullptr;
+}
+
+bool EvalExpressionTruthy(const ExpressionAST *Expr, const RowEvalContext &Ctx) {
+	const auto V = EvalSetValueExpr(Expr, Ctx);
+	if(!V || V->empty())
+		return false;
+	if(*V == "0" || *V == "false" || *V == "FALSE")
+		return false;
+	return true;
+}
+
 std::string SerializeSetValueExpr(const ExpressionAST *Expr) {
 	std::ostringstream Out;
 	SerializeNode(Expr, Out);
+	return Out.str();
+}
+
+std::string SerializeLambdaExpr(const LambdaExprAST &Lambda) {
+	std::ostringstream Out;
+	Out << 'M' << Lambda.Params.size() << '|';
+	for(const auto &P : Lambda.Params)
+		Out << P << '|';
+	Out << SerializeSetValueExpr(Lambda.Body.get());
 	return Out.str();
 }
 

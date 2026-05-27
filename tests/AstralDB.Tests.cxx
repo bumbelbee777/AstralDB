@@ -1,4 +1,4 @@
-﻿/* Database before doctest so schema types are parsed before short macro names leak in. */
+/* Database before doctest so schema types are parsed before short macro names leak in. */
 #include <Database/AdvancedTypes.hxx>
 #include <Database/Database.hxx>
 #include <Database/ColumnarStorage.hxx>
@@ -9,7 +9,12 @@
 #include <Database/MathSciAutograd.hxx>
 #include <Database/MathSciSignal.hxx>
 #include <Database/MathSciSolves.hxx>
+#include <Database/MathSciClassify.hxx>
+#include <Database/MathSciNlp.hxx>
+#include <Database/MathSciEmbeddings.hxx>
+#include <Database/MathSciComplex.hxx>
 #include <Database/GeoSpatial.hxx>
+#include <DS/Geometry2D.hxx>
 #include <IO/MemoryGuard.hxx>
 #include <Database/TimeSeriesCompression.hxx>
 #include <Database/WriteAheadLog.hxx>
@@ -17,15 +22,19 @@
 #include <IO/Logger.hxx>
 #include <IO/SIMD.hxx>
 #include <SQL/SQL.hxx>
+#include <SQL/DialectCompat.hxx>
 #include <SQL/BytecodeInterpreter.hxx>
 #include <SQL/Bytecode.hxx>
 #include <SQL/BytecodeFormat.hxx>
 #include <SQL/BytecodeInspect.hxx>
 #include <SQL/BytecodeDebug.hxx>
 #include <SQL/BytecodeProcedures.hxx>
+#include <SQL/BytecodeTriggers.hxx>
+#include <SQL/ProcedureParser.hxx>
 #include "AstralTestHelpers.hxx"
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <random>
 #include <set>
 #include <fstream>
@@ -104,13 +113,68 @@ bool TableExists(const AstralDB::Database *Db, const std::string &Name) {
 	return Db != nullptr && Db->TableSchemaSnapshot(Name).has_value();
 }
 
-/** Off-CI stress harnesses (see file headers); run via CLI with \c -O2, not the fast examples sweep. */
-bool IsOffCiStressHarness(const std::string &FileName) {
-	return FileName.starts_with("benchmark_") || FileName.starts_with("stress_") || FileName == "torture_unhinged.sql" ||
-	       FileName == "torture_advanced.sql";
+/** Perf-tier SQL harnesses (see \c ctest -L perf); excluded from the sub-1s contract sweep. */
+bool IsPerfHarness(const std::string &FileName) {
+	if(FileName.starts_with("benchmark_") || FileName.starts_with("stress_") || FileName == "nuke.sql" ||
+	   FileName == "benchmark_torture.sql" || FileName == "torture_unhinged.sql" || FileName == "torture_advanced.sql")
+		return true;
+	return FileName.starts_with("torture_");
+}
+
+bool RunAllExamplesInDefaultSuite() {
+	const char *Env = std::getenv("ASTRALDB_RUN_ALL_EXAMPLES");
+	if(Env == nullptr)
+		return false;
+	const std::string V = Env;
+	return V == "1" || V == "true" || V == "TRUE" || V == "yes" || V == "YES";
+}
+
+bool RunExamplesSweep() {
+	const char *Env = std::getenv("ASTRALDB_RUN_EXAMPLES");
+	if(Env == nullptr)
+		return false;
+	const std::string V = Env;
+	return V == "1" || V == "true" || V == "TRUE" || V == "yes" || V == "YES";
+}
+
+bool IsDefaultSlowExample(const std::string &FileName) {
+	return FileName == "sql92_03_coverage.sql" || FileName == "sql_math_sci.sql" ||
+	       FileName == "sql_window_frames.sql" || FileName == "sql_dialect_compat.sql";
 }
 
 } // namespace
+
+TEST_CASE("WriteAheadLog: embedding catalog survives sync and WAL") {
+	fs::path Dir = UniqueTempDir("astral_emb_wal_");
+	fs::path DbPath = Dir / "emb.db";
+	std::error_code Ec;
+	fs::remove(DbPath, Ec);
+	fs::remove(DbPath.string() + ".wal", Ec);
+	{
+		AstralDB::Database Db(DbPath, nullptr);
+		AstralDB::Database::Schema Sch;
+		AstralDB::Database::Column Tok;
+		Tok.Name = "tok";
+		Tok.DefaultValue = "TEXT";
+		AstralDB::Database::Column Vec;
+		Vec.Name = "vec";
+		Vec.DefaultValue = "TEXT";
+		Sch.push_back(Tok);
+		Sch.push_back(Vec);
+		Db.CreateTable("vocab", Sch).get();
+		Db.Insert("vocab", {{"tok", "a"}, {"vec", "CV[2]:1,0,0,1"}}).get();
+		Db.Insert("vocab", {{"tok", "b"}, {"vec", "CV[2]:0,1,1,0"}}).get();
+		Db.RegisterEmbedding("emb", "vocab", "tok", "vec");
+		REQUIRE(Db.EmbeddingWireCell("emb").has_value());
+		Db.SyncToFile();
+	}
+	REQUIRE(fs::exists(DbPath));
+	AstralDB::Database Db2(DbPath, nullptr);
+	REQUIRE(Db2.EmbeddingWireCell("emb").has_value());
+	REQUIRE(Db2.EmbeddingWireCell("emb")->rfind("EC[2,2]:", 0) == 0);
+	const auto Lookup = AstralDB::MathSciEmbeddings::LookupCellFromReal(*Db2.EmbeddingWireCell("emb"), "a", &Db2);
+	REQUIRE(Lookup.has_value());
+}
 
 TEST_CASE("WriteAheadLog: recover schema and row after reopen") {
 	AstralTest::PerfSection Perf("Wal reopen");
@@ -495,6 +559,77 @@ TEST_CASE("SQL: NOT EXISTS (non-correlated) keeps rows when inner is empty") {
 	REQUIRE(Rows[1].at("pk") == "2");
 }
 
+TEST_CASE("SQL: IN and NOT IN subqueries") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_in_sub_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "insub.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE pr (pk INT); CREATE TABLE cr (fk INT); "
+	    "INSERT INTO pr VALUES (1),(2),(3); INSERT INTO cr VALUES (1),(3); "
+	    "SELECT pk FROM pr WHERE pk IN (SELECT fk FROM cr) ORDER BY pk;";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	const auto Rows = AllRows(Db, "pr");
+	REQUIRE(Rows.size() == 2);
+	REQUIRE(Rows[0].at("pk") == "1");
+	REQUIRE(Rows[1].at("pk") == "3");
+}
+
+TEST_CASE("SQL: NOT IN literal list") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_notin_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "notin.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE t (n INT); INSERT INTO t VALUES (1),(2),(3); "
+	    "SELECT n FROM t WHERE n NOT IN (2, 99) ORDER BY n;";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	const auto Rows = AllRows(Db, "t");
+	REQUIRE(Rows.size() == 2);
+	REQUIRE(Rows[0].at("n") == "1");
+	REQUIRE(Rows[1].at("n") == "3");
+}
+
+TEST_CASE("SQL: SUM OVER RANGE BETWEEN frame") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_wrange_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "wrange.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE vals (x INT); INSERT INTO vals VALUES (1),(3),(5),(7),(9); "
+	    "SELECT x, SUM(x) OVER (ORDER BY x ASC RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) AS rsum "
+	    "FROM vals ORDER BY x ASC;";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	const auto Rows = AllRows(Db, "vals");
+	REQUIRE(Rows.size() == 5);
+	REQUIRE(Rows[0].at("rsum") == "1");
+	REQUIRE(Rows[1].at("rsum") == "4");
+	REQUIRE(Rows[2].at("rsum") == "8");
+	REQUIRE(Rows[3].at("rsum") == "12");
+	REQUIRE(Rows[4].at("rsum") == "16");
+}
+
 TEST_CASE("SQL: correlated EXISTS / NOT EXISTS (column = column in inner WHERE)") {
 	AstralDB::SQL::SetParserDiagnostics(false);
 	fs::path Dir = UniqueTempDir("astral_ex_corr_");
@@ -662,6 +797,233 @@ TEST_CASE("SQL: COALESCE uses first non-null scalar") {
 	const auto Rows = AllRows(Db, "c");
 	REQUIRE(Rows.size() == 1);
 	REQUIRE(Rows[0].at("v") == "7");
+}
+
+TEST_CASE("SQL: :: cast NVL2 nested ROWNUM CONNECT BY") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_dialect2_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "dialect2.log").string(), false);
+	const char *Setup =
+	    "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, nick TEXT); "
+	    "INSERT INTO t VALUES (1,'Ada','ada'),(2,'Grace',''); "
+	    "SELECT name::TEXT AS nt, NVL2(nick, UPPER(nick), 'x') AS nu FROM t ORDER BY id;";
+	AstralDB::SQL::Parser P0(Setup);
+	AstralDB::SQL::Bytecode Code0 =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code0));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	{
+		const auto Rows = AllRows(Db, "t");
+		REQUIRE(Rows.size() == 2);
+		REQUIRE(Rows[0].at("nt") == "Ada");
+		REQUIRE(Rows[0].at("nu") == "ADA");
+		REQUIRE(Rows[1].at("nu") == "x");
+	}
+	const char *Rownum =
+	    "SELECT name FROM t WHERE ROWNUM <= 1;";
+	AstralDB::SQL::Parser P1(Rownum);
+	AstralDB::SQL::Bytecode Code1 =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	REQUIRE_NOTHROW(I.Execute(Code1));
+	{
+		const auto Rows = AllRows(Db, "t");
+		REQUIRE(Rows.size() == 1);
+	}
+	const char *Hierarchy =
+	    "CREATE TABLE org (id INT, name TEXT, mgr INT); "
+	    "INSERT INTO org VALUES (1,'ceo',NULL),(2,'eng',1),(3,'sales',1); "
+	    "SELECT name FROM org START WITH mgr IS NULL CONNECT BY PRIOR id = mgr ORDER BY name;";
+	AstralDB::SQL::Parser P2(Hierarchy);
+	AstralDB::SQL::Bytecode Code2 =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	REQUIRE_NOTHROW(I.Execute(Code2));
+	{
+		const auto Rows = AllRows(Db, "org");
+		REQUIRE(Rows.size() == 3);
+		REQUIRE(Rows[0].at("name") == "ceo");
+	}
+}
+
+TEST_CASE("SQL: DuckDB lambda COLUMNS intdiv REPLACE") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_duck_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "duck.log").string(), false);
+	const char *Setup =
+	    "CREATE TABLE n (id INT PRIMARY KEY, a INT, b INT); "
+	    "INSERT INTO n VALUES (1,10,3),(2,7,2); "
+	    "SELECT id, a // b AS q FROM n ORDER BY id;";
+	AstralDB::SQL::Parser P0(Setup);
+	AstralDB::SQL::Bytecode Code0 =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code0));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	{
+		const auto Rows = AllRows(Db, "n");
+		REQUIRE(Rows.size() == 2);
+		REQUIRE(Rows[0].at("q") == "3");
+		REQUIRE(Rows[1].at("q") == "3");
+	}
+	const char *Cols =
+	    "CREATE TABLE w (id INT, x INT, y INT); INSERT INTO w VALUES (1,1,2); SELECT COLUMNS(*) FROM w;";
+	AstralDB::SQL::Parser P1(Cols);
+	AstralDB::SQL::Bytecode Code1 =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	REQUIRE_NOTHROW(I.Execute(Code1));
+	{
+		const auto Rows = AllRows(Db, "w");
+		REQUIRE(Rows.size() == 1);
+		REQUIRE(Rows[0].find("id") != Rows[0].end());
+		REQUIRE(Rows[0].find("x") != Rows[0].end());
+		REQUIRE(Rows[0].find("y") != Rows[0].end());
+	}
+	const char *Replace =
+	    "CREATE TABLE u (id INT PRIMARY KEY, name TEXT); "
+	    "INSERT INTO u VALUES (1,'Ada'); "
+	    "REPLACE INTO u VALUES (1,'Grace'); "
+	    "SELECT name FROM u;";
+	AstralDB::SQL::Parser P2(Replace);
+	AstralDB::SQL::Bytecode Code2 =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	REQUIRE_NOTHROW(I.Execute(Code2));
+	{
+		const auto Rows = AllRows(Db, "u");
+		REQUIRE(Rows.size() == 1);
+		REQUIRE(Rows[0].at("name") == "Grace");
+	}
+}
+
+TEST_CASE("SQL: Postgres RETURNING + SQLite INTEGER PRIMARY KEY") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_ret_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "ret.log").string(), false);
+
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+
+	const char *Create =
+	    "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);";
+	AstralDB::SQL::Parser P0(Create);
+	AstralDB::SQL::Bytecode C0 =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	REQUIRE_NOTHROW(I.Execute(C0));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+
+	const char *Insert =
+	    "INSERT INTO t(name) VALUES ('Ada') RETURNING id, name;";
+	AstralDB::SQL::Parser P1(Insert);
+	AstralDB::SQL::Bytecode Code1 =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	REQUIRE_NOTHROW(I.Execute(Code1));
+	{
+		const auto Rows = AllRows(Db, "__astral_returning");
+		REQUIRE(Rows.size() == 1);
+		REQUIRE(Rows[0].at("id") == "1");
+		REQUIRE(Rows[0].at("name") == "Ada");
+	}
+
+	const char *Update =
+	    "UPDATE t SET name = 'Grace' WHERE id = 1 RETURNING id, name;";
+	AstralDB::SQL::Parser P2(Update);
+	AstralDB::SQL::Bytecode Code2 =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	REQUIRE_NOTHROW(I.Execute(Code2));
+	{
+		const auto Rows = AllRows(Db, "__astral_returning");
+		REQUIRE(Rows.size() == 1);
+		REQUIRE(Rows[0].at("id") == "1");
+		REQUIRE(Rows[0].at("name") == "Grace");
+	}
+
+	const char *Delete =
+	    "DELETE FROM t WHERE id = 1 RETURNING *;";
+	AstralDB::SQL::Parser P3(Delete);
+	AstralDB::SQL::Bytecode Code3 =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	REQUIRE_NOTHROW(I.Execute(Code3));
+	{
+		const auto Rows = AllRows(Db, "__astral_returning");
+		REQUIRE(Rows.size() == 1);
+		REQUIRE(Rows[0].at("id") == "1");
+		REQUIRE(Rows[0].at("name") == "Grace");
+	}
+}
+
+TEST_CASE("SQL: SQLite PostgreSQL Oracle dialect compat") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_dialect_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "dialect.log").string(), false);
+	const char *Setup =
+	    "CREATE TABLE t (id SERIAL PRIMARY KEY, name TEXT, nick TEXT); "
+	    "INSERT INTO t (name, nick) VALUES ('Ada','ada'),('Grace',''); "
+	    "SELECT IFNULL(nick, name) AS disp FROM t ORDER BY id;";
+	AstralDB::SQL::Parser P0(Setup);
+	AstralDB::SQL::Bytecode Code0 =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code0));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	{
+		const auto Rows = AllRows(Db, "t");
+		REQUIRE(Rows.size() == 2);
+		REQUIRE(Rows[0].at("disp") == "ada");
+		REQUIRE(Rows[1].at("disp") == "Grace");
+	}
+	const char *Pred =
+	    "SELECT name FROM t WHERE name ILIKE 'ad%' ORDER BY name;";
+	AstralDB::SQL::Parser P1(Pred);
+	AstralDB::SQL::Bytecode Code1 =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	REQUIRE_NOTHROW(I.Execute(Code1));
+	{
+		const auto Rows = AllRows(Db, "t");
+		REQUIRE(Rows.size() == 1);
+		REQUIRE(Rows[0].at("name") == "Ada");
+	}
+	const char *Dual = "SELECT 'ok' AS flag FROM DUAL;";
+	AstralDB::SQL::Parser P2(Dual);
+	AstralDB::SQL::Bytecode Code2 =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	REQUIRE_NOTHROW(I.Execute(Code2));
+	{
+		const auto Rows = AllRows(Db, "DUAL");
+		REQUIRE(Rows.size() == 1);
+		REQUIRE(Rows[0].at("flag") == "ok");
+	}
+	const char *ResetT =
+	    "DELETE FROM t; INSERT INTO t (name, nick) VALUES ('Ada','ada'),('Grace','');";
+	AstralDB::SQL::Parser Pr(ResetT);
+	AstralDB::SQL::Bytecode CodeR =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	REQUIRE_NOTHROW(I.Execute(CodeR));
+	auto RunNamePred = [&](const char *Sql, const std::string &Expected) {
+		AstralDB::SQL::Parser Px(Sql);
+		AstralDB::SQL::Bytecode Cx =
+		    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+		REQUIRE_NOTHROW(I.Execute(Cx));
+		const auto Rows = AllRows(Db, "t");
+		REQUIRE(Rows.size() == 1);
+		REQUIRE(Rows[0].at("name") == Expected);
+	};
+	RunNamePred("SELECT name FROM t WHERE name REGEXP '^A' ORDER BY name;", "Ada");
+	AstralDB::SQL::Parser Pr2(ResetT);
+	REQUIRE_NOTHROW(I.Execute(AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None)));
+	RunNamePred("SELECT name FROM t WHERE name ~ 'race' ORDER BY name;", "Grace");
+	AstralDB::SQL::Parser Pr3(ResetT);
+	REQUIRE_NOTHROW(I.Execute(AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None)));
+	RunNamePred("SELECT name FROM t WHERE REGEXP_MATCH(name, '^G') ORDER BY name;", "Grace");
 }
 
 TEST_CASE("SQL: SQL-92 through SQL:2003 standard edge cases") {
@@ -2034,6 +2396,37 @@ TEST_CASE("SQL: EXTRACT and DATE_ADD on ISO date text") {
 	REQUIRE(!Rows[0].at("d2").empty());
 }
 
+TEST_CASE("SQL: CREATE USER DROP USER and ALTER USER password") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_sqluser_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "sqluser.log").string(), false);
+	const char *Q =
+	    "CREATE USER app1 IDENTIFIED BY 'pw1'; "
+	    "CREATE USER IF NOT EXISTS app1 IDENTIFIED BY 'ignored'; "
+	    "ALTER USER app1 IDENTIFIED BY 'pw2'; "
+	    "CREATE TABLE u_t (id INT); "
+	    "GRANT SELECT ON u_t TO app1;";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	REQUIRE(Db->AuthenticateUser("app1", "pw2"));
+	REQUIRE_FALSE(Db->AuthenticateUser("app1", "pw1"));
+	Db->Logout();
+	REQUIRE(Db->AuthenticateUser("Admin0", "admin"));
+	const char *DropQ = "DROP USER app1;";
+	AstralDB::SQL::Parser P2(DropQ);
+	AstralDB::SQL::Bytecode Code2 =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	REQUIRE_NOTHROW(I.Execute(Code2));
+	REQUIRE_FALSE(Db->AuthenticateUser("app1", "pw2"));
+}
+
 TEST_CASE("SQL: GRANT WITH GRANT OPTION executes") {
 	AstralDB::SQL::SetParserDiagnostics(false);
 	fs::path Dir = UniqueTempDir("astral_grant_opt_");
@@ -2271,6 +2664,133 @@ TEST_CASE("SQL: CREATE PROCEDURE caches .abc and CALL runs") {
 	REQUIRE(AstralDB::SQL::FindProcedure(Cat, "p1").has_value());
 }
 
+TEST_CASE("ProcedureParser: PL/pgSQL dollar body is identified and lowered") {
+	const char *Src =
+	    "CREATE OR REPLACE PROCEDURE pgsql_demo() LANGUAGE plpgsql AS $$ "
+	    "BEGIN CREATE TABLE pg_demo (n INTEGER); INSERT INTO pg_demo VALUES (1); END; $$";
+	REQUIRE(AstralDB::SQL::ProcedureParser::IsDialectProcedureStatement(Src));
+	const auto R = AstralDB::SQL::ProcedureParser(Src).ParseDialectCreate();
+	REQUIRE(R.DialectTag == "plpgsql");
+	REQUIRE(R.ProcedureName == "pgsql_demo");
+	REQUIRE(R.LoweredBodySql.find("CREATE TABLE pg_demo") != std::string::npos);
+	REQUIRE(R.LoweredBodySql.find("INSERT INTO pg_demo") != std::string::npos);
+}
+
+TEST_CASE("ProcedureParser: PL/SQL IS BEGIN form is identified and lowered") {
+	const char *Src = "CREATE OR REPLACE PROCEDURE ora_demo IS BEGIN "
+	                  "CREATE TABLE ora_demo (n INTEGER); INSERT INTO ora_demo VALUES (2); END ora_demo;";
+	REQUIRE(AstralDB::SQL::ProcedureParser::IsDialectProcedureStatement(Src));
+	const auto R = AstralDB::SQL::ProcedureParser(Src).ParseDialectCreate();
+	REQUIRE(R.DialectTag == "plsql");
+	REQUIRE(R.ProcedureName == "ora_demo");
+	REQUIRE(R.OrReplace);
+	REQUIRE(R.LoweredBodySql.find("INSERT INTO ora_demo") != std::string::npos);
+}
+
+TEST_CASE("SQL: EXEC and EXECUTE PROCEDURE alias CALL") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	AstralDB::SQL::Parser P1("EXEC myproc;");
+	AstralDB::SQL::Parser P2("EXECUTE PROCEDURE myproc;");
+	(void)P1;
+	(void)P2;
+	const auto Calls = AstralDB::SQL::ScanProcedureCallsInSql("EXEC a; EXECUTE b; EXECUTE PROCEDURE c; CALL d;");
+	auto Has = [&](const char *N) {
+		return std::find(Calls.begin(), Calls.end(), N) != Calls.end();
+	};
+	REQUIRE(Has("a"));
+	REQUIRE(Has("b"));
+	REQUIRE(Has("c"));
+	REQUIRE(Has("d"));
+}
+
+TEST_CASE("ProcedureParser: EXCEPTION WHEN OTHERS lowers handlers") {
+	const char *Src = "CREATE OR REPLACE PROCEDURE ex_demo IS BEGIN "
+	                  "INSERT INTO t VALUES (1); "
+	                  "EXCEPTION WHEN OTHERS THEN INSERT INTO err VALUES (1); END;";
+	const auto R = AstralDB::SQL::ProcedureParser(Src).ParseDialectCreate();
+	REQUIRE(R.Body_.ExceptionHandlers.size() == 1);
+	REQUIRE(R.Body_.ExceptionHandlers[0].Condition == "OTHERS");
+}
+
+TEST_CASE("SQL: PL/pgSQL CREATE PROCEDURE lowers, caches .abc, and CALL runs") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_proc_plpgsql_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "plpgsql.log").string(), false);
+	const std::string Sql =
+	    "CREATE OR REPLACE PROCEDURE p2() LANGUAGE plpgsql AS $$ "
+	    "BEGIN CREATE TABLE pt2 (x INTEGER); INSERT INTO pt2 VALUES (8); END; $$; "
+	    "CALL p2;";
+	AstralDB::SQL::Parser P(Sql);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter Interp(&Log);
+	Interp.DatabasePath(Dir / "astral.db");
+	REQUIRE_NOTHROW(Interp.Execute(Code));
+	const auto Cat = AstralDB::SQL::LoadProcedureCatalog(AstralDB::SQL::DefaultProcedureCatalogPath(Dir / "astral.db"));
+	const auto Entry = AstralDB::SQL::FindProcedure(Cat, "p2");
+	REQUIRE(Entry.has_value());
+	REQUIRE(Entry->SourceDialect == "plpgsql");
+}
+
+TEST_CASE("Triggers: storage-backed create, fire, disable, drop") {
+	AstralTest::PerfSection Perf("triggers");
+	fs::path Dir = UniqueTempDir("astral_trig_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "trig.log").string(), false);
+	const std::string Sql =
+	    "CREATE TABLE src (id INTEGER); "
+	    "CREATE TABLE trig_log (id INTEGER); "
+	    "CREATE TRIGGER bump_after_insert AFTER INSERT ON src FOR EACH ROW "
+	    "AS (INSERT INTO trig_log VALUES (1)); "
+	    "INSERT INTO src VALUES (1); "
+	    "INSERT INTO src VALUES (2);";
+	AstralDB::SQL::BytecodeInterpreter Interp(&Log);
+	Interp.DatabasePath(Dir / "astral.db");
+	{
+		AstralDB::SQL::Parser P(Sql);
+		AstralDB::SQL::Bytecode Code =
+		    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+		REQUIRE_NOTHROW(Interp.Execute(Code));
+		if(AstralDB::Database *DbSync = Interp.PrimaryDatabase())
+			DbSync->SyncToFile();
+	}
+	{
+		AstralDB::Database *Db = Interp.PrimaryDatabase();
+		REQUIRE(Db != nullptr);
+		REQUIRE(Db->TriggerFireDepth() == 0);
+		REQUIRE(Db->Tables_.at("src").RowStore.size() == 2);
+		REQUIRE(Db->Tables_.at("trig_log").RowStore.size() >= 1);
+	}
+	const auto Cat0 = AstralDB::SQL::LoadTriggerCatalog(AstralDB::SQL::DefaultTriggerCatalogPath(Dir / "astral.db"));
+	REQUIRE(AstralDB::SQL::FindTrigger(Cat0, "bump_after_insert").has_value());
+	REQUIRE(AstralDB::SQL::FindTrigger(Cat0, "bump_after_insert")->Enabled);
+	const std::string DisableSql = "ALTER TRIGGER bump_after_insert DISABLE; INSERT INTO src VALUES (3);";
+	AstralDB::SQL::Parser P2(DisableSql);
+	AstralDB::SQL::Bytecode Code2 =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	REQUIRE_NOTHROW(Interp.Execute(Code2));
+	{
+		AstralDB::Database *Db = Interp.PrimaryDatabase();
+		REQUIRE(Db->Tables_.at("trig_log").RowStore.size() >= 1);
+	}
+	const auto Cat1 = AstralDB::SQL::LoadTriggerCatalog(AstralDB::SQL::DefaultTriggerCatalogPath(Dir / "astral.db"));
+	REQUIRE(!AstralDB::SQL::FindTrigger(Cat1, "bump_after_insert")->Enabled);
+	const std::string DropSql = "DROP TRIGGER bump_after_insert; INSERT INTO src VALUES (4);";
+	AstralDB::SQL::Parser P3(DropSql);
+	AstralDB::SQL::Bytecode Code3 =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	REQUIRE_NOTHROW(Interp.Execute(Code3));
+	{
+		AstralDB::Database *Db = Interp.PrimaryDatabase();
+		REQUIRE(Db->Tables_.at("trig_log").RowStore.size() == 2);
+	}
+	const auto Cat2 = AstralDB::SQL::LoadTriggerCatalog(AstralDB::SQL::DefaultTriggerCatalogPath(Dir / "astral.db"));
+	REQUIRE(!AstralDB::SQL::FindTrigger(Cat2, "bump_after_insert").has_value());
+}
+
 TEST_CASE("Hybrid storage: CREATE USING STORAGE and ALTER SET STORAGE") {
 	AstralTest::PerfSection Perf("hybrid storage SQL");
 	fs::path Dir = UniqueTempDir("astral_hybrid_");
@@ -2377,6 +2897,15 @@ TEST_CASE("AdvancedTypes: STRUCT MAP VECTOR MATRIX COMPLEX wire format") {
 }
 
 TEST_CASE("SQL: advanced types and SIMD scalar builtins") {
+	const auto Pa = AstralDB::MathSciComplex::ParseNumericVec("V[2]:3,4");
+	const auto Pb = AstralDB::MathSciComplex::ParseNumericVec("V[2]:1,0");
+	REQUIRE(Pa.has_value());
+	REQUIRE(Pb.has_value());
+	REQUIRE_FALSE(Pa->IsComplex());
+	REQUIRE_FALSE(Pb->IsComplex());
+	const auto DotCell = AstralDB::MathSciComplex::DotCellFromReal("V[2]:3,4", "V[2]:1,0");
+	REQUIRE(DotCell.has_value());
+	REQUIRE(std::stod(*DotCell) == AstralTest::Approx(3.0).epsilon(0.001));
 	AstralDB::SQL::SetParserDiagnostics(false);
 	fs::path Dir = UniqueTempDir("astral_adv_types_");
 	ScopedCwd Cwd(Dir);
@@ -2391,12 +2920,13 @@ TEST_CASE("SQL: advanced types and SIMD scalar builtins") {
 	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
 	AstralDB::SQL::BytecodeInterpreter I(&Log);
 	REQUIRE_NOTHROW(I.Execute(Code));
-	const AstralDB::Database *Db = I.PrimaryDatabase();
+	AstralDB::Database *Db = I.PrimaryDatabase();
 	REQUIRE(Db != nullptr);
-	const auto Rows = AllRows(Db, "adv");
-	REQUIRE(Rows.size() == 1);
-	REQUIRE(std::stod(Rows[0].at("dot")) == AstralTest::Approx(3.0).epsilon(0.001));
-	REQUIRE(Rows[0].at("cm").find("C(") == 0);
+	Db->WithExclusiveBytecodeLock([&]() {
+		const auto &Row = Db->Tables_.at("adv").RowStore[0];
+		REQUIRE(std::stod(Row.at("dot")) == AstralTest::Approx(3.0).epsilon(0.001));
+		REQUIRE(Row.at("cm").find("C(") == 0);
+	});
 }
 
 TEST_CASE("MathSci: elementary and LIST builtins") {
@@ -2446,14 +2976,49 @@ TEST_CASE("MathSci: loss, similarity, MATVEC, sort, RNG") {
 	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
 	AstralDB::SQL::BytecodeInterpreter I(&Log);
 	REQUIRE_NOTHROW(I.Execute(Code));
-	const AstralDB::Database *Db = I.PrimaryDatabase();
+	AstralDB::Database *Db = I.PrimaryDatabase();
 	REQUIRE(Db != nullptr);
-	const auto Rows = AllRows(Db, "t");
-	REQUIRE(Rows.size() == 1);
-	REQUIRE(std::stod(Rows[0].at("mse")) == AstralTest::Approx(1.0).epsilon(0.001));
-	REQUIRE(std::stod(Rows[0].at("cs")) == AstralTest::Approx(0.0).epsilon(0.001));
-	REQUIRE(Rows[0].at("sorted") == "L[3]:1,2,3");
-	REQUIRE(Rows[0].at("mv").find("V[2]:") == 0);
+	Db->WithExclusiveBytecodeLock([&]() {
+		const auto &Row = Db->Tables_.at("t").RowStore[0];
+		REQUIRE(Row.contains("m"));
+		REQUIRE(Row.contains("v"));
+		const auto Mv = AstralDB::MathSciComplex::MatVecCellFromReal(Row.at("m"), Row.at("v"));
+		REQUIRE(Mv.has_value());
+		REQUIRE(Mv->find("V[2]:") == 0);
+		REQUIRE(std::stod(Row.at("mse")) == AstralTest::Approx(1.0).epsilon(0.001));
+		REQUIRE(std::stod(Row.at("cs")) == AstralTest::Approx(0.0).epsilon(0.001));
+		REQUIRE(Row.at("sorted") == "L[3]:1,2,3");
+		REQUIRE(Row.contains("mv"));
+		REQUIRE(Row.at("mv").find("V[2]:") == 0);
+	});
+}
+
+TEST_CASE("SQL: INSERT VALUES with ST_MESH and ST_POLYGON expressions") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_geo_ins_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "geo_ins.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE meshes (id INT, shape MESH); "
+	    "INSERT INTO meshes (id, shape) VALUES (1, ST_MESH('V[9]:0,0,0,1,0,0,0,1,0', 'L[3]:0,1,2')); "
+	    "CREATE TABLE parcels (id INT, geom POLYGON); "
+	    "INSERT INTO parcels VALUES (1, ST_POLYGON('V[10]:0,0,2,0,2,2,0,2,0,0')); "
+	    "SELECT ST_MESH_VOLUME(shape) AS vol FROM meshes WHERE id = 1; "
+	    "SELECT ST_GEOM_AREA(geom) AS area FROM parcels WHERE id = 1;";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::Basic);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	Db->WithExclusiveBytecodeLock([&]() {
+		REQUIRE(Db->Tables_.at("meshes").RowStore.size() == 1);
+		REQUIRE(Db->Tables_.at("parcels").RowStore.size() == 1);
+		REQUIRE(!Db->Tables_.at("meshes").RowStore[0].at("shape").empty());
+		REQUIRE(!Db->Tables_.at("parcels").RowStore[0].at("geom").empty());
+	});
 }
 
 TEST_CASE("SQL: JSON NULLIF AS OF MATCH_RECOGNIZE") {
@@ -2649,6 +3214,94 @@ TEST_CASE("GeoSpatial: terrain point and DEM sample") {
 	const auto Elev = AstralDB::GeoSpatial::SampleDemBilinear(Dem, 2, 2, 0, 0, 1, 1, 0.25, 0.25);
 	REQUIRE(Elev.has_value());
 	REQUIRE(*Elev == AstralTest::Approx(7.5).epsilon(0.01));
+}
+
+TEST_CASE("GeoSpatial: mesh glTF import/export and CSG") {
+	using AstralDB::SQL::ScalarSqlFn;
+	const auto Defined = AstralDB::MathSci::EvalScalar(
+	    ScalarSqlFn::StMeshDefine, {"V[9]:0,0,0,1,0,0,0,1,0", "L[3]:0,1,2"});
+	REQUIRE(Defined.has_value());
+	REQUIRE(Defined->find("M3{") == 0);
+	const auto Exported = AstralDB::MathSci::EvalScalar(ScalarSqlFn::StMeshExportGltf, {*Defined});
+	REQUIRE(Exported.has_value());
+	REQUIRE(Exported->find("\"meshes\"") != std::string::npos);
+	const auto Imported = AstralDB::MathSci::EvalScalar(ScalarSqlFn::StMeshImportGltf, {*Exported});
+	REQUIRE(Imported.has_value());
+	REQUIRE(Imported->find("M3{") == 0);
+	const auto Sewn = AstralDB::MathSci::EvalScalar(ScalarSqlFn::StMeshSew, {*Defined, "0.0001"});
+	REQUIRE(Sewn.has_value());
+	REQUIRE(Sewn->find("M3{") == 0);
+	const auto U = AstralDB::MathSci::EvalScalar(ScalarSqlFn::StMeshUnion, {*Defined, *Imported});
+	const auto I = AstralDB::MathSci::EvalScalar(ScalarSqlFn::StMeshIntersection, {*Defined, *Imported});
+	const auto D = AstralDB::MathSci::EvalScalar(ScalarSqlFn::StMeshDifference, {*Defined, *Imported});
+	REQUIRE(U.has_value());
+	REQUIRE(I.has_value());
+	REQUIRE(D.has_value());
+	const auto Area = AstralDB::MathSci::EvalScalar(ScalarSqlFn::StMeshSurfaceArea, {*Defined});
+	REQUIRE(Area.has_value());
+	REQUIRE(std::stod(*Area) > 0.0);
+	const auto Vol = AstralDB::MathSci::EvalScalar(ScalarSqlFn::StMeshVolume, {*Defined});
+	REQUIRE(Vol.has_value());
+	const auto Moved = AstralDB::MathSci::EvalScalar(ScalarSqlFn::StMeshTranslate, {*Defined, "1", "0", "0"});
+	REQUIRE(Moved.has_value());
+}
+
+TEST_CASE("GeoSpatial: polygon metrics booleans and GeoJSON") {
+	using AstralDB::SQL::ScalarSqlFn;
+	const auto Square = AstralDB::MathSci::EvalScalar(ScalarSqlFn::StPolygon, {"V[10]:0,0,2,0,2,2,0,2,0,0"});
+	REQUIRE(Square.has_value());
+	REQUIRE(Square->find("P2{") == 0);
+	const auto Area = AstralDB::MathSci::EvalScalar(ScalarSqlFn::StGeomArea, {*Square});
+	REQUIRE(Area.has_value());
+	REQUIRE(std::stod(*Area) == AstralTest::Approx(4.0).epsilon(0.01));
+	const auto Contains = AstralDB::MathSci::EvalScalar(ScalarSqlFn::StGeomContains, {*Square, "G(1,1)"});
+	REQUIRE(Contains == "1");
+	const auto Hole = AstralDB::MathSci::EvalScalar(ScalarSqlFn::StPolygonWkt,
+	                                                 {"POLYGON((1 0,3 0,3 2,1 2,1 0))"});
+	REQUIRE(Hole.has_value());
+	const auto Intersects = AstralDB::MathSci::EvalScalar(ScalarSqlFn::StGeomIntersects, {*Square, *Hole});
+	REQUIRE(Intersects == "1");
+	const auto U = AstralDB::MathSci::EvalScalar(ScalarSqlFn::StGeomUnion, {*Square, *Hole});
+	REQUIRE(U.has_value());
+	const auto Geo = AstralDB::MathSci::EvalScalar(ScalarSqlFn::StGeojsonExport, {*Square});
+	REQUIRE(Geo.has_value());
+	const auto Back = AstralDB::MathSci::EvalScalar(ScalarSqlFn::StGeojsonImport, {*Geo});
+	REQUIRE(Back.has_value());
+	REQUIRE(Back->find("P2{") == 0);
+	const auto Buf = AstralDB::MathSci::EvalScalar(ScalarSqlFn::StGeomBuffer, {*Square, "0.5"});
+	REQUIRE(Buf.has_value());
+}
+
+TEST_CASE("GeoSpatial: hardened validate repair and predicates") {
+	using AstralDB::SQL::ScalarSqlFn;
+	const auto Dup = AstralDB::MathSci::EvalScalar(ScalarSqlFn::StPolygon,
+	                                                {"V[12]:0,0,1,0,1,0,1,1,0,1,0,0"});
+	REQUIRE(Dup.has_value());
+	REQUIRE(AstralDB::MathSci::EvalScalar(ScalarSqlFn::StGeomValidate, {*Dup}) == "1");
+	const auto Repaired = AstralDB::MathSci::EvalScalar(ScalarSqlFn::StGeomRepair, {*Dup});
+	REQUIRE(Repaired.has_value());
+	REQUIRE(AstralDB::MathSci::EvalScalar(ScalarSqlFn::StGeomValidate, {*Repaired}) == "1");
+
+	const auto Mesh = AstralDB::MathSci::EvalScalar(ScalarSqlFn::StMeshDefine,
+	                                                {"V[9]:0,0,0,1,0,0,0,1,0", "L[3]:0,1,2"});
+	REQUIRE(Mesh.has_value());
+	REQUIRE(AstralDB::MathSci::EvalScalar(ScalarSqlFn::StMeshValidate, {*Mesh}) == "1");
+	const auto MeshRep = AstralDB::MathSci::EvalScalar(ScalarSqlFn::StMeshRepair, {*Mesh});
+	REQUIRE(MeshRep.has_value());
+	REQUIRE(AstralDB::MathSci::EvalScalar(ScalarSqlFn::StMeshValidate, {*MeshRep}) == "1");
+
+	REQUIRE(AstralDB::DS::Geometry2D::ValidatePolygon(
+	            AstralDB::DS::Geometry2D::PolygonFromRing({0, 0, 1, 0, 1, 1, 0, 1, 0, 0}))
+	            .Ok);
+	REQUIRE(!AstralDB::DS::Geometry2D::ValidatePolygon(
+	             AstralDB::DS::Geometry2D::PolygonFromRing({0, 0, 2, 2, 2, 0, 0, 2, 0, 0}))
+	             .Ok);
+
+	const auto Unit = AstralDB::DS::Geometry2D::PolygonFromRing({0, 0, 2, 0, 2, 2, 0, 2, 0, 0});
+	const auto Bar = AstralDB::DS::Geometry2D::PolygonFromRing({1, 1, 3, 1, 3, 3, 1, 3, 1, 1});
+	const auto I = AstralDB::DS::Geometry2D::Intersection(Unit, Bar);
+	REQUIRE(AstralDB::DS::Geometry2D::ValidatePolygon(I).Ok);
+	REQUIRE(AstralDB::DS::Geometry2D::PolygonArea(I) == AstralTest::Approx(1.0).epsilon(0.02));
 }
 
 TEST_CASE("GQL graph: analytics shortest path PageRank projection varlen") {
@@ -2919,6 +3572,126 @@ TEST_CASE("MathSci: Hessian Wirtinger and ODE SDE PDE solvers") {
 	});
 }
 
+TEST_CASE("MathSci: iterative linear root and march solvers") {
+	const auto Rk3 = AstralDB::MathSciSolves::OdeRk3FromReal({1.0}, 0.1, {0.1}, {0.12}, {0.13});
+	REQUIRE(Rk3.size() == 1);
+	REQUIRE(Rk3[0] == AstralTest::Approx(1.012).epsilon(0.01));
+
+	const auto Ab2 = AstralDB::MathSciSolves::OdeAdamsBashforth2FromReal({1.0}, 0.1, {0.2}, {0.1});
+	REQUIRE(Ab2[0] == AstralTest::Approx(1.015).epsilon(0.01));
+
+	const std::string Mat = AstralDB::AdvancedTypes::FormatMatrixCell({4.0, 1.0, 1.0, 3.0}, 2, 2);
+	const auto Cg = AstralDB::MathSciSolves::LinearCgSolveFromMat(Mat, {0.0, 0.0}, {1.0, 2.0}, 32, 1e-6);
+	REQUIRE(Cg.size() == 2);
+	REQUIRE(Cg[0] == AstralTest::Approx(0.0909).epsilon(0.02));
+	REQUIRE(Cg[1] == AstralTest::Approx(0.6364).epsilon(0.02));
+
+	const auto Jac = AstralDB::MathSciSolves::LinearJacobiStepFromMat(Mat, {0.0, 0.0}, {1.0, 2.0});
+	REQUIRE(Jac.size() == 2);
+
+	const auto Root = AstralDB::MathSciSolves::RootNewtonStepFromReal(2.0, 1.0, 2.0);
+	REQUIRE(Root == AstralTest::Approx(1.5).epsilon(1e-6));
+
+	const auto Marched = AstralDB::MathSciSolves::OdeMarchFromReal("EULER", {1.0}, 0.1, {0.5}, {0.0}, {0.0}, {0.0}, 2);
+	REQUIRE(Marched[0] == AstralTest::Approx(1.1).epsilon(0.001));
+}
+
+TEST_CASE("MathSci: classifiers NLP embeddings integrators") {
+	const auto Trap = AstralDB::MathSciSolves::OdeTrapezoidFromReal({1.0}, 0.2, {0.5}, {0.6});
+	REQUIRE(Trap.size() == 1);
+	REQUIRE(Trap[0] == AstralTest::Approx(1.11).epsilon(0.001));
+
+	const auto Semi = AstralDB::MathSciSolves::OdeSemiImplicitFromReal({1.0}, 0.1, {0.5}, {0.2});
+	REQUIRE(Semi[0] == AstralTest::Approx(1.07).epsilon(0.001));
+
+	const auto Cn = AstralDB::MathSciSolves::OdeCrankNicolsonFromReal({1.0}, 0.1, {0.5}, {0.2});
+	REQUIRE(Cn[0] == AstralTest::Approx(1.0359).epsilon(0.01));
+
+	const auto Label = AstralDB::MathSciClassify::LinearLabelFromReal({1.0, 0.0}, {0.5, 1.0}, 0.0);
+	REQUIRE(Label == "1");
+
+	const auto Tok = AstralDB::MathSciNlp::TokenizeCellFromReal("Hello, world!");
+	REQUIRE(Tok.has_value());
+	REQUIRE(Tok->find("L[2]:") == 0);
+
+	const auto Table = AstralDB::MathSciEmbeddings::BuildFromTokensAndMatrix(
+	    {"a", "b"}, {1.0, 0.0, 0.0, 1.0}, 2, 2, false);
+	REQUIRE(Table.has_value());
+	const std::string Wire = AstralDB::MathSciEmbeddings::Serialize(*Table);
+	const auto Round = AstralDB::MathSciEmbeddings::Deserialize(Wire);
+	REQUIRE(Round.has_value());
+	REQUIRE(Round->Dim == 2);
+	REQUIRE(Round->Rows.size() == 2);
+
+	AstralDB::MathSciEmbeddings::EmbeddingCache Lru(8);
+	Lru.Insert("a", {1.f, 0.f});
+	REQUIRE(Lru.Lookup("a").has_value());
+
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_nlp_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "nlp.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE t (id INT, doc TEXT); INSERT INTO t VALUES (1,'hello world'); "
+	    "SELECT NLP_TOKENIZE(doc) AS toks, "
+	    "ODE_TRAPEZOID('L[1]:1', 'L[1]:0.5', 'L[1]:0.6', '0.2') AS trap, "
+	    "CLASSIFY_LINEAR('L[2]:1,0', 'L[2]:0.5,1', '0') AS lbl FROM t;";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+}
+
+TEST_CASE("MathSci: complex vectors unit") {
+	const auto CvA = AstralDB::MathSciComplex::ParseNumericVec("CV[2]:1,0,0,1");
+	const auto CvB = AstralDB::MathSciComplex::ParseNumericVec("CV[2]:0,1,1,0");
+	REQUIRE(CvA.has_value());
+	REQUIRE(CvB.has_value());
+	REQUIRE(CvA->IsComplex());
+	const auto Dot = AstralDB::MathSciComplex::DotComplex(*CvA, *CvB);
+	REQUIRE(Dot.has_value());
+	REQUIRE(Dot->first == AstralTest::Approx(0.0).epsilon(1e-5));
+	REQUIRE(Dot->second == AstralTest::Approx(0.0).epsilon(1e-5));
+	const auto Sim = AstralDB::MathSciComplex::CosineSim(*CvA, *CvB);
+	REQUIRE(Sim.has_value());
+	REQUIRE(*Sim == AstralTest::Approx(0.0).epsilon(1e-5));
+
+	const auto CTable = AstralDB::MathSciEmbeddings::BuildFromTokensAndMatrix(
+	    {"x", "y"}, {1.f, 0.f, 0.f, 1.f, 0.f, 1.f, 1.f, 0.f}, 2, 2, true);
+	REQUIRE(CTable.has_value());
+	const std::string CWire = AstralDB::MathSciEmbeddings::Serialize(*CTable);
+	REQUIRE(CWire.rfind("EC[2,2]:", 0) == 0);
+	REQUIRE(AstralDB::MathSciEmbeddings::Deserialize(CWire).has_value());
+}
+
+TEST_CASE("MathSci: CREATE EMBEDDING catalog") {
+	fs::path Dir = UniqueTempDir("astral_cemb_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "cemb.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE vocab (tok TEXT, vec TEXT); "
+	    "INSERT INTO vocab VALUES ('a', 'CV[2]:1,0,0,1'), ('b', 'CV[2]:0,1,1,0'); "
+	    "CREATE EMBEDDING emb AS TABLE vocab (tok, vec);";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	Db->WithExclusiveBytecodeLock([&]() {
+		REQUIRE(Db->EmbeddingWireCellAssumeDbMutexHeld("emb").has_value());
+		const auto Wire = Db->EmbeddingWireCellAssumeDbMutexHeld("emb");
+		REQUIRE(Wire->rfind("EC[2,2]:", 0) == 0);
+		const auto Vec = AstralDB::MathSciEmbeddings::LookupCellFromReal(*Wire, "a", Db);
+		REQUIRE(Vec.has_value());
+		REQUIRE(Vec->find("CV[2]:") == 0);
+	});
+}
+
 TEST_CASE("Simd: dot product matches scalar reference") {
 	std::vector<float> A{1.f, 2.f, 3.f, 4.f};
 	std::vector<float> B{2.f, 3.f, 4.f, 5.f};
@@ -3127,7 +3900,49 @@ TEST_CASE("optimizer: invalid control flow after pass reverts bytecode") {
 	REQUIRE(Code.size() == Before);
 }
 
+TEST_CASE("optimizer: jump threading collapses jmp chains" * doctest::test_suite("fast")) {
+	AstralDB::SQL::Bytecode Code = {
+	    AstralDB::SQL::MakeInstruction(AstralDB::SQL::Opcode::JMP, static_cast<int64_t>(1)),
+	    AstralDB::SQL::MakeInstruction(AstralDB::SQL::Opcode::JMP, static_cast<int64_t>(2)),
+	    AstralDB::SQL::MakeInstruction(AstralDB::SQL::Opcode::PUSH, static_cast<int64_t>(1)),
+	    AstralDB::SQL::MakeInstruction(AstralDB::SQL::Opcode::HALT),
+	};
+	AstralDB::SQL::RunOptimizerPipeline(Code, AstralDB::SQL::OptimizationLevel::Advanced);
+	REQUIRE(Code[0].Opcode_ == AstralDB::SQL::Opcode::JMP);
+	const auto *T = std::get_if<int64_t>(&Code[0].Operands[0]);
+	REQUIRE(T != nullptr);
+	REQUIRE(*T == 2);
+}
+
+TEST_CASE("perf: nuke.sql bulk and window on ephemeral db" * doctest::test_suite("perf")) {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	std::string Script = ReadExampleFile(RepoRoot() / "examples" / "nuke.sql");
+	{
+		const std::string Needle = "BULK 10000000";
+		const std::string Repl = "BULK 200000";
+		if(const std::size_t Pos = Script.find(Needle); Pos != std::string::npos)
+			Script.replace(Pos, Needle.size(), Repl);
+	}
+	REQUIRE(!Script.empty());
+	fs::path Dir = UniqueTempDir("astral_nuke_perf_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "nuke.log").string(), false);
+	AstralDB::SQL::Parser P(Script);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::Maximum);
+	AstralDB::SQL::BytecodeInterpreter Interp(&Log);
+	Interp.DatabasePath(Dir / "astraldb_session_nuke.db");
+	const auto T0 = std::chrono::steady_clock::now();
+	REQUIRE_NOTHROW(Interp.Execute(Code));
+	const double Ms =
+	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - T0).count();
+	REQUIRE(Ms < 120000.0);
+}
+
 TEST_CASE("examples: every *.sql parses, compiles, runs") {
+	if(!RunExamplesSweep())
+		return;
 	AstralDB::SQL::SetParserDiagnostics(false);
 	AstralTest::PerfSection Perf("examples/*.sql (all files)");
 	const fs::path Ex = RepoRoot() / "examples";
@@ -3145,7 +3960,9 @@ TEST_CASE("examples: every *.sql parses, compiles, runs") {
 	AstralDB::Logger Log((Dir / "ex.log").string(), false);
 	for(const fs::path &F : Files) {
 		const std::string Name = F.filename().string();
-		if(IsOffCiStressHarness(Name))
+		if(IsPerfHarness(Name))
+			continue;
+		if(!RunAllExamplesInDefaultSuite() && IsDefaultSlowExample(Name))
 			continue;
 		INFO("example: ", Name);
 		RemoveEphemeralDb(Dir);

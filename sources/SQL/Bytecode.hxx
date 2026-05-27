@@ -38,12 +38,12 @@ enum class Opcode : uint8_t {
     FILTER_DNF,
     PUSH_POOL,
     AND, OR, NOT, EQ, NE, LT, LE, GT, GE,
-    ADD, SUB, MUL, DIV, MOD,
+    ADD, SUB, MUL, DIV, MOD, INT_DIV,
     PUSH, POP, LOAD, STORE,
     CALL, RET, JMP, NOP, HALT,
     GRANT, REVOKE,
-	CREATE_ROLE, DROP_ROLE, CREATE_SEQUENCE, DROP_SEQUENCE, GRANT_ROLE_MEMBERSHIP, REVOKE_ROLE_MEMBERSHIP,
-	GRANT_COLUMN, REVOKE_COLUMN,
+	CREATE_ROLE, DROP_ROLE, CREATE_USER, DROP_USER, ALTER_USER_PASSWORD, CREATE_SEQUENCE, DROP_SEQUENCE,
+	GRANT_ROLE_MEMBERSHIP, REVOKE_ROLE_MEMBERSHIP, GRANT_COLUMN, REVOKE_COLUMN,
 
     // Transaction control
     BEGIN, COMMIT, ROLLBACK,
@@ -91,9 +91,19 @@ enum class Opcode : uint8_t {
 	CREATE_PROCEDURE,
 	/** Operands: procedure name, if-exists flag (int64). */
 	DROP_PROCEDURE,
-	/** Operands: procedure name. Loads cached \c .abc and runs it. */
+	/** Operands: procedure name, optional invoke kind (\c call, \c execute, \c exec). Loads cached \c .abc. */
 	CALL_PROCEDURE,
-    
+	/** Procedure exception region: savepoint, end IP, then \c (handler_ip, condition)* pairs. */
+	PROC_TRY,
+	/** End try: savepoint name, end IP (release savepoint and jump past handlers). */
+	PROC_END_TRY,
+
+	/** Operands: name, table, timing, event, for_each_row, action_kind, procedure, body_sql, if_not_exists, or_replace. */
+	CREATE_TRIGGER,
+	DROP_TRIGGER,
+	/** Operands: name, enabled (int64 0/1). */
+	ALTER_TRIGGER,
+
     // Schema operations
     CREATE_SCHEMA, DROP_SCHEMA, ALTER_SCHEMA,
     
@@ -117,6 +127,9 @@ enum class Opcode : uint8_t {
 	 *  in \c [loop_start_ip, this instruction) repeatedly, appending only new row signatures from \c delta_table
 	 *  into \c work_table until no growth or \c max_iterations exceeded. */
 	RECURSIVE_CTE_FIXPOINT,
+	/** Operands: table name, parent column, child column, prior_on_parent (int64), start_with DNF blob (may be empty),
+	 *  no_cycle (int64). Expands rows in hierarchical order (depth-first) in-place. */
+	CONNECT_BY_EXPAND,
     /** Operands: PARTITION count (int64, 0=no partition), PARTITION col names..., ORDER BY col, asc (int64), out col name,
      *  kind (int64: 0–2 ordinals, 3–6 running SUM/MIN/MAX/AVG, 7–8 LAG/LEAD), source column, frame offset (int64),
      *  explicit ROWS flag (int64), and when set: start kind, start offset, end kind, end offset. Without an explicit
@@ -138,6 +151,11 @@ enum class Opcode : uint8_t {
     /** SELECT projection: operands are output column; \c ScalarSqlFn as \e int64 ; argc; then \e argc × (scalar kind,
      *  payload) using the same scalar encoding as \c CAST_EVAL sources. Table popped/pushed like \c CAST_EVAL . */
     SCALAR_FUNC_EVAL,
+	/** Operands: output column, op char (1-char string), left column, right column. Integer division uses \c INT_DIV . */
+	SCALAR_ARITH_EVAL,
+	/** Operands: work table, mode (\c ColumnsPickMode ), glob or serialized lambda, static select count.
+	 *  Pushes matching column names onto the VM stack (like \c SELECT col ). */
+	COLUMNS_EXPAND,
 	/** \c INSERT … BULK fixture rows at runtime (torture-shaped five columns). Operands: table name, count, start id,
 	 *  step (all int64 except table string). Avoids expanding millions of \c INSERT instructions at compile time. */
 	INSERT_BULK,
@@ -147,6 +165,10 @@ enum class Opcode : uint8_t {
 	LOAD_DATASET,
 	/** Operands: dataset name. */
 	DROP_DATASET,
+	/** Operands: embedding name, table, token column, vector column. */
+	REGISTER_EMBEDDING,
+	/** Operands: embedding name. */
+	DROP_EMBEDDING,
 	/** Operands: optional table name (empty string = whole database). */
 	VACUUM,
 	/** Operands: table name. */
@@ -216,11 +238,15 @@ struct Instruction {
 			case Opcode::CREATE_PROCEDURE:
 			case Opcode::DROP_PROCEDURE:
 			case Opcode::CALL_PROCEDURE:
+			case Opcode::PROC_TRY:
+			case Opcode::PROC_END_TRY:
             case Opcode::INSERT:
 			case Opcode::INSERT_BULK:
 			case Opcode::REGISTER_DATASET:
 			case Opcode::LOAD_DATASET:
 			case Opcode::DROP_DATASET:
+			case Opcode::REGISTER_EMBEDDING:
+			case Opcode::DROP_EMBEDDING:
 			case Opcode::VACUUM:
 			case Opcode::REPACK_CONCURRENTLY:
 			case Opcode::GRAPH_REGISTER:
@@ -243,6 +269,9 @@ struct Instruction {
             case Opcode::REVOKE:
 			case Opcode::CREATE_ROLE:
 			case Opcode::DROP_ROLE:
+			case Opcode::CREATE_USER:
+			case Opcode::DROP_USER:
+			case Opcode::ALTER_USER_PASSWORD:
 			case Opcode::CREATE_SEQUENCE:
 			case Opcode::DROP_SEQUENCE:
 			case Opcode::GRANT_ROLE_MEMBERSHIP:
@@ -258,6 +287,7 @@ struct Instruction {
             case Opcode::CONVERT_TABULAR_FILES:
             case Opcode::CLONE_TABLE:
 			case Opcode::RECURSIVE_CTE_FIXPOINT:
+			case Opcode::CONNECT_BY_EXPAND:
             case Opcode::SET_COMBINE:
 			case Opcode::GROUP_BY:
 			case Opcode::ROLLUP:
@@ -422,18 +452,23 @@ bool ValidateBytecodeControlFlow(const Bytecode &Code) noexcept;
 /** Run the optimization pipeline for \a OptLevel (reverts on broken control flow). */
 void RunOptimizerPipeline(Bytecode &Code, OptimizationLevel OptLevel, Logger *Logger = nullptr);
 
-// Instruction combining (alias: advanced peephole sweep)
+// Instruction combining (advanced peephole patterns)
 class InstructionCombiningPass : public OptimizationPass {
 public:
     bool Run(Bytecode& Code, Logger* Logger = nullptr) override;
     const char* GetName() const override { return "InstructionCombining"; }
 };
 
-// Register allocation
-class RegisterAllocationPass : public OptimizationPass {
+class JumpThreadingPass : public OptimizationPass {
 public:
     bool Run(Bytecode& Code, Logger* Logger = nullptr) override;
-    const char* GetName() const override { return "RegisterAllocation"; }
+    const char* GetName() const override { return "JumpThreading"; }
+};
+
+class UnreachableBlockPass : public OptimizationPass {
+public:
+    bool Run(Bytecode& Code, Logger* Logger = nullptr) override;
+    const char* GetName() const override { return "UnreachableBlock"; }
 };
 
 Bytecode BuildBytecode(Logger *Logger, OptimizationLevel OptLevel = OptimizationLevel::Basic,

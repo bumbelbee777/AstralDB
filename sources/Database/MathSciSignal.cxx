@@ -1,5 +1,6 @@
 #include <Database/MathSciSignal.hxx>
 
+#include <Database/MathSciSimdUtil.hxx>
 #include <IO/SIMD.hxx>
 
 #include <algorithm>
@@ -63,20 +64,6 @@ void FftButterflies(float *Re, float *Im, size_t N, bool Inverse) {
 			}
 		}
 	}
-}
-
-std::vector<float> ToF32(const std::vector<double> &In) {
-	std::vector<float> Out(In.size());
-	for(size_t I = 0; I < In.size(); ++I)
-		Out[I] = static_cast<float>(In[I]);
-	return Out;
-}
-
-std::vector<double> ToF64(const std::vector<float> &In) {
-	std::vector<double> Out(In.size());
-	for(size_t I = 0; I < In.size(); ++I)
-		Out[I] = static_cast<double>(In[I]);
-	return Out;
 }
 
 } // namespace
@@ -167,12 +154,21 @@ std::vector<float> Conv1dSameF32(const float *A, size_t Na, const float *B, size
 std::vector<float> Laplacian1dF32(const float *In, size_t N) {
 	if(N == 0)
 		return {};
-	std::vector<float> Out(N, 0.f);
-	for(size_t I = 0; I < N; ++I) {
-		const float L = (I > 0) ? In[I - 1] : 0.f;
-		const float R = (I + 1 < N) ? In[I + 1] : 0.f;
-		Out[I] = L - 2.f * In[I] + R;
+	std::vector<float> Out(N);
+	std::vector<float> ShiftL(N, 0.f);
+	std::vector<float> ShiftR(N, 0.f);
+	std::vector<float> Center(N);
+	Simd::ScaleF32(Center.data(), In, -2.f, N);
+	if(N > 1) {
+		ShiftL[0] = 0.f;
+		for(size_t I = 1; I < N; ++I)
+			ShiftL[I] = In[I - 1];
+		for(size_t I = 0; I + 1 < N; ++I)
+			ShiftR[I] = In[I + 1];
+		ShiftR[N - 1] = 0.f;
 	}
+	Simd::AddF32(Out.data(), Center.data(), ShiftL.data(), N);
+	Simd::AddF32(Out.data(), Out.data(), ShiftR.data(), N);
 	return Out;
 }
 
@@ -290,47 +286,47 @@ std::vector<double> IfftRealFromInterleaved(const std::vector<double> &Interleav
 		Im[I] = static_cast<float>(Interleaved[I * 2 + 1]);
 	}
 	IfftInPlaceF32(Re.data(), Im.data(), N);
-	return ToF64(Re);
+	return MathSciSimdUtil::ToF64(Re);
 }
 
 std::vector<double> Dct2FromReal(const std::vector<double> &In) {
 	if(In.empty() || In.size() > MaxTransformLen)
 		return {};
-	const auto F = ToF32(In);
+	const auto F = MathSciSimdUtil::SeqToF32(In);
 	std::vector<float> Out(In.size());
 	Dct2F32(F.data(), Out.data(), In.size());
-	return ToF64(Out);
+	return MathSciSimdUtil::ToF64(Out);
 }
 
 std::vector<double> Idct2FromReal(const std::vector<double> &In) {
 	if(In.empty() || In.size() > MaxTransformLen)
 		return {};
-	const auto F = ToF32(In);
+	const auto F = MathSciSimdUtil::SeqToF32(In);
 	std::vector<float> Out(In.size());
 	Idct2F32(F.data(), Out.data(), In.size());
-	return ToF64(Out);
+	return MathSciSimdUtil::ToF64(Out);
 }
 
 std::vector<double> Conv1dFullFromReal(const std::vector<double> &A, const std::vector<double> &B) {
 	if(A.empty() || B.empty())
 		return {};
-	const auto Af = ToF32(A);
-	const auto Bf = ToF32(B);
-	return ToF64(Conv1dFullF32(Af.data(), Af.size(), Bf.data(), Bf.size()));
+	const auto Af = MathSciSimdUtil::SeqToF32(A);
+	const auto Bf = MathSciSimdUtil::SeqToF32(B);
+	return MathSciSimdUtil::ToF64(Conv1dFullF32(Af.data(), Af.size(), Bf.data(), Bf.size()));
 }
 
 std::vector<double> Conv1dSameFromReal(const std::vector<double> &A, const std::vector<double> &B) {
 	if(A.empty() || B.empty())
 		return {};
-	const auto Af = ToF32(A);
-	const auto Bf = ToF32(B);
-	return ToF64(Conv1dSameF32(Af.data(), Af.size(), Bf.data(), Bf.size()));
+	const auto Af = MathSciSimdUtil::SeqToF32(A);
+	const auto Bf = MathSciSimdUtil::SeqToF32(B);
+	return MathSciSimdUtil::ToF64(Conv1dSameF32(Af.data(), Af.size(), Bf.data(), Bf.size()));
 }
 
 std::vector<double> Laplacian1dFromReal(const std::vector<double> &In) {
 	if(In.empty())
 		return {};
-	return ToF64(Laplacian1dF32(ToF32(In).data(), In.size()));
+	return MathSciSimdUtil::ToF64(Laplacian1dF32(MathSciSimdUtil::SeqToF32(In).data(), In.size()));
 }
 
 } // namespace MathSciSignal

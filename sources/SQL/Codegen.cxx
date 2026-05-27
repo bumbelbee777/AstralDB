@@ -1,8 +1,12 @@
 #include <SQL/Bytecode.hxx>
 #include <SQL/GraphOptimizer.hxx>
+#include <SQL/MathSciOptimizer.hxx>
 #include <SQL/SetExprEval.hxx>
 #include <Database/MathSci.hxx>
 #include <SQL/SQL.hxx>
+#include <SQL/BytecodeProcedures.hxx>
+#include <SQL/BytecodeTriggers.hxx>
+#include <SQL/DialectCompat.hxx>
 #include <Database/Database.hxx>
 #include <Database/MathSci.hxx>
 #include <IO/Limits.hxx>
@@ -29,6 +33,60 @@ using RowTriple = std::tuple<std::string, std::string, std::string>;
 
 [[noreturn]] inline void FailCodegen(std::string Message) {
 	throw std::runtime_error(AstralDB::Err::Prefixed("SQL codegen", std::move(Message)));
+}
+
+bool TryParseDoubleCodegen(const std::string &S, double &Out) {
+	try {
+		size_t Pos = 0;
+		Out = std::stod(S, &Pos);
+		return Pos == S.size() || std::isspace(static_cast<unsigned char>(S[Pos]));
+	} catch(...) {
+		return false;
+	}
+}
+
+/** Fold INSERT VALUES expressions that are literals or constant scalar calls (e.g. ST_MESH(...)). */
+std::optional<std::string> TryConstEvalInsertExpr(const ExpressionAST *E) {
+	if(!E)
+		return std::nullopt;
+	if(const auto *L = dynamic_cast<const LiteralAST *>(E))
+		return L->Value;
+	if(dynamic_cast<const NullLiteralAST *>(E))
+		return std::string();
+	if(const auto *Sf = dynamic_cast<const ScalarFuncExprAST *>(E)) {
+		std::vector<std::string> Cells;
+		Cells.reserve(Sf->Args.size());
+		for(const auto &A : Sf->Args) {
+			const auto V = TryConstEvalInsertExpr(A.get());
+			if(!V)
+				return std::nullopt;
+			Cells.push_back(*V);
+		}
+		if(MathSci::IsMathSciScalarFn(Sf->Fn))
+			return MathSci::EvalScalar(Sf->Fn, Cells, nullptr);
+		return std::nullopt;
+	}
+	if(const auto *C = dynamic_cast<const CastExprAST *>(E))
+		return TryConstEvalInsertExpr(C->Operand.get());
+	if(const auto *B = dynamic_cast<const BinaryOpAST *>(E)) {
+		const auto L = TryConstEvalInsertExpr(B->LHS.get());
+		const auto R = TryConstEvalInsertExpr(B->RHS.get());
+		if(!L || !R)
+			return std::nullopt;
+		double A = 0, Bv = 0;
+		if(B->Op == "+" && TryParseDoubleCodegen(*L, A) && TryParseDoubleCodegen(*R, Bv))
+			return std::to_string(static_cast<long long>(std::llround(A + Bv)));
+		if(B->Op == "-" && TryParseDoubleCodegen(*L, A) && TryParseDoubleCodegen(*R, Bv))
+			return std::to_string(static_cast<long long>(std::llround(A - Bv)));
+		if(B->Op == "*" && TryParseDoubleCodegen(*L, A) && TryParseDoubleCodegen(*R, Bv))
+			return std::to_string(static_cast<long long>(std::llround(A * Bv)));
+		if(B->Op == "/" && TryParseDoubleCodegen(*L, A) && TryParseDoubleCodegen(*R, Bv) && Bv != 0)
+			return std::to_string(static_cast<long long>(std::llround(A / Bv)));
+		if(B->Op == "+")
+			return *L + *R;
+		return std::nullopt;
+	}
+	return std::nullopt;
 }
 
 struct SqlViewCodegenState {
@@ -100,12 +158,14 @@ std::string ResolveRelationLogicalName(const std::string &Logical, BytecodeScrat
 }
 
 static constexpr const char *kExistCol = "__ASTRAL_EXISTS__";
+static constexpr const char *kInSubCol = "__ASTRAL_IN_SUBQUERY__";
 /** Stored as predicate RHS bytes; MatchOnePredicate resolves against the enclosing+inner merged row (correlation). */
 static constexpr const char kAstRhsColMarker[] = "__AST_RHS_COL__:";
 
 static constexpr const char *kOpIsNull = "__IS_NULL__";
 static constexpr const char *kOpIsNotNull = "__IS_NOT_NULL__";
 static constexpr const char *kOpIn = "__IN__";
+static constexpr const char *kOpNotIn = "__NOT_IN__";
 static constexpr const char *kBoolConstCol = "__ASTRAL_BOOL__";
 static constexpr const char *kOpBoolConst = "__BOOL_CONST__";
 
@@ -175,6 +235,11 @@ static std::unique_ptr<ExpressionAST> NormalizeHavingExpr(const ExpressionAST *R
 	if(const auto *Ep = dynamic_cast<const ExistsPredAST *>(Root)) {
 		auto InnerW = Ep->InnerWhere ? NormalizeHavingExpr(Ep->InnerWhere.get(), Sel) : nullptr;
 		return std::make_unique<ExistsPredAST>(Ep->Negated, Ep->InnerTable, std::move(InnerW));
+	}
+	if(const auto *Ip = dynamic_cast<const InSubqueryPredAST *>(Root)) {
+		auto InnerW = Ip->InnerWhere ? NormalizeHavingExpr(Ip->InnerWhere.get(), Sel) : nullptr;
+		return std::make_unique<InSubqueryPredAST>(Ip->Negated, Ip->LhsColumn, Ip->InnerTable, Ip->InnerValueColumn,
+		                                           std::move(InnerW));
 	}
 	if(const auto *Iv = dynamic_cast<const InValuesAST *>(Root))
 		return std::make_unique<InValuesAST>(Iv->Values);
@@ -246,8 +311,9 @@ bool ExtractOneComparison(const ExpressionAST *Expr, RowTriple &Out) {
 	if(!Expr)
 		return false;
 	const auto *Bin = dynamic_cast<const BinaryOpAST *>(Expr);
-	if(!Bin || Bin->Op == "IN" || Bin->Op == "LIKE" || Bin->Op == "NOT LIKE" || Bin->Op == "MATCH"
-	    || Bin->Op == "NOT MATCH")
+	if(!Bin || Bin->Op == "IN" || Bin->Op == "LIKE" || Bin->Op == "NOT LIKE" || Bin->Op == "ILIKE" ||
+	    Bin->Op == "NOT ILIKE" || Bin->Op == "GLOB" || Bin->Op == "NOT GLOB" || Bin->Op == "REGEXP" || Bin->Op == "NOT REGEXP" || Bin->Op == "REGEXP_ICASE" || Bin->Op == "NOT REGEXP_ICASE" || Bin->Op == "~" || Bin->Op == "!~" || Bin->Op == "~*" || Bin->Op == "!~*" || Bin->Op == "MATCH" ||
+	    Bin->Op == "NOT MATCH")
 		return false;
 
 	const auto *LCol = dynamic_cast<const ColumnRefAST *>(Bin->LHS.get());
@@ -308,6 +374,17 @@ bool AtomToTriples(const ExpressionAST *Expr, std::vector<RowTriple> &Out) {
 		return true;
 	}
 
+	if(const auto *Sf = dynamic_cast<const ScalarFuncExprAST *>(Expr)) {
+		if(Sf->Fn == ScalarSqlFn::RegexpMatch && Sf->Args.size() == 2) {
+			std::string Col, Pat;
+			if(!ColumnNameExpr(Sf->Args[0].get(), Col))
+				return false;
+			if(!LiteralOrNullCsv(Sf->Args[1].get(), Pat))
+				return false;
+			Out.emplace_back(Col, "REGEXP", Pat);
+			return true;
+		}
+	}
 	if(const auto *Bl = dynamic_cast<const BooleanLiteralAST *>(Expr)) {
 		Out.emplace_back(std::string(kBoolConstCol), std::string(kOpBoolConst), Bl->Value ? "1" : "0");
 		return true;
@@ -328,6 +405,26 @@ bool AtomToTriples(const ExpressionAST *Expr, std::vector<RowTriple> &Out) {
 		Payload.push_back('\x1E');
 		Payload.append(Blob);
 		Out.emplace_back(std::string(kExistCol), Ep->InnerTable, std::move(Payload));
+		return true;
+	}
+
+	if(const auto *Ip = dynamic_cast<const InSubqueryPredAST *>(Expr)) {
+		std::vector<std::vector<RowTriple>> Inner;
+		if(Ip->InnerWhere) {
+			if(!BuildWhereDnf(Ip->InnerWhere.get(), Inner))
+				return false;
+		} else
+			Inner.push_back({});
+		std::string Blob;
+		PackDnfOperandsBlob(Inner, Blob);
+		std::string Payload;
+		Payload.reserve(3 + Ip->InnerValueColumn.size() + Blob.size());
+		Payload.push_back(Ip->Negated ? '1' : '0');
+		Payload.push_back('\x1E');
+		Payload.append(Ip->InnerValueColumn);
+		Payload.push_back('\x1E');
+		Payload.append(Blob);
+		Out.emplace_back(Ip->LhsColumn, std::string(kInSubCol), Ip->InnerTable + "\x1E" + std::move(Payload));
 		return true;
 	}
 
@@ -352,7 +449,7 @@ bool AtomToTriples(const ExpressionAST *Expr, std::vector<RowTriple> &Out) {
 	}
 
 	const auto *Bin = dynamic_cast<const BinaryOpAST *>(Expr);
-	if(Bin && Bin->Op == "IN") {
+	if(Bin && (Bin->Op == "IN" || Bin->Op == "NOT IN")) {
 		std::string Col;
 		if(!ColumnNameExpr(Bin->LHS.get(), Col))
 			return false;
@@ -365,11 +462,14 @@ bool AtomToTriples(const ExpressionAST *Expr, std::vector<RowTriple> &Out) {
 				O << '\x1E';
 			O << Rhs->Values[I];
 		}
-		Out.emplace_back(Col, kOpIn, std::move(O).str());
+		Out.emplace_back(Col, Bin->Op == "NOT IN" ? kOpNotIn : kOpIn, std::move(O).str());
 		return true;
 	}
 
-	if(Bin && (Bin->Op == "LIKE" || Bin->Op == "NOT LIKE")) {
+	if(Bin && (Bin->Op == "LIKE" || Bin->Op == "NOT LIKE" || Bin->Op == "ILIKE" || Bin->Op == "NOT ILIKE" ||
+	           Bin->Op == "GLOB" || Bin->Op == "NOT GLOB" || Bin->Op == "REGEXP" || Bin->Op == "NOT REGEXP" ||
+	           Bin->Op == "REGEXP_ICASE" || Bin->Op == "NOT REGEXP_ICASE" || Bin->Op == "~" || Bin->Op == "!~" ||
+	           Bin->Op == "~*" || Bin->Op == "!~*")) {
 		std::string Col, Pat;
 		if(!ColumnNameExpr(Bin->LHS.get(), Col))
 			return false;
@@ -473,8 +573,134 @@ static void AppendCaseScalarPayload(Instruction &Inst, const ExpressionAST *E) {
 	} else if(dynamic_cast<const NullLiteralAST *>(E)) {
 		Inst.Operands.push_back(static_cast<int64_t>(2));
 		Inst.Operands.push_back(std::string());
+	} else if(const auto *Lam = dynamic_cast<const LambdaExprAST *>(E)) {
+		Inst.Operands.push_back(static_cast<int64_t>(5));
+		Inst.Operands.push_back(SerializeLambdaExpr(*Lam));
 	} else
-		FailCodegen("CASE THEN/ELSE must be a literal, a column reference, or NULL in this dialect.");
+		FailCodegen("CASE THEN/ELSE must be a literal, column, NULL, or lambda in this dialect.");
+}
+
+static unsigned GScalarMaterializeCounter = 0;
+
+static void EmitCaseEvalInstruction(const CaseExprAST &C, const std::string &OutCol,
+                                    BytecodeScratch &Instructions);
+
+static void EmitCoalesceForColumn(const CoalesceExprAST &C, const std::string &OutCol,
+                                  BytecodeScratch &Instructions);
+static void EmitNvl2ForColumn(const Nvl2ExprAST &N, const std::string &OutCol, BytecodeScratch &Instructions);
+static void EmitCastEvalInstruction(const CastExprAST &C, const std::string &OutCol,
+                                    BytecodeScratch &Instructions);
+static void EmitScalarFuncEvalInstruction(const ScalarFuncExprAST &F, const std::string &OutCol,
+                                          BytecodeScratch &Instructions);
+static void EmitBinaryArithForColumn(const BinaryOpAST &B, const std::string &OutCol,
+                                     BytecodeScratch &Instructions);
+
+static std::string MaterializeScalarToColumn(const ExpressionAST *E, BytecodeScratch &Instructions) {
+	if(const auto *C = dynamic_cast<const ColumnRefAST *>(E))
+		return C->Name;
+	const std::string Tmp = std::string("_sxt") + std::to_string(GScalarMaterializeCounter++);
+	if(const auto *L = dynamic_cast<const LiteralAST *>(E)) {
+		std::vector<CaseExprAST::Arm> NoArms;
+		EmitCaseEvalInstruction(CaseExprAST(std::move(NoArms), std::make_unique<LiteralAST>(L->Value)), Tmp,
+		                        Instructions);
+		return Tmp;
+	}
+	if(dynamic_cast<const NullLiteralAST *>(E)) {
+		std::vector<CaseExprAST::Arm> NoArms;
+		EmitCaseEvalInstruction(CaseExprAST(std::move(NoArms), std::make_unique<NullLiteralAST>()), Tmp,
+		                        Instructions);
+		return Tmp;
+	}
+	if(const auto *Ca = dynamic_cast<const CastExprAST *>(E)) {
+		EmitCastEvalInstruction(*Ca, Tmp, Instructions);
+		return Tmp;
+	}
+	if(const auto *Sf = dynamic_cast<const ScalarFuncExprAST *>(E)) {
+		EmitScalarFuncEvalInstruction(*Sf, Tmp, Instructions);
+		return Tmp;
+	}
+	if(const auto *Co = dynamic_cast<const CoalesceExprAST *>(E)) {
+		EmitCoalesceForColumn(*Co, Tmp, Instructions);
+		return Tmp;
+	}
+	if(const auto *Nv = dynamic_cast<const Nvl2ExprAST *>(E)) {
+		EmitNvl2ForColumn(*Nv, Tmp, Instructions);
+		return Tmp;
+	}
+	if(const auto *Ce = dynamic_cast<const CaseExprAST *>(E)) {
+		EmitCaseEvalInstruction(*Ce, Tmp, Instructions);
+		return Tmp;
+	}
+	if(const auto *B = dynamic_cast<const BinaryOpAST *>(E)) {
+		EmitBinaryArithForColumn(*B, Tmp, Instructions);
+		return Tmp;
+	}
+	if(const auto *Lam = dynamic_cast<const LambdaExprAST *>(E)) {
+		std::vector<CaseExprAST::Arm> NoArms;
+		EmitCaseEvalInstruction(
+		    CaseExprAST(std::move(NoArms), std::make_unique<LiteralAST>(SerializeLambdaExpr(*Lam))), Tmp,
+		    Instructions);
+		return Tmp;
+	}
+	FailCodegen("Unsupported scalar expression in COALESCE/NVL2/CAST projection.");
+}
+
+static void EmitBinaryArithForColumn(const BinaryOpAST &B, const std::string &OutCol,
+                                     BytecodeScratch &Instructions) {
+	if(B.Op != "+" && B.Op != "-" && B.Op != "*" && B.Op != "/" && B.Op != "//")
+		FailCodegen("Unsupported arithmetic operator in SELECT projection.");
+	const std::string L = MaterializeScalarToColumn(B.LHS.get(), Instructions);
+	const std::string R = MaterializeScalarToColumn(B.RHS.get(), Instructions);
+	Instruction I;
+	I.Opcode_ = Opcode::SCALAR_ARITH_EVAL;
+	I.Operands.push_back(OutCol);
+	I.Operands.push_back(B.Op);
+	I.Operands.push_back(L);
+	I.Operands.push_back(R);
+	Instructions.push_back(std::move(I));
+}
+
+static void EmitCoalesceForColumn(const CoalesceExprAST &C, const std::string &OutCol,
+                                  BytecodeScratch &Instructions) {
+	if(C.Args.empty())
+		FailCodegen("COALESCE requires at least one argument.");
+	if(C.Args.size() == 1) {
+		if(const auto *Col = dynamic_cast<const ColumnRefAST *>(C.Args[0].get())) {
+			std::vector<CaseExprAST::Arm> NoArms;
+			EmitCaseEvalInstruction(
+			    CaseExprAST(std::move(NoArms), std::make_unique<ColumnRefAST>(Col->Name)), OutCol, Instructions);
+		} else {
+			const std::string Tmp = MaterializeScalarToColumn(C.Args[0].get(), Instructions);
+			std::vector<CaseExprAST::Arm> NoArms;
+			EmitCaseEvalInstruction(
+			    CaseExprAST(std::move(NoArms), std::make_unique<ColumnRefAST>(Tmp)), OutCol, Instructions);
+		}
+		return;
+	}
+	std::vector<CaseExprAST::Arm> Arms;
+	for(size_t I = 0; I + 1 < C.Args.size(); ++I) {
+		const std::string Tmp = MaterializeScalarToColumn(C.Args[I].get(), Instructions);
+		CaseExprAST::Arm A;
+		A.When = std::make_unique<IsNullPredAST>(std::make_unique<ColumnRefAST>(Tmp), true);
+		A.Then = std::make_unique<ColumnRefAST>(Tmp);
+		Arms.push_back(std::move(A));
+	}
+	const std::string ElseTmp = MaterializeScalarToColumn(C.Args.back().get(), Instructions);
+	EmitCaseEvalInstruction(
+	    CaseExprAST(std::move(Arms), std::make_unique<ColumnRefAST>(ElseTmp)), OutCol, Instructions);
+}
+
+static void EmitNvl2ForColumn(const Nvl2ExprAST &N, const std::string &OutCol, BytecodeScratch &Instructions) {
+	const std::string Subj = MaterializeScalarToColumn(N.Subject.get(), Instructions);
+	const std::string NotNull = MaterializeScalarToColumn(N.NotNullVal.get(), Instructions);
+	const std::string NullBr = MaterializeScalarToColumn(N.NullVal.get(), Instructions);
+	CaseExprAST::Arm A;
+	A.When = std::make_unique<IsNullPredAST>(std::make_unique<ColumnRefAST>(Subj), true);
+	A.Then = std::make_unique<ColumnRefAST>(NotNull);
+	std::vector<CaseExprAST::Arm> Arms;
+	Arms.push_back(std::move(A));
+	EmitCaseEvalInstruction(CaseExprAST(std::move(Arms), std::make_unique<ColumnRefAST>(NullBr)), OutCol,
+	                        Instructions);
 }
 
 static void EmitCaseEvalInstruction(const CaseExprAST &C, const std::string &OutCol,
@@ -513,6 +739,14 @@ static void EmitCaseEvalInstruction(const CaseExprAST &C, const std::string &Out
 static void EmitCastEvalInstruction(const CastExprAST &C, const std::string &OutCol, BytecodeScratch &Instructions) {
 	if(!C.Operand)
 		FailCodegen("CAST missing operand expression.");
+	if(!dynamic_cast<const LiteralAST *>(C.Operand.get()) &&
+	   !dynamic_cast<const ColumnRefAST *>(C.Operand.get()) &&
+	   !dynamic_cast<const NullLiteralAST *>(C.Operand.get())) {
+		const std::string Tmp = MaterializeScalarToColumn(C.Operand.get(), Instructions);
+		CastExprAST Simple(std::make_unique<ColumnRefAST>(Tmp), C.Target, C.TargetTypeSql);
+		EmitCastEvalInstruction(Simple, OutCol, Instructions);
+		return;
+	}
 	Instruction I;
 	I.Opcode_ = Opcode::CAST_EVAL;
 	I.Operands.push_back(OutCol);
@@ -583,6 +817,12 @@ static void EmitScalarFuncEvalInstruction(const ScalarFuncExprAST &F, const std:
 	case ScalarSqlFn::MatrixVec:
 		Need = 2;
 		break;
+	case ScalarSqlFn::RegexpMatch:
+		Need = 2;
+		break;
+	case ScalarSqlFn::ListTransform:
+		Need = 2;
+		break;
 	default:
 		if(MathSci::IsMathSciScalarFn(F.Fn)) {
 			const auto Ar = MathSci::ArityFor(F.Fn);
@@ -609,7 +849,13 @@ static void EmitScalarFuncEvalInstruction(const ScalarFuncExprAST &F, const std:
 	for(const auto &A : F.Args) {
 		if(!A)
 			FailCodegen("Internal: scalar builtin null argument.");
-		AppendCaseScalarPayload(I, A.get());
+		if(dynamic_cast<const ScalarFuncExprAST *>(A.get())) {
+			const std::string SrcCol = MaterializeScalarToColumn(A.get(), Instructions);
+			I.Operands.push_back(static_cast<int64_t>(1));
+			I.Operands.push_back(SrcCol);
+		} else {
+			AppendCaseScalarPayload(I, A.get());
+		}
 	}
 	Instructions.push_back(std::move(I));
 }
@@ -680,6 +926,26 @@ static void EmitCodegenColumnConstraints(const std::vector<std::string> &Constra
 
 } // namespace
 
+void CoalesceExprAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	(void)Instructions;
+	FailCodegen("Internal: COALESCE projection is lowered via Opcode::CASE_EVAL in codegen.");
+}
+
+void Nvl2ExprAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	(void)Instructions;
+	FailCodegen("Internal: NVL2 projection is lowered via Opcode::CASE_EVAL in codegen.");
+}
+
+void LambdaExprAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	(void)Instructions;
+	FailCodegen("Internal: lambda expressions are lowered at their call site.");
+}
+
+void ColumnsExprAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	(void)Instructions;
+	FailCodegen("Internal: COLUMNS(...) is expanded via Opcode::COLUMNS_EXPAND.");
+}
+
 void NullLiteralAST::EmitBytecode(BytecodeScratch &) const {
 	FailCodegen("Internal: NULL literal should not emit standalone bytecode.");
 }
@@ -702,6 +968,10 @@ void IsNullPredAST::EmitBytecode(BytecodeScratch &) const {
 
 void ExistsPredAST::EmitBytecode(BytecodeScratch &) const {
 	FailCodegen("Internal: EXISTS should not emit standalone bytecode.");
+}
+
+void InSubqueryPredAST::EmitBytecode(BytecodeScratch &) const {
+	FailCodegen("Internal: IN subquery should not emit standalone bytecode.");
 }
 
 void CaseExprAST::EmitBytecode(BytecodeScratch &) const {
@@ -923,7 +1193,9 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 		FailCodegen("GROUPING SETS requires at least one grouping set.");
 
 	std::string Work = ResolveRelationLogicalName(MaterializedTable, Instructions);
-	const std::string FromBase = ResolveRelationLogicalName(Table_, Instructions);
+	std::string FromBase = ResolveRelationLogicalName(Table_, Instructions);
+	if(IsDialectDualTable(Table_))
+		FromBase = std::string(kDialectDualInternal);
 	if(Work != FromBase)
 		AppendInstruction(Instructions, MakeInstruction(Opcode::CLONE_TABLE, Work, FromBase));
 	for(size_t Ij = 0; Ij < JoinSpecs().size(); ++Ij) {
@@ -976,8 +1248,30 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 		Instructions.push_back(std::move(Mi));
 	}
 
-	for(const auto &Column : Columns_)
+	size_t StaticSelectCols = 0;
+	for(const auto &Column : Columns_) {
+		if(Column.rfind(kColumnsExpandPrefix, 0) == 0) {
+			continue;
+		}
+		++StaticSelectCols;
 		AppendInstruction(Instructions, MakeInstruction(Opcode::SELECT, Column));
+	}
+	for(size_t Pi = 0; Pi < ProjectionExprs_.size(); ++Pi) {
+		if(const auto *Cx = dynamic_cast<const ColumnsExprAST *>(ProjectionExprs_[Pi].get())) {
+			Instruction Ci;
+			Ci.Opcode_ = Opcode::COLUMNS_EXPAND;
+			Ci.Operands.push_back(Work);
+			Ci.Operands.push_back(static_cast<int64_t>(static_cast<int>(Cx->Mode)));
+			if(Cx->Mode == ColumnsPickMode::Glob)
+				Ci.Operands.push_back(Cx->GlobPattern);
+			else if(Cx->Mode == ColumnsPickMode::Lambda && Cx->Lambda)
+				Ci.Operands.push_back(SerializeLambdaExpr(*Cx->Lambda));
+			else
+				Ci.Operands.push_back(std::string());
+			Ci.Operands.push_back(static_cast<int64_t>(StaticSelectCols));
+			Instructions.push_back(std::move(Ci));
+		}
+	}
 	AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Work));
 
 	if(WhereRoot()) {
@@ -986,6 +1280,26 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 			FailCodegen(
 			    "WHERE clause shape is not supported yet for this statement (predicate grammar extension required).");
 		Instructions.push_back(MakeFilterDnf(Branches));
+	}
+
+	if(ConnectBy()) {
+		const ConnectBySpec &Cb = *ConnectBy();
+		Instruction Cbi;
+		Cbi.Opcode_ = Opcode::CONNECT_BY_EXPAND;
+		Cbi.Operands.push_back(Work);
+		Cbi.Operands.push_back(Cb.ParentColumn);
+		Cbi.Operands.push_back(Cb.ChildColumn);
+		Cbi.Operands.push_back(static_cast<int64_t>(Cb.PriorOnParent ? 1 : 0));
+		std::string StartBlob;
+		if(Cb.StartWith) {
+			std::vector<std::vector<RowTriple>> Branches;
+			if(!BuildWhereDnf(Cb.StartWith.get(), Branches))
+				FailCodegen("START WITH predicate is not supported for CONNECT BY lowering.");
+			PackDnfOperandsBlob(Branches, StartBlob);
+		}
+		Cbi.Operands.push_back(StartBlob);
+		Cbi.Operands.push_back(static_cast<int64_t>(Cb.NoCycle ? 1 : 0));
+		Instructions.push_back(std::move(Cbi));
 	}
 
 	if(DistinctSelected())
@@ -1083,8 +1397,8 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 		WI.Operands.push_back(KindTag);
 		WI.Operands.push_back(Ws.SourceColumn);
 		WI.Operands.push_back(Ws.FrameOffset);
-		WI.Operands.push_back(static_cast<int64_t>(Ws.HasExplicitRowsFrame ? 1 : 0));
-		if(Ws.HasExplicitRowsFrame) {
+		WI.Operands.push_back(static_cast<int64_t>(Ws.HasExplicitFrame ? (Ws.FrameUnit == WindowFrameUnit::Range ? 2 : 1) : 0));
+		if(Ws.HasExplicitFrame) {
 			WI.Operands.push_back(static_cast<int64_t>(Ws.FrameStart.Kind));
 			WI.Operands.push_back(Ws.FrameStart.Offset);
 			WI.Operands.push_back(static_cast<int64_t>(Ws.FrameEnd.Kind));
@@ -1097,17 +1411,33 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 		const auto &Ptr = ProjectionExprs_[Pi];
 		if(!Ptr)
 			continue;
+		if(dynamic_cast<const ColumnsExprAST *>(Ptr.get()))
+			continue;
 		if(const auto *Ca = dynamic_cast<const CastExprAST *>(Ptr.get()))
 			EmitCastEvalInstruction(*Ca, Columns_[Pi], Instructions);
 		else if(const auto *Ce = dynamic_cast<const CaseExprAST *>(Ptr.get()))
 			EmitCaseEvalInstruction(*Ce, Columns_[Pi], Instructions);
+		else if(const auto *Co = dynamic_cast<const CoalesceExprAST *>(Ptr.get()))
+			EmitCoalesceForColumn(*Co, Columns_[Pi], Instructions);
+		else if(const auto *Nv = dynamic_cast<const Nvl2ExprAST *>(Ptr.get()))
+			EmitNvl2ForColumn(*Nv, Columns_[Pi], Instructions);
 		else if(const auto *Sf = dynamic_cast<const ScalarFuncExprAST *>(Ptr.get()))
 			EmitScalarFuncEvalInstruction(*Sf, Columns_[Pi], Instructions);
 		else if(const auto *Gx = dynamic_cast<const GroupingExprAST *>(Ptr.get()))
 			EmitGroupingEvalInstruction(*Gx, Columns_[Pi], Instructions);
 		else if(const auto *Gid = dynamic_cast<const GroupingIdExprAST *>(Ptr.get()))
 			EmitGroupingIdEvalInstruction(*Gid, Columns_[Pi], Instructions);
-		else
+		else if(const auto *Bx = dynamic_cast<const BinaryOpAST *>(Ptr.get()))
+			EmitBinaryArithForColumn(*Bx, Columns_[Pi], Instructions);
+		else if(const auto *Cr = dynamic_cast<const ColumnRefAST *>(Ptr.get())) {
+			Instruction I;
+			I.Opcode_ = Opcode::CASE_EVAL;
+			I.Operands.push_back(Columns_[Pi]);
+			I.Operands.push_back(0LL);
+			I.Operands.push_back(1LL);
+			I.Operands.push_back(Cr->Name);
+			Instructions.push_back(std::move(I));
+		} else
 			FailCodegen("Internal: unsupported SELECT projection expression.");
 	}
 }
@@ -1127,7 +1457,19 @@ void SelectAST::EmitOrderingFinalize(BytecodeScratch &Instructions) const {
 	else if(Lim >= 0)
 		AppendInstruction(Instructions, MakeInstruction(Opcode::LIMIT, Lim));
 
-	AppendInstruction(Instructions, MakeInstruction(Opcode::SELECT, static_cast<int64_t>(Columns_.size())));
+	size_t StaticSelectCols = 0;
+	bool HasDynamicColumns = false;
+	for(const auto &Column : Columns_) {
+		if(Column.rfind(kColumnsExpandPrefix, 0) == 0)
+			HasDynamicColumns = true;
+		else
+			++StaticSelectCols;
+	}
+	if(HasDynamicColumns)
+		AppendInstruction(Instructions, MakeInstruction(Opcode::SELECT, static_cast<int64_t>(StaticSelectCols),
+		                                                static_cast<int64_t>(1)));
+	else
+		AppendInstruction(Instructions, MakeInstruction(Opcode::SELECT, static_cast<int64_t>(Columns_.size())));
 }
 
 void CompoundSelectAST::EmitBytecode(BytecodeScratch &Instructions) const {
@@ -1239,37 +1581,90 @@ void WithSelectAST::EmitBytecode(BytecodeScratch& Instructions) const {
 }
 
 void InsertAST::EmitBytecode(BytecodeScratch& Instructions) const {
+	const bool DoReturning = HasReturning;
+	const int64_t RetNRet = ReturningAll ? static_cast<int64_t>(-1) : static_cast<int64_t>(ReturningColumns.size());
+	const std::string RetTable = "__astral_returning";
+	std::size_t RowIx = 0;
 	for(const auto &RowValue : Values) {
+		const int64_t RetReset = DoReturning && RowIx == 0 ? 1LL : 0LL;
+		if(!Columns.empty() && Columns.size() != RowValue.size())
+			FailCodegen("INSERT column count does not match VALUES count.");
+		const size_t K = RowValue.size();
 		AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Table->TableName));
 		for(const auto &Column : Columns)
 			AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Column));
-		for(const auto &Val : RowValue)
-			AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Val));
+		for(const auto &Val : RowValue) {
+			const auto Cell = TryConstEvalInsertExpr(Val.get());
+			if(!Cell)
+				FailCodegen(
+				    "INSERT VALUES must be literals, NULL, NEXTVAL(...), or constant scalar expressions "
+				    "(e.g. ST_MESH('V[…]', 'L[…]')) in this dialect.");
+			AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, *Cell));
+		}
 		const int64_t Explicit = Columns.empty() ? 0LL : 1LL;
 		if(Upsert_) {
 			const UpsertSpec &U = *Upsert_;
 			const int64_t DoNothing = U.Mode == UpsertSpec::OnConflict::Nothing ? 1LL : 0LL;
+			std::vector<UpsertAssign> ReplaceBuilt;
+			const std::vector<UpsertAssign> *Assignments = &U.UpdateAssignments;
+			if(U.SqliteReplace && U.UpdateAssignments.empty() && !Columns.empty()) {
+				for(const auto &C : Columns) {
+					UpsertAssign Asg;
+					Asg.Column = C;
+					Asg.Value = std::make_unique<QualifiedRefAST>(QualifiedRefAST::Role::Excluded, C);
+					ReplaceBuilt.push_back(std::move(Asg));
+				}
+				Assignments = &ReplaceBuilt;
+			}
 			std::vector<Value> Ops;
-			Ops.reserve(6 + U.ConflictColumns.size() + U.UpdateAssignments.size() * 2 + 4);
-			Ops.push_back(static_cast<int64_t>(RowValue.size()));
+			Ops.reserve(7 + U.ConflictColumns.size() + Assignments->size() * 2 + 4
+			            + (DoReturning ? (3 + (RetNRet >= 0 ? static_cast<size_t>(RetNRet) : 0ULL)) : 0ULL));
+			Ops.push_back(static_cast<int64_t>(K));
 			Ops.push_back(Explicit);
 			Ops.push_back(DoNothing);
 			Ops.push_back(static_cast<int64_t>(U.ConflictColumns.size()));
 			for(const auto &C : U.ConflictColumns)
 				Ops.push_back(C);
-			Ops.push_back(static_cast<int64_t>(U.UpdateAssignments.size()));
-			for(const auto &Asg : U.UpdateAssignments) {
+			Ops.push_back(U.SqliteReplace ? (U.SqliteReplaceImplicitSchema ? static_cast<int64_t>(2) :
+			                                                               static_cast<int64_t>(1)) :
+			                              static_cast<int64_t>(0));
+			Ops.push_back(static_cast<int64_t>(Assignments->size()));
+			for(const auto &Asg : *Assignments) {
 				Ops.push_back(Asg.Column);
 				Ops.push_back(SerializeSetValueExpr(Asg.Value.get()));
+			}
+			if(DoReturning) {
+				Ops.push_back(RetTable);
+				Ops.push_back(RetReset);
+				Ops.push_back(RetNRet);
+				if(RetNRet >= 0) {
+					for(const std::string &C : ReturningColumns)
+						Ops.push_back(C);
+				}
 			}
 			Instruction Up;
 			Up.Opcode_ = Opcode::UPSERT;
 			Up.Operands = std::move(Ops);
 			AppendInstruction(Instructions, Up);
 		} else {
-			AppendInstruction(Instructions,
-			                   MakeInstruction(Opcode::INSERT, static_cast<int64_t>(RowValue.size()), Explicit));
+			if(!DoReturning) {
+				AppendInstruction(Instructions, MakeInstruction(Opcode::INSERT, static_cast<int64_t>(K), Explicit));
+			} else {
+				Instruction Ins;
+				Ins.Opcode_ = Opcode::INSERT;
+				Ins.Operands.push_back(static_cast<int64_t>(K));
+				Ins.Operands.push_back(Explicit);
+				Ins.Operands.push_back(RetTable);
+				Ins.Operands.push_back(RetReset);
+				Ins.Operands.push_back(RetNRet);
+				if(RetNRet >= 0) {
+					for(const std::string &C : ReturningColumns)
+						Ins.Operands.push_back(C);
+				}
+				AppendInstruction(Instructions, std::move(Ins));
+			}
 		}
+		++RowIx;
 	}
 }
 
@@ -1304,12 +1699,9 @@ void MergeAST::EmitBytecode(BytecodeScratch &Instructions) const {
 void BulkInsertAST::EmitBytecode(BytecodeScratch& Instructions) const {
 	if(Count <= 0)
 		FailCodegen("BULK INSERT row count must be a positive integer.");
-	if(static_cast<std::uint64_t>(Count) > Limits::MaxBulkInsertRows)
+	if(static_cast<std::uint64_t>(Count) > Limits::MaxBulkInsertRowsBench)
 		FailCodegen("BULK INSERT row count exceeds the configured maximum (see server limits).");
-	const bool Implicit = Columns.empty();
-	if(!Implicit && Columns.size() != 5)
-		FailCodegen("BULK INSERT with a column list must name exactly these columns: id, a, b, c, d.");
-	(void)Implicit;
+	(void)Columns;
 	AppendInstruction(Instructions,
 	                  MakeInstruction(Opcode::INSERT_BULK, TableName, Count, StartId, Step));
 }
@@ -1321,7 +1713,17 @@ void UpdateAST::EmitBytecode(BytecodeScratch& Instructions) const {
 			FailCodegen("Unsupported WHERE on UPDATE (extend SQLite-lite predicate grammar).");
 	} else
 		Branches.push_back({}); /* tautology: UPDATE all rows (consistent with DELETE without WHERE). */
-	Instructions.push_back(MakeUpdateDnf(TableName, Assignments, Branches));
+	Instruction I = MakeUpdateDnf(TableName, Assignments, Branches);
+	if(HasReturning) {
+		const int64_t RetNRet = ReturningAll ? static_cast<int64_t>(-1) : static_cast<int64_t>(ReturningColumns.size());
+		I.Operands.push_back(std::string("__astral_returning"));
+		I.Operands.push_back(RetNRet);
+		if(RetNRet >= 0) {
+			for(const std::string &C : ReturningColumns)
+				I.Operands.push_back(C);
+		}
+	}
+	Instructions.push_back(std::move(I));
 }
 
 void DeleteAST::EmitBytecode(BytecodeScratch& Instructions) const {
@@ -1329,7 +1731,31 @@ void DeleteAST::EmitBytecode(BytecodeScratch& Instructions) const {
 		std::vector<std::vector<RowTriple>> Branches;
 		if(!BuildWhereDnf(Condition.get(), Branches))
 			FailCodegen("Unsupported WHERE on DELETE.");
-		Instructions.push_back(MakeDeleteDnf(TableName, Branches));
+		Instruction I = MakeDeleteDnf(TableName, Branches);
+		if(HasReturning) {
+			const int64_t RetNRet = ReturningAll ? static_cast<int64_t>(-1) : static_cast<int64_t>(ReturningColumns.size());
+			I.Operands.push_back(std::string("__astral_returning"));
+			I.Operands.push_back(RetNRet);
+			if(RetNRet >= 0) {
+				for(const std::string &C : ReturningColumns)
+					I.Operands.push_back(C);
+			}
+		}
+		Instructions.push_back(std::move(I));
+		return;
+	}
+	if(HasReturning) {
+		std::vector<std::vector<RowTriple>> Branches;
+		Branches.push_back({}); /* tautology: DELETE all rows. */
+		Instruction I = MakeDeleteDnf(TableName, Branches);
+		const int64_t RetNRet = ReturningAll ? static_cast<int64_t>(-1) : static_cast<int64_t>(ReturningColumns.size());
+		I.Operands.push_back(std::string("__astral_returning"));
+		I.Operands.push_back(RetNRet);
+		if(RetNRet >= 0) {
+			for(const std::string &C : ReturningColumns)
+				I.Operands.push_back(C);
+		}
+		Instructions.push_back(std::move(I));
 		return;
 	}
 	AppendInstruction(Instructions, MakeInstruction(Opcode::DELETE, TableName));
@@ -1347,6 +1773,8 @@ void BinaryOpAST::EmitBytecode(BytecodeScratch& Instructions) const {
 		SqlOp = Opcode::MUL;
 	else if(Op == "/")
 		SqlOp = Opcode::DIV;
+	else if(Op == "//")
+		SqlOp = Opcode::INT_DIV;
 	else if(Op == "%")
 		SqlOp = Opcode::MOD;
 	else if(Op == "==" || Op == "=")
@@ -1414,6 +1842,21 @@ void DropRoleAST::EmitBytecode(BytecodeScratch &Instructions) const {
 	AppendInstruction(Instructions, MakeInstruction(Opcode::DROP_ROLE, RoleName));
 }
 
+void CreateUserAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions,
+	                  MakeInstruction(Opcode::CREATE_USER, UserName, Password,
+	                                  static_cast<int64_t>(IfNotExists ? 1 : 0)));
+}
+
+void DropUserAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions,
+	                  MakeInstruction(Opcode::DROP_USER, UserName, static_cast<int64_t>(IfExists ? 1 : 0)));
+}
+
+void AlterUserPasswordAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions, MakeInstruction(Opcode::ALTER_USER_PASSWORD, UserName, Password));
+}
+
 void CreateSequenceAST::EmitBytecode(BytecodeScratch &Instructions) const {
 	AppendInstruction(Instructions,
 	                  MakeInstruction(Opcode::CREATE_SEQUENCE, SequenceName, Start, Increment,
@@ -1446,6 +1889,15 @@ void RepackConcurrentlyAST::EmitBytecode(BytecodeScratch &Instructions) const {
 
 void DropDatasetAST::EmitBytecode(BytecodeScratch &Instructions) const {
 	AppendInstruction(Instructions, MakeInstruction(Opcode::DROP_DATASET, DatasetName));
+}
+
+void CreateEmbeddingAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions, MakeInstruction(Opcode::REGISTER_EMBEDDING, EmbeddingName, SourceTable, TokenColumn,
+	                                              VectorColumn));
+}
+
+void DropEmbeddingAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions, MakeInstruction(Opcode::DROP_EMBEDDING, EmbeddingName));
 }
 
 void CreateGraphAST::EmitBytecode(BytecodeScratch &Instructions) const {
@@ -1510,9 +1962,17 @@ void DropViewAST::EmitBytecode(BytecodeScratch &Instructions) const {
 }
 
 void CreateProcedureAST::EmitBytecode(BytecodeScratch &Instructions) const {
-	AppendInstruction(Instructions,
-	                  MakeInstruction(Opcode::CREATE_PROCEDURE, ProcedureName, BodySql_,
-	                                  static_cast<int64_t>(IfNotExists ? 1 : 0)));
+	if(ExceptionHandlers_.empty())
+		AppendInstruction(Instructions,
+		                  MakeInstruction(Opcode::CREATE_PROCEDURE, ProcedureName, BodySql_,
+		                                  static_cast<int64_t>(IfNotExists ? 1 : 0),
+		                                  static_cast<int64_t>(OrReplace ? 1 : 0), SourceDialect_));
+	else
+		AppendInstruction(Instructions,
+		                  MakeInstruction(Opcode::CREATE_PROCEDURE, ProcedureName, BodySql_,
+		                                  static_cast<int64_t>(IfNotExists ? 1 : 0),
+		                                  static_cast<int64_t>(OrReplace ? 1 : 0), SourceDialect_,
+		                                  EncodeExceptionHandlersJson(ExceptionHandlers_)));
 }
 
 void DropProcedureAST::EmitBytecode(BytecodeScratch &Instructions) const {
@@ -1522,7 +1982,27 @@ void DropProcedureAST::EmitBytecode(BytecodeScratch &Instructions) const {
 }
 
 void CallProcedureAST::EmitBytecode(BytecodeScratch &Instructions) const {
-	AppendInstruction(Instructions, MakeInstruction(Opcode::CALL_PROCEDURE, ProcedureName));
+	AppendInstruction(Instructions, MakeInstruction(Opcode::CALL_PROCEDURE, ProcedureName, InvokeKind));
+}
+
+void CreateTriggerAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions,
+	                  MakeInstruction(Opcode::CREATE_TRIGGER, TriggerName, TableName,
+	                                  static_cast<int64_t>(static_cast<int>(Timing)),
+	                                  static_cast<int64_t>(static_cast<int>(Event)),
+	                                  static_cast<int64_t>(ForEachRow ? 1 : 0), ActionKind, ProcedureName,
+	                                  BodySql_, static_cast<int64_t>(IfNotExists ? 1 : 0),
+	                                  static_cast<int64_t>(OrReplace ? 1 : 0)));
+}
+
+void DropTriggerAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions,
+	                  MakeInstruction(Opcode::DROP_TRIGGER, TriggerName, static_cast<int64_t>(IfExists ? 1 : 0)));
+}
+
+void AlterTriggerAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions,
+	                  MakeInstruction(Opcode::ALTER_TRIGGER, TriggerName, static_cast<int64_t>(Enable ? 1 : 0)));
 }
 
 Bytecode BuildBytecode(Logger *Logger, OptimizationLevel OptLevel, const AstralDB::Database *ViewCatalogDb) {
@@ -1572,6 +2052,7 @@ Bytecode BuildBytecode(Logger *Logger, OptimizationLevel OptLevel, const AstralD
 	}
 
 	RunGraphOptimizerPipeline(Result, OptLevel, Logger);
+	RunMathSciOptimizerPipeline(Result, OptLevel, Logger);
 	RunOptimizerPipeline(Result, OptLevel, Logger);
 	RunGraphOptimizerPipeline(Result, OptLevel, Logger);
 

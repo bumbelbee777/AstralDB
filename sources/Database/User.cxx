@@ -41,7 +41,8 @@ void User::RegenerateSessionSalt() {
 	std::random_device rd;
 	std::mt19937 gen(rd());
 	std::uniform_int_distribution<int> dis(0, 255);
-	for(auto& b : SessionSalt_) b = dis(gen);
+	for(auto &B : SessionSalt_)
+		B = static_cast<uint8_t>(dis(gen));
 	InitSalts();
 }
 
@@ -53,9 +54,9 @@ std::vector<uint8_t> User::GetCombinedSalt() {
 	return combined;
 }
 
-std::vector<uint8_t> User::SaltAndHashPassword(const std::string& Password) const {
+std::vector<uint8_t> User::SaltAndHashPassword(const std::string &PlainPassword) const {
 	InitSalts();
-	std::vector<uint8_t> Input(Password.begin(), Password.end());
+	std::vector<uint8_t> Input(PlainPassword.begin(), PlainPassword.end());
 	auto Hash = Blake3::Hash(Input);
 	auto Salt = GetCombinedSalt();
 	std::vector<uint8_t> Salted(Hash.begin(), Hash.end());

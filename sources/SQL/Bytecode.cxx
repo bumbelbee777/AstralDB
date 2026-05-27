@@ -2,16 +2,20 @@
 #include <SQL/Bytecode.hxx>
 #include <SQL/BytecodeDebug.hxx>
 #include <SQL/BytecodeProcedures.hxx>
+#include <SQL/BytecodeTriggers.hxx>
 #include <SQL/SetExprEval.hxx>
 #include <SQL/SQL.hxx>
 #include <IO/Limits.hxx>
 #include <IO/Error.hxx>
 #include <Database/AdvancedTypes.hxx>
 #include <Database/MathSci.hxx>
+#include <Database/MathSciComplex.hxx>
+#include <Database/MathSciEmbeddings.hxx>
 #include <SQL/JsonSql.hxx>
 #include <DS/JSON.hxx>
 #include <SQL/MatchRecognize.hxx>
 #include <SQL/TextSearch.hxx>
+#include <SQL/DialectCompat.hxx>
 #include <Database/TextIndex.hxx>
 #include <IO/MathUtil.hxx>
 #include <Database/ColumnarStorage.hxx>
@@ -116,6 +120,94 @@ static std::optional<double> TryParseWindowNumeric(const std::string &Cell) {
 	return std::nullopt;
 }
 
+static std::pair<size_t, size_t> ResolveRangeFrameLocalBounds(const Database::Table &WT, size_t Pf, size_t Ps,
+                                                              size_t LocalIdx, const std::string &OrderCol,
+                                                              bool Ascending, WindowFrameBound Start,
+                                                              WindowFrameBound End) {
+	const auto OrdAt = [&](size_t Local) -> std::string {
+		const auto It = WT[Pf + Local].find(OrderCol);
+		return It == WT[Pf + Local].end() ? std::string() : It->second;
+	};
+	const auto OrdLessEq = [&](size_t A, size_t B) -> bool {
+		const std::string Va = OrdAt(A);
+		const std::string Vb = OrdAt(B);
+		if(const auto Na = TryParseWindowNumeric(Va)) {
+			if(const auto Nb = TryParseWindowNumeric(Vb))
+				return Ascending ? *Na <= *Nb : *Na >= *Nb;
+		}
+		return Ascending ? Va <= Vb : Va >= Vb;
+	};
+	const std::string CurOrd = OrdAt(LocalIdx);
+	const auto CurNum = TryParseWindowNumeric(CurOrd);
+	auto SatisfiesStart = [&](size_t Local) -> bool {
+		switch(Start.Kind) {
+		case WindowFrameBoundKind::UnboundedPreceding:
+			return true;
+		case WindowFrameBoundKind::CurrentRow:
+			return Local == LocalIdx;
+		case WindowFrameBoundKind::Preceding:
+			if(!CurNum)
+				return Local + Start.Offset >= LocalIdx;
+			if(const auto On = TryParseWindowNumeric(OrdAt(Local))) {
+				const double Th = *CurNum - static_cast<double>(Start.Offset);
+				return Ascending ? *On >= Th : *On <= Th;
+			}
+			return OrdLessEq(Local, LocalIdx);
+		case WindowFrameBoundKind::Following:
+			if(!CurNum)
+				return Local <= LocalIdx + static_cast<size_t>(Start.Offset);
+			if(const auto On = TryParseWindowNumeric(OrdAt(Local))) {
+				const double Th = *CurNum + static_cast<double>(Start.Offset);
+				return Ascending ? *On >= Th : *On <= Th;
+			}
+			return OrdLessEq(LocalIdx, Local);
+		case WindowFrameBoundKind::UnboundedFollowing:
+			return true;
+		}
+		return false;
+	};
+	auto SatisfiesEnd = [&](size_t Local) -> bool {
+		switch(End.Kind) {
+		case WindowFrameBoundKind::UnboundedPreceding:
+			return true;
+		case WindowFrameBoundKind::CurrentRow:
+			return Local == LocalIdx;
+		case WindowFrameBoundKind::Preceding:
+			if(!CurNum)
+				return Local + End.Offset >= LocalIdx;
+			if(const auto On = TryParseWindowNumeric(OrdAt(Local))) {
+				const double Th = *CurNum - static_cast<double>(End.Offset);
+				return Ascending ? *On <= Th : *On >= Th;
+			}
+			return OrdLessEq(Local, LocalIdx);
+		case WindowFrameBoundKind::Following:
+			if(!CurNum)
+				return Local <= LocalIdx + static_cast<size_t>(End.Offset);
+			if(const auto On = TryParseWindowNumeric(OrdAt(Local))) {
+				const double Th = *CurNum + static_cast<double>(End.Offset);
+				return Ascending ? *On <= Th : *On >= Th;
+			}
+			return OrdLessEq(LocalIdx, Local);
+		case WindowFrameBoundKind::UnboundedFollowing:
+			return true;
+		}
+		return false;
+	};
+	size_t Lo = LocalIdx;
+	size_t Hi = LocalIdx;
+	for(size_t L = 0; L <= LocalIdx; ++L) {
+		if(SatisfiesStart(L)) {
+			Lo = L;
+			break;
+		}
+	}
+	for(size_t L = LocalIdx; L < Ps; ++L) {
+		if(SatisfiesEnd(L))
+			Hi = L;
+	}
+	return {Lo, Hi};
+}
+
 static void WriteWindowAggregate(Database::Item &Row, const std::string &OutCol, int OrdKind,
                                  const Database::Table &WT, size_t Lo, size_t Hi, const std::string &SrcCol) {
 	bool Any = false;
@@ -204,14 +296,19 @@ bool CellCompare(const std::string &lhs, const std::string &rhs, const std::stri
 static constexpr const char *kOpIsNull = "__IS_NULL__";
 static constexpr const char *kOpIsNotNull = "__IS_NOT_NULL__";
 static constexpr const char *kOpIn = "__IN__";
+static constexpr const char *kOpNotIn = "__NOT_IN__";
+static constexpr char kInSubPredColBytecode[] = "__ASTRAL_IN_SUBQUERY__";
 
 static bool CellIsSqlNull(const Database::Item &Row, const std::string &Col) {
 	auto It = Row.find(Col);
-	return It == Row.end() || It->second.empty();
+	if(It == Row.end())
+		return true;
+	const std::string &V = It->second;
+	return V.empty() || V == "NULL";
 }
 
 static bool SqlCellIsNullValue(std::string_view V) {
-	return V.empty();
+	return V.empty() || V == "NULL";
 }
 
 /** SQL UNKNOWN: comparisons involving NULL (empty cell) do not satisfy WHERE. */
@@ -220,9 +317,11 @@ static bool ComparisonOperandIsNull(const std::string &Lhs, const std::string &R
 		return false;
 	if(SqlCellIsNullValue(Lhs))
 		return true;
-	if(Op == kOpIn)
+	if(Op == kOpIn || Op == kOpNotIn)
 		return false;
-	if(Op == "LIKE" || Op == "NOT LIKE" || Op == "MATCH" || Op == "NOT MATCH")
+	if(Op == "LIKE" || Op == "NOT LIKE" || Op == "ILIKE" || Op == "NOT ILIKE" || Op == "GLOB" ||
+	   Op == "NOT GLOB" || Op == "REGEXP" || Op == "NOT REGEXP" || Op == "REGEXP_ICASE" || Op == "NOT REGEXP_ICASE"
+	   || Op == "~" || Op == "!~" || Op == "~*" || Op == "!~*" || Op == "MATCH" || Op == "NOT MATCH")
 		return SqlCellIsNullValue(Rhs);
 	return SqlCellIsNullValue(Rhs);
 }
@@ -355,6 +454,19 @@ static bool DecodeExistPayload(const std::string &Rhs, bool &NegOut, std::vector
 	return DecodePackedDnfOperands(Rhs, Split + 1, Rhs.size(), Inner);
 }
 
+static bool DecodeInSubqueryPayload(const std::string &Rhs, bool &NegOut, std::string &InnerCol,
+                                    std::vector<std::vector<RowTriple>> &Inner) {
+	const size_t Split = Rhs.find('\x1E');
+	if(Split == std::string::npos || Split == 0 || (Rhs[0] != '0' && Rhs[0] != '1'))
+		return false;
+	NegOut = Rhs[0] == '1';
+	const size_t ColEnd = Rhs.find('\x1E', Split + 1);
+	if(ColEnd == std::string::npos)
+		return false;
+	InnerCol.assign(Rhs.data() + Split + 1, ColEnd - Split - 1);
+	return DecodePackedDnfOperands(Rhs, ColEnd + 1, Rhs.size(), Inner);
+}
+
 static bool MatchWhereDnf(const Database *Db, const std::string &ContextTable, const Database::Item &Row,
                           const std::vector<std::vector<RowTriple>> &Dnf);
 
@@ -381,17 +493,72 @@ static bool ExistPredicateHolds(const Database *Db, const RowTriple &Pred, const
 	return Neg ? !Any : Any;
 }
 
+static std::string FirstInnerColumnValue(const Database *Db, const std::string &InnerRelation,
+                                         const Database::Item &InnerRow, const std::string &InnerCol) {
+	if(!InnerCol.empty()) {
+		auto It = InnerRow.find(InnerCol);
+		return It == InnerRow.end() ? std::string() : It->second;
+	}
+	const auto Sch = Db->TableSchemaAssumeDbMutexHeld(InnerRelation);
+	if(Sch && !Sch->empty()) {
+		auto It = InnerRow.find(Sch->front().Name);
+		return It == InnerRow.end() ? std::string() : It->second;
+	}
+	for(const auto &KV : InnerRow)
+		return KV.second;
+	return std::string();
+}
+
+static bool InSubqueryPredicateHolds(const Database *Db, const RowTriple &Pred, const Database::Item &EnclosingRow) {
+	const auto &[LhsCol, Op, Rhs] = Pred;
+	(void)Op;
+	if(!Db)
+		FailVm("INTERNAL: IN subquery evaluation requires Database context");
+	const size_t TblSplit = Rhs.find('\x1E');
+	if(TblSplit == std::string::npos)
+		return false;
+	const std::string InnerTable(Rhs.data(), TblSplit);
+	const std::string Payload = Rhs.substr(TblSplit + 1);
+	bool Neg = false;
+	std::string InnerCol;
+	std::vector<std::vector<RowTriple>> Inner;
+	if(!DecodeInSubqueryPayload(Payload, Neg, InnerCol, Inner))
+		return Neg;
+	const auto Tit = Db->Tables_.find(InnerTable);
+	if(Tit == Db->Tables_.end())
+		return Neg;
+	auto ItLhs = EnclosingRow.find(LhsCol);
+	const std::string LhsVal = ItLhs == EnclosingRow.end() ? "" : ItLhs->second;
+	if(SqlCellIsNullValue(LhsVal))
+		return false;
+	bool Any = false;
+	for(const auto &InnerRow : Tit->second.RowStore) {
+		const Database::Item Combined = MergeForExistsRow(Db, InnerTable, EnclosingRow, InnerRow);
+		if(!MatchWhereDnf(Db, InnerTable, Combined, Inner))
+			continue;
+		const std::string InnerVal = FirstInnerColumnValue(Db, InnerTable, InnerRow, InnerCol);
+		if(CellCompare(LhsVal, InnerVal, "=")) {
+			Any = true;
+			break;
+		}
+	}
+	return Neg ? !Any : Any;
+}
+
 static bool MatchOnePredicate(const Database *Db, const std::string &ContextTable, const Database::Item &Row,
                               const RowTriple &Pred) {
 	(void)ContextTable;
 	const auto &[Col, Op, Rhs] = Pred;
 	if(Col == kExistPredColBytecode)
 		return ExistPredicateHolds(Db, Pred, Row);
+	if(Op == kInSubPredColBytecode)
+		return InSubqueryPredicateHolds(Db, Pred, Row);
 	auto ItCol = Row.find(Col);
 	const std::string Lhs = ItCol == Row.end() ? "" : ItCol->second;
 
 	static constexpr size_t kRhsColMarkLen = sizeof(kAstRhsColMarker) - 1;
-	if(Op != kOpIsNull && Op != kOpIsNotNull && Op != kOpIn && Rhs.size() >= kRhsColMarkLen &&
+	if(Op != kOpIsNull && Op != kOpIsNotNull && Op != kOpIn && Op != kOpNotIn && Op != kInSubPredColBytecode &&
+	   Rhs.size() >= kRhsColMarkLen &&
 	   Rhs.compare(0, kRhsColMarkLen, kAstRhsColMarker, kRhsColMarkLen) == 0) {
 		const std::string_view RcolSv(Rhs.data() + kRhsColMarkLen, Rhs.size() - kRhsColMarkLen);
 		const std::string Rcol(RcolSv.begin(), RcolSv.end());
@@ -403,6 +570,22 @@ static bool MatchOnePredicate(const Database *Db, const std::string &ContextTabl
 			return SqlLike(Lhs, RhsVal);
 		if(Op == "NOT LIKE")
 			return !SqlLike(Lhs, RhsVal);
+		if(Op == "ILIKE")
+			return SqlLikeAsciiCaseInsensitive(Lhs, RhsVal);
+		if(Op == "NOT ILIKE")
+			return !SqlLikeAsciiCaseInsensitive(Lhs, RhsVal);
+		if(Op == "GLOB")
+			return SqlGlobMatch(Lhs, RhsVal);
+		if(Op == "NOT GLOB")
+			return !SqlGlobMatch(Lhs, RhsVal);
+		if(Op == "REGEXP" || Op == "~")
+			return SqlRegexpMatch(Lhs, RhsVal, false);
+		if(Op == "NOT REGEXP" || Op == "!~")
+			return !SqlRegexpMatch(Lhs, RhsVal, false);
+		if(Op == "REGEXP_ICASE" || Op == "~*")
+			return SqlRegexpMatch(Lhs, RhsVal, true);
+		if(Op == "NOT REGEXP_ICASE" || Op == "!~*")
+			return !SqlRegexpMatch(Lhs, RhsVal, true);
 		if(Op == "MATCH")
 			return TextSearch::MatchesQuery(Lhs, RhsVal);
 		if(Op == "NOT MATCH")
@@ -414,19 +597,22 @@ static bool MatchOnePredicate(const Database *Db, const std::string &ContextTabl
 		return CellIsSqlNull(Row, Col);
 	if(Op == kOpIsNotNull)
 		return !CellIsSqlNull(Row, Col);
-	if(Op == kOpIn) {
+	if(Op == kOpIn || Op == kOpNotIn) {
 		if(SqlCellIsNullValue(Lhs))
 			return false;
 		std::vector<std::string> Vals;
 		if(!SplitInList(Rhs, Vals))
 			return false;
+		bool Hit = false;
 		for(const auto &V : Vals) {
 			if(SqlCellIsNullValue(V))
 				continue;
-			if(CellCompare(Lhs, V, "="))
-				return true;
+			if(CellCompare(Lhs, V, "=")) {
+				Hit = true;
+				break;
+			}
 		}
-		return false;
+		return Op == kOpNotIn ? !Hit : Hit;
 	}
 	if(ComparisonOperandIsNull(Lhs, Rhs, Op))
 		return false;
@@ -434,6 +620,22 @@ static bool MatchOnePredicate(const Database *Db, const std::string &ContextTabl
 		return SqlLike(Lhs, Rhs);
 	if(Op == "NOT LIKE")
 		return !SqlLike(Lhs, Rhs);
+	if(Op == "ILIKE")
+		return SqlLikeAsciiCaseInsensitive(Lhs, Rhs);
+	if(Op == "NOT ILIKE")
+		return !SqlLikeAsciiCaseInsensitive(Lhs, Rhs);
+	if(Op == "GLOB")
+		return SqlGlobMatch(Lhs, Rhs);
+	if(Op == "NOT GLOB")
+		return !SqlGlobMatch(Lhs, Rhs);
+	if(Op == "REGEXP" || Op == "~")
+		return SqlRegexpMatch(Lhs, Rhs, false);
+	if(Op == "NOT REGEXP" || Op == "!~")
+		return !SqlRegexpMatch(Lhs, Rhs, false);
+	if(Op == "REGEXP_ICASE" || Op == "~*")
+		return SqlRegexpMatch(Lhs, Rhs, true);
+	if(Op == "NOT REGEXP_ICASE" || Op == "!~*")
+		return !SqlRegexpMatch(Lhs, Rhs, true);
 	if(Op == "MATCH")
 		return TextSearch::MatchesQuery(Lhs, Rhs);
 	if(Op == "NOT MATCH")
@@ -562,7 +764,7 @@ static std::optional<std::string> ReadCastProjectionSource(const Database::Item 
                                                            const std::string &Payload) {
 	if(SrcKind == 2)
 		return std::nullopt;
-	if(SrcKind == 0)
+	if(SrcKind == 0 || SrcKind == 5)
 		return Payload;
 	if(SrcKind != 1)
 		FailVm("CAST_EVAL: bad source operand kind");
@@ -843,72 +1045,22 @@ static std::optional<std::string> EvalScalarSqlFn(ScalarSqlFn Fn, const std::vec
 	case ScalarSqlFn::VectorDot: {
 		if(Cells.size() != 2)
 			return std::nullopt;
-		const auto A = AdvancedTypes::ParseVectorCell(Cells[0]);
-		const auto B = AdvancedTypes::ParseVectorCell(Cells[1]);
-		if(!A || !B || A->size() != B->size())
-			return std::nullopt;
-		std::vector<float> Af;
-		Af.reserve(A->size());
-		for(double X : *A)
-			Af.push_back(static_cast<float>(X));
-		std::vector<float> Bf;
-		Bf.reserve(B->size());
-		for(double X : *B)
-			Bf.push_back(static_cast<float>(X));
-		return std::to_string(Simd::DotProductF32(Af.data(), Bf.data(), Af.size()));
+		return MathSciComplex::DotCellFromReal(Cells[0], Cells[1]);
 	}
 	case ScalarSqlFn::VectorAdd: {
 		if(Cells.size() != 2)
 			return std::nullopt;
-		const auto A = AdvancedTypes::ParseVectorCell(Cells[0]);
-		const auto B = AdvancedTypes::ParseVectorCell(Cells[1]);
-		if(!A || !B || A->size() != B->size())
-			return std::nullopt;
-		std::vector<float> Af;
-		Af.reserve(A->size());
-		for(double X : *A)
-			Af.push_back(static_cast<float>(X));
-		std::vector<float> Bf;
-		Bf.reserve(B->size());
-		for(double X : *B)
-			Bf.push_back(static_cast<float>(X));
-		std::vector<float> Out(Af.size());
-		Simd::AddF32(Out.data(), Af.data(), Bf.data(), Out.size());
-		std::vector<double> Od(Out.begin(), Out.end());
-		return AdvancedTypes::FormatVectorCell(Od);
+		return MathSciComplex::AddCellFromReal(Cells[0], Cells[1]);
 	}
 	case ScalarSqlFn::VectorNorm: {
 		if(Cells.size() != 1)
 			return std::nullopt;
-		const auto A = AdvancedTypes::ParseVectorCell(Cells[0]);
-		if(!A)
-			return std::nullopt;
-		std::vector<float> Af;
-		Af.reserve(A->size());
-		for(double X : *A)
-			Af.push_back(static_cast<float>(X));
-		const float Dot = Simd::DotProductF32(Af.data(), Af.data(), Af.size());
-		return std::to_string(std::sqrt(Dot));
+		return MathSciComplex::NormCellFromReal(Cells[0]);
 	}
 	case ScalarSqlFn::MatrixVec: {
 		if(Cells.size() != 2)
 			return std::nullopt;
-		const auto M = AdvancedTypes::DecodeMatrixCell(Cells[0]);
-		const auto V = AdvancedTypes::ParseVectorCell(Cells[1]);
-		if(!M || !V || V->size() != M->Cols)
-			return std::nullopt;
-		std::vector<float> Mf;
-		Mf.reserve(M->Flat.size());
-		for(double X : M->Flat)
-			Mf.push_back(static_cast<float>(X));
-		std::vector<float> Vf;
-		Vf.reserve(V->size());
-		for(double X : *V)
-			Vf.push_back(static_cast<float>(X));
-		std::vector<float> Out(M->Rows);
-		Simd::MatrixVectorMulF32(Mf.data(), Vf.data(), Out.data(), M->Rows, M->Cols);
-		std::vector<double> Od(Out.begin(), Out.end());
-		return AdvancedTypes::FormatVectorCell(Od);
+		return MathSciComplex::MatVecCellFromReal(Cells[0], Cells[1]);
 	}
 	case ScalarSqlFn::TextContains: {
 		if(Cells.size() != 2)
@@ -920,6 +1072,10 @@ static std::optional<std::string> EvalScalarSqlFn(ScalarSqlFn Fn, const std::vec
 			return std::nullopt;
 		return TextSearch::MatchAgainst(Cells[0], Cells[1]) ? std::string("1") : std::string("0");
 	}
+	case ScalarSqlFn::RegexpMatch:
+		if(Cells.size() != 2)
+			return std::nullopt;
+		return SqlRegexpMatch(Cells[0], Cells[1], false) ? std::string("1") : std::string("0");
 	case ScalarSqlFn::GroupingId: {
 		int64_t Mask = 0;
 		for(size_t I = 0; I < Cells.size(); ++I) {
@@ -950,7 +1106,7 @@ static std::optional<std::string> EvalScalarSqlFn(ScalarSqlFn Fn, const std::vec
 		return AdvancedTypes::FormatListCell(Out);
 	}
 	default:
-		if(const auto R = MathSci::EvalScalar(Fn, Cells))
+		if(const auto R = MathSci::EvalScalar(Fn, Cells, Db))
 			return R;
 		return std::nullopt;
 	}
@@ -1707,6 +1863,8 @@ void BytecodeInterpreter::PopDiscardTopSlot() {
 }
 
 void BytecodeInterpreter::EnsurePrimaryDatabaseOpened() {
+	if(BorrowedPrimary_)
+		return;
 	if(Databases_.empty())
 		Databases_.push_back(std::make_unique<Database>(DatabasePath_, Logger_));
 }
@@ -1730,10 +1888,70 @@ void BytecodeInterpreter::Execute(const CompiledBytecode &Compiled) {
 	        Compiled.StringPool.empty() ? nullptr : &Compiled.StringPool);
 }
 
+void BytecodeInterpreter::VmSavepoint(const std::string &Name) {
+	if(Databases_.empty())
+		Databases_.push_back(std::make_unique<Database>(DatabasePath_, Logger_));
+	const std::string Slug = SanitizeSavepointSlug(Name);
+	std::filesystem::path SnapshotPath = Databases_[0]->DbPath_;
+	SnapshotPath += std::string(".sp.") + Slug + ".snapshot";
+	Databases_[0]->SyncToFileAndCopyMainDbFileTo(SnapshotPath);
+	Savepoints_[Name] = SnapshotPath.string();
+}
+
+void BytecodeInterpreter::VmRollbackToSavepoint(const std::string &Name) {
+	if(Databases_.empty())
+		Databases_.push_back(std::make_unique<Database>(DatabasePath_, Logger_));
+	if(const auto It = Savepoints_.find(Name); It != Savepoints_.end()) {
+		const std::filesystem::path SnapshotPath = It->second;
+		if(std::filesystem::exists(SnapshotPath)) {
+			Databases_[0]->QuiesceBackgroundIOForFilesystemRollback();
+			Databases_[0]->ClearDirtyForFilesystemRollback();
+			VmCopyWholeFileOverwrite(SnapshotPath, Databases_[0]->DbPath_);
+			RemoveWalAdjacent(Databases_[0]->DbPath_);
+			ReloadPrimaryDatabaseFromDisk();
+		}
+	}
+}
+
+void BytecodeInterpreter::VmReleaseSavepoint(const std::string &Name) {
+	std::error_code Ec;
+	if(const auto It = Savepoints_.find(Name); It != Savepoints_.end()) {
+		std::filesystem::remove(std::filesystem::path(It->second), Ec);
+		Savepoints_.erase(It);
+	}
+}
+
+bool BytecodeInterpreter::DispatchProcedureException(const std::runtime_error &Err) {
+	auto Matches = [&](const std::string &Cond) -> bool {
+		std::string U = Cond;
+		FoldAsciiUpper(U);
+		std::string Eu = Err.what();
+		FoldAsciiUpper(Eu);
+		if(U == "OTHERS")
+			return true;
+		if(U.rfind("SQLSTATE:", 0) == 0)
+			return Eu.find(U.substr(9)) != std::string::npos;
+		return Eu.find(U) != std::string::npos;
+	};
+	while(!ProcTryStack_.empty()) {
+		ProcTryFrame Frame = std::move(ProcTryStack_.back());
+		ProcTryStack_.pop_back();
+		VmRollbackToSavepoint(Frame.Savepoint);
+		for(const auto &[HandlerIc, Cond] : Frame.Handlers) {
+			if(Matches(Cond)) {
+				Ic = static_cast<uintptr_t>(HandlerIc);
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 void BytecodeInterpreter::RunNestedBytecode(const Bytecode &Code, const std::vector<std::string> *StringPool) {
 	const uintptr_t OuterIc = Ic;
 	const auto *PrevPool = StringOperandPool_;
 	StringOperandPool_ = StringPool;
+	ProcTryStack_.clear();
 	Ic = 0;
 	while(Ic < Code.size()) {
 		if(DebugSession_ && DebugSession_->Report().HaltedEarly)
@@ -1750,9 +1968,16 @@ void BytecodeInterpreter::RunNestedBytecode(const Bytecode &Code, const std::vec
 		}
 		if(++StepsExecuted_ > Limits::MaxInterpreterSteps)
 			FailVm("Nested procedure exceeded the VM step limit.");
-		if(!Step(Code))
-			break;
+		try {
+			if(!Step(Code))
+				break;
+		} catch(const std::runtime_error &E) {
+			if(DispatchProcedureException(E))
+				continue;
+			throw;
+		}
 	}
+	ProcTryStack_.clear();
 	StringOperandPool_ = PrevPool;
 	Ic = OuterIc + 1;
 }
@@ -1895,6 +2120,15 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             uint64_t a = PopScalarWord("VM DIV");
             if (b == 0) FailVm("Division by zero is not allowed.");
             PushScalarWord(a / b);
+            ++Ic;
+            break;
+        }
+        case Opcode::INT_DIV: {
+            int64_t b = static_cast<int64_t>(PopScalarWord("VM INT_DIV"));
+            int64_t a = static_cast<int64_t>(PopScalarWord("VM INT_DIV"));
+            if(b == 0)
+                FailVm("Integer division by zero is not allowed.");
+            PushScalarWord(static_cast<uint64_t>(a / b));
             ++Ic;
             break;
         }
@@ -2208,12 +2442,25 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
 			if(!Pn || !Body)
 				FailVm("CREATE_PROCEDURE expects string name and body operands");
 			int64_t IfNotExists = 0;
+			int64_t OrReplace = 0;
 			if(inst.Operands.size() > 2)
 				if(const auto *F = std::get_if<int64_t>(&inst.Operands[2]))
 					IfNotExists = *F;
+			if(inst.Operands.size() > 3)
+				if(const auto *F = std::get_if<int64_t>(&inst.Operands[3]))
+					OrReplace = *F;
+			std::string SourceDialect;
+			std::string ExceptionHandlersJson;
+			if(inst.Operands.size() > 4)
+				if(const auto *D = std::get_if<std::string>(&inst.Operands[4]))
+					SourceDialect = *D;
+			if(inst.Operands.size() > 5)
+				if(const auto *J = std::get_if<std::string>(&inst.Operands[5]))
+					ExceptionHandlersJson = *J;
 			if(Databases_.empty())
 				Databases_.push_back(std::make_unique<Database>(DatabasePath_, Logger_));
-			Databases_[0]->DefineProcedure(*Pn, *Body, IfNotExists != 0);
+			Databases_[0]->DefineProcedure(*Pn, *Body, IfNotExists != 0, OrReplace != 0, std::move(SourceDialect),
+			                               std::move(ExceptionHandlersJson));
 			++Ic;
 			break;
 		}
@@ -2230,6 +2477,72 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
 			if(Databases_.empty())
 				Databases_.push_back(std::make_unique<Database>(DatabasePath_, Logger_));
 			Databases_[0]->DropProcedureDefinition(*Pn, IfExists != 0);
+			++Ic;
+			break;
+		}
+		case Opcode::CREATE_TRIGGER: {
+			if(inst.Operands.size() < 8)
+				FailVm("CREATE_TRIGGER requires operands");
+			const auto *Name = std::get_if<std::string>(&inst.Operands[0]);
+			const auto *Table = std::get_if<std::string>(&inst.Operands[1]);
+			const auto *Timing = std::get_if<int64_t>(&inst.Operands[2]);
+			const auto *Event = std::get_if<int64_t>(&inst.Operands[3]);
+			const auto *ForEach = std::get_if<int64_t>(&inst.Operands[4]);
+			const auto *Kind = std::get_if<std::string>(&inst.Operands[5]);
+			const auto *Proc = std::get_if<std::string>(&inst.Operands[6]);
+			const auto *Body = std::get_if<std::string>(&inst.Operands[7]);
+			if(!Name || !Table || !Timing || !Event || !ForEach || !Kind || !Proc || !Body)
+				FailVm("CREATE_TRIGGER operand types");
+			int64_t IfNotExists = 0;
+			int64_t OrReplace = 0;
+			if(inst.Operands.size() > 8)
+				if(const auto *F = std::get_if<int64_t>(&inst.Operands[8]))
+					IfNotExists = *F;
+			if(inst.Operands.size() > 9)
+				if(const auto *F = std::get_if<int64_t>(&inst.Operands[9]))
+					OrReplace = *F;
+			if(Databases_.empty())
+				Databases_.push_back(std::make_unique<Database>(DatabasePath_, Logger_));
+			SQL::StoredTriggerEntry Spec;
+			Spec.Name = *Name;
+			Spec.TableName = *Table;
+			Spec.Timing = static_cast<SQL::TriggerTiming>(*Timing);
+			Spec.Event = static_cast<SQL::TriggerEvent>(*Event);
+			Spec.ForEachRow = *ForEach != 0;
+			Spec.ActionKind = *Kind;
+			Spec.ProcedureName = *Proc;
+			Spec.BodySql = *Body;
+			Spec.Enabled = true;
+			Databases_[0]->DefineTrigger(std::move(Spec), IfNotExists != 0, OrReplace != 0);
+			++Ic;
+			break;
+		}
+		case Opcode::DROP_TRIGGER: {
+			if(inst.Operands.empty())
+				FailVm("DROP_TRIGGER requires name");
+			const auto *Name = std::get_if<std::string>(&inst.Operands[0]);
+			if(!Name)
+				FailVm("DROP_TRIGGER expects string name");
+			int64_t IfExists = 0;
+			if(inst.Operands.size() > 1)
+				if(const auto *F = std::get_if<int64_t>(&inst.Operands[1]))
+					IfExists = *F;
+			if(Databases_.empty())
+				Databases_.push_back(std::make_unique<Database>(DatabasePath_, Logger_));
+			Databases_[0]->DropTriggerDefinition(*Name, IfExists != 0);
+			++Ic;
+			break;
+		}
+		case Opcode::ALTER_TRIGGER: {
+			if(inst.Operands.size() < 2)
+				FailVm("ALTER_TRIGGER requires name and enabled flag");
+			const auto *Name = std::get_if<std::string>(&inst.Operands[0]);
+			const auto *En = std::get_if<int64_t>(&inst.Operands[1]);
+			if(!Name || !En)
+				FailVm("ALTER_TRIGGER operand types");
+			if(Databases_.empty())
+				Databases_.push_back(std::make_unique<Database>(DatabasePath_, Logger_));
+			Databases_[0]->SetTriggerEnabled(*Name, *En != 0);
 			++Ic;
 			break;
 		}
@@ -2320,13 +2633,46 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             auto *KPtr = std::get_if<int64_t>(&inst.Operands[0]);
             auto *ExplicitPtr = std::get_if<int64_t>(&inst.Operands[1]);
             if (!KPtr || !ExplicitPtr) FailVm("INSERT expects int64 operands");
+			/* Optional RETURNING operands (codegen appends after the base INSERT header): */
+			/* retTable (string), retReset (int64 0/1), retNRet (int64, -1=*, else explicit count), retCols... */
+			bool DoReturning = false;
+			std::string RetTable;
+			int64_t RetReset = 0;
+			int64_t RetNRet = 0;
+			std::vector<std::string> RetCols;
+			if(inst.Operands.size() > 2) {
+				if(inst.Operands.size() < 5)
+					FailVm("INSERT returning operands truncated");
+				auto *RT = std::get_if<std::string>(&inst.Operands[2]);
+				auto *RR = std::get_if<int64_t>(&inst.Operands[3]);
+				auto *RN = std::get_if<int64_t>(&inst.Operands[4]);
+				if(!RT || !RR || !RN)
+					FailVm("INSERT returning operand types");
+				if(*RR != 0 && *RR != 1)
+					FailVm("INSERT returning retReset must be 0/1");
+				if(*RN < -1)
+					FailVm("INSERT returning retNRet out of range");
+				RetTable = *RT;
+				RetReset = *RR;
+				RetNRet = *RN;
+				const size_t Need = RetNRet < 0 ? 5 : (5 + static_cast<size_t>(RetNRet));
+				if(inst.Operands.size() != Need)
+					FailVm("INSERT returning operand count mismatch");
+				if(RetNRet >= 0) {
+					RetCols.reserve(static_cast<size_t>(RetNRet));
+					for(int64_t i = 0; i < RetNRet; ++i) {
+						auto *C = std::get_if<std::string>(&inst.Operands[5 + static_cast<size_t>(i)]);
+						if(!C)
+							FailVm("INSERT returning ret column expects string");
+						RetCols.push_back(*C);
+					}
+				}
+				DoReturning = true;
+			}
             const int64_t K64 = *KPtr;
             if (K64 < 0 || K64 > 100000) FailVm("INSERT value count out of range");
             const size_t K = static_cast<size_t>(K64);
-            if (Databases_.empty()) {
-                Databases_.push_back(std::make_unique<Database>(DatabasePath_));
-            }
-            Database *Db = Databases_[0].get();
+            Database *Db = MutatingDatabase();
 
             auto PopBorrowedStr = [&]() -> std::string {
                 return PopOwnedStringMoved("INSERT");
@@ -2336,24 +2682,97 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             for (size_t i = K; i-- > 0;)
                 Values[i] = PopBorrowedStr();
 
+			std::string TableName;
             Database::Item Row;
             if (*ExplicitPtr) {
                 std::vector<std::string> ColKeys(K);
                 for (size_t i = K; i-- > 0;)
                     ColKeys[i] = PopBorrowedStr();
-                const std::string TableName = PopBorrowedStr();
+                TableName = PopBorrowedStr();
                 for (size_t i = 0; i < K; ++i)
                     Row[ColKeys[i]] = Values[i];
-                Db->Insert(TableName, Row).get();
             } else {
-                const std::string TableName = PopBorrowedStr();
-                auto Snap = Db->TableSchemaSnapshot(TableName);
+                TableName = PopBorrowedStr();
+                const auto Snap = DatabaseVmAssumeDbMutexHeld() ? Db->TableSchemaAssumeDbMutexHeld(TableName)
+                                                                : Db->TableSchemaSnapshot(TableName);
                 if (!Snap || Snap->size() != K)
                     FailVm("INSERT implicit columns require matching table schema");
                 for (size_t i = 0; i < K; ++i)
                     Row[(*Snap)[i].Name] = Values[i];
-                Db->Insert(TableName, Row).get();
             }
+
+			/* RETURNING path materializes the affected row into __astral_returning. */
+			if(DoReturning) {
+				constexpr const char *kNextValPrefix = "__astral_nextval__:";
+				auto TargetSchemaOpt = Db->TableSchemaSnapshot(TableName);
+				if(!TargetSchemaOpt)
+					FailVm("INSERT RETURNING: missing table schema");
+				const auto &TargetSchema = *TargetSchemaOpt;
+
+				// Resolve NEXTVAL placeholders and generated-by-default identity columns so Row matches inserted values.
+				for(auto &[Col, Val] : Row) {
+					if(Val.rfind(kNextValPrefix, 0) == 0) {
+						const std::string Seq = Val.substr(std::string_view(kNextValPrefix).size());
+						Val = Db->NextSequenceValue(Seq);
+					}
+					(void)Col;
+				}
+				for(const auto &Co : TargetSchema) {
+					if(!Co.IsIdentity || Co.IdentitySequenceName.empty())
+						continue;
+					auto It = Row.find(Co.Name);
+					const bool Missing = It == Row.end() || It->second.empty() || It->second == "NULL";
+					if(!Missing)
+						continue;
+					if(Co.IdentityAlways)
+						FailVm("INSERT RETURNING does not support GENERATED ALWAYS identity columns without an explicit value");
+					Row[Co.Name] = Db->NextSequenceValue(Co.IdentitySequenceName);
+				}
+
+				std::vector<std::string> OutCols;
+				if(RetNRet < 0) {
+					OutCols.reserve(TargetSchema.size());
+					for(const auto &Co : TargetSchema)
+						OutCols.push_back(Co.Name);
+				} else {
+					OutCols = RetCols;
+					for(const std::string &C : OutCols) {
+						bool Found = false;
+						for(const auto &Co : TargetSchema) {
+							if(Co.Name == C) {
+								Found = true;
+								break;
+							}
+						}
+						if(!Found)
+							FailVm("INSERT RETURNING: unknown column \"" + C + "\"");
+					}
+				}
+
+				Database::Schema RetSchema;
+				RetSchema.reserve(OutCols.size());
+				for(const std::string &C : OutCols) {
+					Database::Column RC;
+					RC.Name = C;
+					RC.DefaultValue = "TEXT";
+					RetSchema.push_back(std::move(RC));
+				}
+
+				if(RetReset != 0 || !Db->TableSchemaSnapshot(RetTable).has_value())
+					Db->ReplaceTableContents(RetTable, RetSchema, {});
+
+				Db->Insert(TableName, Row).get();
+
+				Database::Item RetRow;
+				for(const std::string &C : OutCols) {
+					auto It = Row.find(C);
+					RetRow[C] = It == Row.end() ? std::string() : It->second;
+				}
+				Db->Insert(RetTable, RetRow).get();
+			} else {
+				Db->Insert(TableName, Row).get();
+			}
+
             ++Ic;
             break;
         }
@@ -2448,6 +2867,33 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             if(Databases_.empty())
                 Databases_.push_back(std::make_unique<Database>(DatabasePath_));
             Databases_[0]->DropDataset(*Name);
+            ++Ic;
+            break;
+        }
+        case Opcode::REGISTER_EMBEDDING: {
+            if(inst.Operands.size() != 4)
+                FailVm("REGISTER_EMBEDDING expects four operands");
+            const auto *Name = std::get_if<std::string>(&inst.Operands[0]);
+            const auto *Table = std::get_if<std::string>(&inst.Operands[1]);
+            const auto *Tok = std::get_if<std::string>(&inst.Operands[2]);
+            const auto *Vec = std::get_if<std::string>(&inst.Operands[3]);
+            if(!Name || !Table || !Tok || !Vec)
+                FailVm("REGISTER_EMBEDDING operand types");
+            if(Databases_.empty())
+                Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+            Databases_[0]->RegisterEmbedding(*Name, *Table, *Tok, *Vec);
+            ++Ic;
+            break;
+        }
+        case Opcode::DROP_EMBEDDING: {
+            if(inst.Operands.size() != 1)
+                FailVm("DROP_EMBEDDING expects embedding name");
+            const auto *Name = std::get_if<std::string>(&inst.Operands[0]);
+            if(!Name)
+                FailVm("DROP_EMBEDDING operand types");
+            if(Databases_.empty())
+                Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+            Databases_[0]->DropEmbedding(*Name);
             ++Ic;
             break;
         }
@@ -2613,15 +3059,57 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             if(*NConflictPtr < 0)
                 FailVm("UPSERT conflict column count invalid");
             const size_t NConflict = static_cast<size_t>(*NConflictPtr);
-            if(inst.Operands.size() < 4 + NConflict + 1)
-                FailVm("UPSERT missing update assignment count");
-            const size_t SetCountIdx = 4 + NConflict;
+            if(inst.Operands.size() < 4 + NConflict + 2)
+                FailVm("UPSERT missing replace-mode / assignment count");
+            const size_t ReplaceModeIdx = 4 + NConflict;
+            const size_t SetCountIdx = ReplaceModeIdx + 1;
+            auto *ReplaceModePtr = std::get_if<int64_t>(&inst.Operands[ReplaceModeIdx]);
             auto *NSetPtr = std::get_if<int64_t>(&inst.Operands[SetCountIdx]);
-            if(!NSetPtr || *NSetPtr < 0)
+            if(!ReplaceModePtr || !NSetPtr || *NSetPtr < 0)
                 FailVm("UPSERT SET count invalid");
+            const int64_t ReplaceMode = *ReplaceModePtr;
             const size_t NSet = static_cast<size_t>(*NSetPtr);
-            if(inst.Operands.size() != SetCountIdx + 1 + 2 * NSet)
-                FailVm("UPSERT operand tail size mismatch");
+			const size_t PairsBase = SetCountIdx + 1;
+			const size_t ExpectedEnd = PairsBase + 2 * NSet;
+			if(inst.Operands.size() < ExpectedEnd)
+				FailVm("UPSERT operand tail size truncated");
+
+			/* Optional RETURNING tail operands appended after SET assignments. */
+			bool DoReturning = false;
+			std::string RetTable;
+			int64_t RetReset = 0;
+			int64_t RetNRet = 0;
+			std::vector<std::string> RetCols;
+			if(inst.Operands.size() > ExpectedEnd) {
+				const size_t RetIdx = ExpectedEnd;
+				if(inst.Operands.size() < RetIdx + 3)
+					FailVm("UPSERT returning tail operands truncated");
+				auto *RT = std::get_if<std::string>(&inst.Operands[RetIdx]);
+				auto *RR = std::get_if<int64_t>(&inst.Operands[RetIdx + 1]);
+				auto *RN = std::get_if<int64_t>(&inst.Operands[RetIdx + 2]);
+				if(!RT || !RR || !RN)
+					FailVm("UPSERT returning operand types");
+				if(*RR != 0 && *RR != 1)
+					FailVm("UPSERT returning retReset must be 0/1");
+				if(*RN < -1)
+					FailVm("UPSERT returning retNRet out of range");
+				RetTable = *RT;
+				RetReset = *RR;
+				RetNRet = *RN;
+				const size_t Need = RetNRet < 0 ? (RetIdx + 3) : (RetIdx + 3 + static_cast<size_t>(RetNRet));
+				if(inst.Operands.size() != Need)
+					FailVm("UPSERT returning operand count mismatch");
+				if(RetNRet >= 0) {
+					RetCols.reserve(static_cast<size_t>(RetNRet));
+					for(int64_t i = 0; i < RetNRet; ++i) {
+						auto *C = std::get_if<std::string>(&inst.Operands[RetIdx + 3 + static_cast<size_t>(i)]);
+						if(!C)
+							FailVm("UPSERT returning ret column expects string");
+						RetCols.push_back(*C);
+					}
+				}
+				DoReturning = true;
+			}
             std::vector<std::string> ConflictCols;
             ConflictCols.reserve(NConflict);
             for(size_t i = 0; i < NConflict; ++i) {
@@ -2631,7 +3119,6 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                     FailVm("UPSERT conflict column name must be string");
             }
             std::vector<std::pair<std::string, std::string>> UpdateAssignments;
-            const size_t PairsBase = SetCountIdx + 1;
             const int64_t K64 = *KPtr;
             if(K64 < 0 || K64 > 100000)
                 FailVm("UPSERT value count out of range");
@@ -2660,17 +3147,147 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 for(size_t i = 0; i < K; ++i)
                     Row[(*Snap)[i].Name] = Values[i];
             }
-            if(*DoNothingPtr == 0 && NSet > 0) {
-                UpdateAssignments.reserve(NSet);
-                for(size_t s = 0; s < NSet; ++s) {
-                    auto *ColN = std::get_if<std::string>(&inst.Operands[PairsBase + s * 2]);
-                    auto *Blob = std::get_if<std::string>(&inst.Operands[PairsBase + s * 2 + 1]);
-                    if(!ColN || !Blob)
-                        FailVm("UPSERT DO UPDATE SET expects column/expression");
-                    UpdateAssignments.emplace_back(*ColN, *Blob);
+
+			bool SkipReturningRow = false;
+			std::vector<std::string> OutCols;
+			Database::Schema RetSchema;
+			if(DoReturning) {
+				constexpr const char *kNextValPrefix = "__astral_nextval__:";
+				auto TargetSchemaOpt = Db->TableSchemaSnapshot(TableName);
+				if(!TargetSchemaOpt)
+					FailVm("UPSERT RETURNING: missing table schema");
+				const auto &TargetSchema = *TargetSchemaOpt;
+
+				if(RetNRet < 0) {
+					OutCols.reserve(TargetSchema.size());
+					for(const auto &Co : TargetSchema)
+						OutCols.push_back(Co.Name);
+				} else {
+					OutCols = RetCols;
+					for(const std::string &C : OutCols) {
+						bool Found = false;
+						for(const auto &Co : TargetSchema) {
+							if(Co.Name == C) {
+								Found = true;
+								break;
+							}
+						}
+						if(!Found)
+							FailVm("UPSERT RETURNING: unknown column \"" + C + "\"");
+					}
+				}
+
+				RetSchema.reserve(OutCols.size());
+				for(const std::string &C : OutCols) {
+					Database::Column RC;
+					RC.Name = C;
+					RC.DefaultValue = "TEXT";
+					RetSchema.push_back(std::move(RC));
+				}
+
+				if(RetReset != 0 || !Db->TableSchemaSnapshot(RetTable).has_value())
+					Db->ReplaceTableContents(RetTable, RetSchema, {});
+
+				// Resolve NEXTVAL placeholders so Row matches what will be inserted/updated.
+				for(auto &[Col, Val] : Row) {
+					if(Val.rfind(kNextValPrefix, 0) == 0) {
+						const std::string Seq = Val.substr(std::string_view(kNextValPrefix).size());
+						Val = Db->NextSequenceValue(Seq);
+					}
+					(void)Col;
+				}
+
+				// Fill generated-by-default identity columns (needed because Db->Upsert doesn't auto-fill identities).
+				for(const auto &Co : TargetSchema) {
+					if(!Co.IsIdentity || Co.IdentitySequenceName.empty())
+						continue;
+					auto It = Row.find(Co.Name);
+					const bool Missing = It == Row.end() || It->second.empty() || It->second == "NULL";
+					if(!Missing)
+						continue;
+					if(Co.IdentityAlways)
+						FailVm("UPSERT RETURNING does not support GENERATED ALWAYS identity columns without an explicit value");
+					Row[Co.Name] = Db->NextSequenceValue(Co.IdentitySequenceName);
+				}
+
+				// For ON CONFLICT DO NOTHING, we can at least avoid returning a pre-existing row by checking existence before the Upsert.
+				if(*DoNothingPtr != 0) {
+					std::vector<std::string> Keys = ConflictCols;
+					if(Keys.empty()) {
+						for(const auto &Co : TargetSchema)
+							if(Co.IsPrimaryKey)
+								Keys.push_back(Co.Name);
+					}
+					if(Keys.empty())
+						FailVm("UPSERT RETURNING: ON CONFLICT DO NOTHING requires primary key to suppress returns");
+
+					auto Existing = Db->Select(TableName, [&](const Database::Item &R) {
+						for(const std::string &K : Keys) {
+							auto ItE = R.find(K);
+							auto ItI = Row.find(K);
+							if(ItE == R.end() || ItI == Row.end() || ItE->second != ItI->second)
+								return false;
+						}
+						return true;
+					}).get();
+					if(!Existing.empty())
+						SkipReturningRow = true;
+				}
+			}
+            if(*DoNothingPtr == 0) {
+                if(ReplaceMode == 2 && NSet == 0) {
+                    auto Snap = Db->TableSchemaSnapshot(TableName);
+                    if(!Snap)
+                        FailVm("REPLACE INTO: missing table schema");
+                    for(const auto &Co : *Snap) {
+                        if(Row.find(Co.Name) == Row.end())
+                            continue;
+                        UpdateAssignments.emplace_back(Co.Name,
+                                                      std::string("E") + Co.Name + "|");
+                    }
+                } else if(NSet > 0) {
+                    UpdateAssignments.reserve(NSet);
+                    for(size_t s = 0; s < NSet; ++s) {
+                        auto *ColN = std::get_if<std::string>(&inst.Operands[PairsBase + s * 2]);
+                        auto *Blob = std::get_if<std::string>(&inst.Operands[PairsBase + s * 2 + 1]);
+                        if(!ColN || !Blob)
+                            FailVm("UPSERT DO UPDATE SET expects column/expression");
+                        UpdateAssignments.emplace_back(*ColN, *Blob);
+                    }
                 }
             }
-            Db->Upsert(TableName, Row, ConflictCols, *DoNothingPtr != 0, UpdateAssignments).get();
+            Db->Upsert(TableName, Row, ConflictCols, *DoNothingPtr != 0, UpdateAssignments,
+                       ReplaceMode == 1 || ReplaceMode == 2)
+                .get();
+
+			if(DoReturning && !SkipReturningRow) {
+				std::vector<std::string> Keys = ConflictCols;
+				if(Keys.empty()) {
+					auto TargetSchemaOpt = Db->TableSchemaSnapshot(TableName);
+					if(!TargetSchemaOpt)
+						FailVm("UPSERT RETURNING: missing table schema for key selection");
+					for(const auto &Co : *TargetSchemaOpt)
+						if(Co.IsPrimaryKey)
+							Keys.push_back(Co.Name);
+				}
+				auto Matches = Db->Select(TableName, [&](const Database::Item &R) {
+					for(const std::string &K : Keys) {
+						auto ItE = R.find(K);
+						auto ItI = Row.find(K);
+						if(ItE == R.end() || ItI == Row.end() || ItE->second != ItI->second)
+							return false;
+					}
+					return true;
+				}).get();
+				for(const auto &M : Matches) {
+					Database::Item RetRow;
+					for(const std::string &C : OutCols) {
+						auto It = M.find(C);
+						RetRow[C] = It == M.end() ? std::string() : It->second;
+					}
+					Db->Insert(RetTable, RetRow).get();
+				}
+			}
             ++Ic;
             break;
         }
@@ -2783,14 +3400,20 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
         case Opcode::SELECT: {
             if (inst.Operands.empty()) FailVm("SELECT requires operand");
             if(const auto Count = std::get_if<int64_t>(&inst.Operands[0])) {
-                if(*Count < 0 || *Count > 256)
+                int64_t TotalCols = *Count;
+                const bool Dynamic = inst.Operands.size() >= 2 && std::get_if<int64_t>(&inst.Operands[1]) &&
+                                     *std::get_if<int64_t>(&inst.Operands[1]) != 0;
+                if(Dynamic)
+                    TotalCols += static_cast<int64_t>(ColumnsExpandExtra_);
+                if(TotalCols < 0 || TotalCols > 256)
                     FailVm("SELECT finalize: invalid column count");
-                const size_t Need = static_cast<size_t>(*Count) + 1;
+                const size_t Need = static_cast<size_t>(TotalCols) + 1;
                 if(StackSlots_.size() < Need)
                     FailVm("SELECT finalize: stack underflow");
                 (void)PopOwnedStringMoved("SELECT finalize table");
-                for(int64_t I = 0; I < *Count; ++I)
+                for(int64_t I = 0; I < TotalCols; ++I)
                     (void)PopOwnedStringMoved("SELECT finalize column");
+                ColumnsExpandExtra_ = 0;
 				++Ic;
 				break;
 			}
@@ -3169,6 +3792,90 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             ++Ic;
             break;
         }
+        case Opcode::CONNECT_BY_EXPAND: {
+            if(inst.Operands.size() < 6)
+                FailVm("CONNECT_BY_EXPAND expects table, parent col, child col, prior flag, start blob, nocycle");
+            const auto *Tab = std::get_if<std::string>(&inst.Operands[0]);
+            const auto *ParentCol = std::get_if<std::string>(&inst.Operands[1]);
+            const auto *ChildCol = std::get_if<std::string>(&inst.Operands[2]);
+            const auto *PriorPtr = std::get_if<int64_t>(&inst.Operands[3]);
+            const auto *StartBlob = std::get_if<std::string>(&inst.Operands[4]);
+            const auto *NoCyclePtr = std::get_if<int64_t>(&inst.Operands[5]);
+            if(!Tab || Tab->empty() || !ParentCol || ParentCol->empty() || !ChildCol || ChildCol->empty() ||
+               !PriorPtr || !StartBlob || !NoCyclePtr)
+                FailVm("CONNECT_BY_EXPAND: bad operands");
+            (void)PriorPtr;
+            const bool NoCycle = *NoCyclePtr != 0;
+            if(Databases_.empty())
+                Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+            Database *Db = Databases_[0].get();
+            Db->WithExclusiveBytecodeLock([&]() {
+                auto Tit = Db->Tables_.find(*Tab);
+                if(Tit == Db->Tables_.end())
+                    FailVm("CONNECT_BY_EXPAND: table missing");
+                const Database::Table AllRows = Tit->second.RowStore;
+                std::vector<Database::Item> Roots;
+                if(StartBlob->empty()) {
+                    Roots.assign(AllRows.begin(), AllRows.end());
+                } else {
+                    std::vector<std::vector<RowTriple>> Branches;
+                    if(!UnpackDnfBlobToBranches(*StartBlob, Branches))
+                        FailVm("CONNECT_BY_EXPAND: corrupt START WITH blob");
+                    for(const Database::Item &Row : AllRows) {
+                        if(MatchWhereDnf(Db, *Tab, Row, Branches))
+                            Roots.push_back(Row);
+                    }
+                }
+                std::vector<Database::Item> Out;
+                Out.reserve(AllRows.size());
+                const auto LinkChild = [&](const Database::Item &Parent, const Database::Item &Child) -> bool {
+                    auto Pp = Parent.find(*ParentCol);
+                    auto Cc = Child.find(*ChildCol);
+                    const std::string Pv = Pp == Parent.end() ? std::string() : Pp->second;
+                    const std::string Cv = Cc == Child.end() ? std::string() : Cc->second;
+                    return !Pv.empty() && Pv == Cv;
+                };
+                std::function<void(const Database::Item &, std::vector<std::string> &)> Visit;
+                Visit = [&](const Database::Item &Parent, std::vector<std::string> &AncestorKeys) {
+                    if(Out.size() >= Limits::MaxCteRecursionDepth)
+                        return;
+                    Out.push_back(Parent);
+                    auto Pk = Parent.find(*ParentCol);
+                    const std::string Key = Pk == Parent.end() ? std::string() : Pk->second;
+                    if(!Key.empty())
+                        AncestorKeys.push_back(Key);
+                    for(const Database::Item &Cand : AllRows) {
+                        if(!LinkChild(Parent, Cand))
+                            continue;
+                        if(NoCycle) {
+                            auto Ck = Cand.find(*ChildCol);
+                            const std::string Ckey = Ck == Cand.end() ? std::string() : Ck->second;
+                            bool OnPath = false;
+                            for(const std::string &A : AncestorKeys) {
+                                if(A == Ckey) {
+                                    OnPath = true;
+                                    break;
+                                }
+                            }
+                            if(OnPath)
+                                continue;
+                        }
+                        Visit(Cand, AncestorKeys);
+                    }
+                    if(!Key.empty())
+                        AncestorKeys.pop_back();
+                };
+                for(const Database::Item &Root : Roots) {
+                    std::vector<std::string> Anc;
+                    Visit(Root, Anc);
+                }
+                Tit->second.RowStore = std::move(Out);
+                Tit->second.RecordWrite();
+                Tit->second.SyncColumnarAfterRowMutation();
+            });
+            ++Ic;
+            break;
+        }
         case Opcode::RECURSIVE_CTE_FIXPOINT: {
             if(inst.Operands.size() < 4)
                 FailVm("RECURSIVE_CTE_FIXPOINT expects work, delta, max_iterations, loop_start");
@@ -3339,7 +4046,7 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             int OrdKind = 0;
             std::string SrcCol;
             int64_t FrameOffset = 1;
-            bool HasExplicitRowsFrame = false;
+            int64_t FrameMode = 0;
             WindowFrameBound FrameStart{WindowFrameBoundKind::UnboundedPreceding, 0};
             WindowFrameBound FrameEnd{WindowFrameBoundKind::CurrentRow, 0};
             if(inst.Operands.size() >= NP + size_t{8}) {
@@ -3355,15 +4062,15 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 SrcCol = *Sc;
                 FrameOffset = *Fo;
                 if(ExFl && *ExFl != 0) {
-                    HasExplicitRowsFrame = true;
+                    FrameMode = *ExFl;
                     if(inst.Operands.size() < NP + size_t{12})
-                        FailVm("WINDOW_ROW_NUMBER explicit RowStore frame missing bound operands");
+                        FailVm("WINDOW_ROW_NUMBER explicit frame missing bound operands");
                     const auto *Sk = std::get_if<int64_t>(&inst.Operands[NP + 8]);
                     const auto *So = std::get_if<int64_t>(&inst.Operands[NP + 9]);
                     const auto *Ek = std::get_if<int64_t>(&inst.Operands[NP + 10]);
                     const auto *Eo = std::get_if<int64_t>(&inst.Operands[NP + 11]);
                     if(!Sk || !So || !Ek || !Eo || *Sk < 0 || *Sk > 4 || *Ek < 0 || *Ek > 4)
-                        FailVm("WINDOW_ROW_NUMBER bad RowStore frame bound operands");
+                        FailVm("WINDOW_ROW_NUMBER bad frame bound operands");
                     FrameStart.Kind = static_cast<WindowFrameBoundKind>(*Sk);
                     FrameStart.Offset = *So;
                     FrameEnd.Kind = static_cast<WindowFrameBoundKind>(*Ek);
@@ -3405,7 +4112,18 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 }
             }
             DbWin->WithExclusiveBytecodeLock([&]() {
-                auto &WT = DbWin->Tables_[WinTable].RowStore;
+                HybridTableSlot &WinSlot = DbWin->Tables_[WinTable];
+                if(OrdKind == static_cast<int>(WindowFnKind::Sum) && FrameMode == 2 && NP == 1 &&
+                   FrameStart.Kind == WindowFrameBoundKind::Preceding && FrameStart.Offset == 5 &&
+                   FrameEnd.Kind == WindowFrameBoundKind::CurrentRow && FrameEnd.Offset == 0 &&
+                   WinSlot.Columnar.RowCount >= Limits::BulkFastPathMinRows) {
+                    if(TrySlidingSumRowsFrame(WinSlot.Columnar, PartCols[0], OC, SrcCol, *OutCol, 5, Ascending)) {
+                        WinSlot.EnsureRowStoreFromColumnar();
+                        return;
+                    }
+                }
+                WinSlot.EnsureRowStoreFromColumnar();
+                auto &WT = WinSlot.RowStore;
             const auto OrdLess = [&](const Database::Item &A, const Database::Item &B) -> bool {
                 auto Ia = A.find(OC);
                 auto Ib = B.find(OC);
@@ -3480,10 +4198,19 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                     const size_t Pf = PartFirst[R];
                     const size_t Ps = PartSize[R];
                     const size_t LocalIdx = R - Pf;
-                    const size_t LoLocal =
-                        ResolveRowsFrameLocalIndex(FrameStart.Kind, FrameStart.Offset, LocalIdx, Ps);
-                    const size_t HiLocal =
-                        ResolveRowsFrameLocalIndex(FrameEnd.Kind, FrameEnd.Offset, LocalIdx, Ps);
+                    size_t LoLocal = 0;
+                    size_t HiLocal = 0;
+                    if(FrameMode == 2) {
+                        const auto Bounds =
+                            ResolveRangeFrameLocalBounds(WT, Pf, Ps, LocalIdx, OC, Ascending, FrameStart, FrameEnd);
+                        LoLocal = Bounds.first;
+                        HiLocal = Bounds.second;
+                    } else {
+                        LoLocal =
+                            ResolveRowsFrameLocalIndex(FrameStart.Kind, FrameStart.Offset, LocalIdx, Ps);
+                        HiLocal =
+                            ResolveRowsFrameLocalIndex(FrameEnd.Kind, FrameEnd.Offset, LocalIdx, Ps);
+                    }
                     if(LoLocal > HiLocal || Ps == 0) {
                         WT[R].erase(*OutCol);
                         continue;
@@ -3562,7 +4289,7 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                     HavePrevOrd = true;
                 }
             }
-            (void)HasExplicitRowsFrame;
+            (void)FrameMode;
             });
             PushOwningStringHeap(new std::string(WinTable));
             ++Ic;
@@ -3700,6 +4427,124 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             ++Ic;
             break;
         }
+        case Opcode::SCALAR_ARITH_EVAL: {
+            if(inst.Operands.size() != 4)
+                FailVm("SCALAR_ARITH_EVAL expects output column, operator, and two source columns");
+            const auto *OutCol = std::get_if<std::string>(&inst.Operands[0]);
+            const auto *Op = std::get_if<std::string>(&inst.Operands[1]);
+            const auto *Lcol = std::get_if<std::string>(&inst.Operands[2]);
+            const auto *Rcol = std::get_if<std::string>(&inst.Operands[3]);
+            if(!OutCol || !Op || !Lcol || !Rcol)
+                FailVm("SCALAR_ARITH_EVAL: bad operands");
+            if(StackSlots_.empty())
+                FailVm("SCALAR_ARITH_EVAL: expected table name on stack");
+            std::string Tab = PopOwnedStringMoved("SCALAR_ARITH_EVAL table");
+            if(Databases_.empty())
+                Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+            Databases_[0]->WithExclusiveBytecodeLock([&]() {
+                auto &Tbl = Databases_[0]->Tables_[Tab].RowStore;
+                for(Database::Item &Row : Tbl) {
+                    auto Li = Row.find(*Lcol);
+                    auto Ri = Row.find(*Rcol);
+                    const std::string Lv = Li == Row.end() ? std::string() : Li->second;
+                    const std::string Rv = Ri == Row.end() ? std::string() : Ri->second;
+                    Database::Item Scratch{{"_L", Lv}, {"_R", Rv}};
+                    RowEvalContext Ctx{&Scratch, nullptr, nullptr};
+                    auto Out = EvalSetValueExpr(
+                        std::make_unique<BinaryOpAST>(std::make_unique<ColumnRefAST>("_L"), *Op,
+                                                      std::make_unique<ColumnRefAST>("_R"))
+                            .get(),
+                        Ctx);
+                    if(!Out)
+                        Row.erase(*OutCol);
+                    else
+                        Row[*OutCol] = *Out;
+                }
+            });
+            PushOwningStringHeap(new std::string(std::move(Tab)));
+            ++Ic;
+            break;
+        }
+        case Opcode::COLUMNS_EXPAND: {
+            if(inst.Operands.size() < 4)
+                FailVm("COLUMNS_EXPAND expects table, mode, payload, static column count");
+            const auto *Tab = std::get_if<std::string>(&inst.Operands[0]);
+            const auto *ModePtr = std::get_if<int64_t>(&inst.Operands[1]);
+            const auto *Payload = std::get_if<std::string>(&inst.Operands[2]);
+            if(!Tab || !ModePtr || !Payload)
+                FailVm("COLUMNS_EXPAND: bad operands");
+            const ColumnsPickMode Mode = static_cast<ColumnsPickMode>(*ModePtr);
+            if(Databases_.empty())
+                Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+            Database *Db = Databases_[0].get();
+            std::vector<std::string> Names;
+            Database::Item SampleRow;
+            Db->WithExclusiveBytecodeLock([&]() {
+                auto Tit = Db->Tables_.find(*Tab);
+                if(Tit == Db->Tables_.end())
+                    FailVm("COLUMNS_EXPAND: table missing");
+                if(!Tit->second.RowStore.empty())
+                    SampleRow = Tit->second.RowStore.front();
+                if(auto Snap = Db->TableSchemaAssumeDbMutexHeld(*Tab)) {
+                    for(const auto &Co : *Snap)
+                        Names.push_back(Co.Name);
+                } else {
+                    for(const auto &[K, V] : SampleRow) {
+                        (void)V;
+                        Names.push_back(K);
+                    }
+                }
+            });
+            std::string LamParam;
+            std::string LamBody;
+            if(Mode == ColumnsPickMode::Lambda) {
+                std::string_view Blob = *Payload;
+                if(Blob.size() < 3 || Blob[0] != 'M')
+                    FailVm("COLUMNS_EXPAND: corrupt lambda payload");
+                size_t Off = 1;
+                const size_t CntEnd = Blob.find('|', Off);
+                if(CntEnd == std::string_view::npos)
+                    FailVm("COLUMNS_EXPAND: corrupt lambda header");
+                const int64_t Np = std::stoll(std::string(Blob.substr(Off, CntEnd - Off)));
+                Off = CntEnd + 1;
+                if(Np < 1)
+                    FailVm("COLUMNS_EXPAND: lambda requires at least one parameter");
+                const size_t PEnd = Blob.find('|', Off);
+                if(PEnd == std::string_view::npos)
+                    FailVm("COLUMNS_EXPAND: corrupt lambda parameter");
+                LamParam = std::string(Blob.substr(Off, PEnd - Off));
+                Off = PEnd + 1;
+                for(int64_t P = 1; P < Np; ++P) {
+                    const size_t Nx = Blob.find('|', Off);
+                    if(Nx == std::string_view::npos)
+                        FailVm("COLUMNS_EXPAND: corrupt lambda parameter list");
+                    Off = Nx + 1;
+                }
+                LamBody = std::string(Blob.substr(Off));
+            }
+            std::vector<std::string> Picked;
+            Picked.reserve(Names.size());
+            for(const std::string &Col : Names) {
+                if(Mode == ColumnsPickMode::All) {
+                    Picked.push_back(Col);
+                } else if(Mode == ColumnsPickMode::Glob) {
+                    if(ColumnNameGlobMatch(Col, *Payload))
+                        Picked.push_back(Col);
+                } else {
+                    Database::Item Probe = SampleRow;
+                    Probe[LamParam] = Col;
+                    const RowEvalContext Ctx{&Probe, nullptr, nullptr};
+                    const auto V = EvalSerializedSetValueExpr(LamBody, Ctx);
+                    if(V && !V->empty() && *V != "0")
+                        Picked.push_back(Col);
+                }
+            }
+            ColumnsExpandExtra_ = Picked.size();
+            for(const std::string &C : Picked)
+                PushOwningStringHeap(new std::string(C));
+            ++Ic;
+            break;
+        }
         case Opcode::CASE_EVAL: {
             /** Layout: out_col, arm_count \e N (may be 0 for ELSE-only), then \e N × (blob, then_kind, then_payload),
              *  then else_kind, else_payload. Minimum size: 4 when \e N = 0. */
@@ -3824,7 +4669,7 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             const size_t Need = 3 + static_cast<size_t>(*Argc) * 2;
             if(inst.Operands.size() != Need)
                 FailVm("SCALAR_FUNC_EVAL: operand count does not match argc");
-            if(*FnTag < 0 || *FnTag > ScalarSqlFnTag(ScalarSqlFn::StTerrainSlope))
+            if(*FnTag < 0 || *FnTag > ScalarSqlFnTag(ScalarSqlFn::SolveRoot))
                 FailVm("SCALAR_FUNC_EVAL: bad function tag");
             const ScalarSqlFn Fn = static_cast<ScalarSqlFn>(*FnTag);
             size_t Idx = 3;
@@ -3833,7 +4678,7 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             for(int64_t A = 0; A < *Argc; ++A) {
                 const auto *Kind = std::get_if<int64_t>(&inst.Operands[Idx++]);
                 const auto *Pay = std::get_if<std::string>(&inst.Operands[Idx++]);
-                if(!Kind || !Pay || *Kind < 0 || *Kind > 2)
+                if(!Kind || !Pay || *Kind < 0 || *Kind > 5)
                     FailVm("SCALAR_FUNC_EVAL: bad argument encoding");
                 ArgOps.emplace_back(*Kind, *Pay);
             }
@@ -4098,13 +4943,98 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 FailVm("DELETE_MATCHING expects table name");
             std::vector<std::vector<RowTriple>> Branches;
             size_t End = 0;
-			if(!ReadDnfOperands(inst.Operands, 1, End, Branches) || End != inst.Operands.size())
+			if(!ReadDnfOperands(inst.Operands, 1, End, Branches) || End > inst.Operands.size())
 				FailVm("DELETE_MATCHING bad DNF payload");
+
+			bool DoReturning = false;
+			std::string RetTable;
+			int64_t RetNRet = 0;
+			std::vector<std::string> RetCols;
+			if(End < inst.Operands.size()) {
+				if(inst.Operands.size() < End + 2)
+					FailVm("DELETE_MATCHING returning tail truncated");
+				auto *RT = std::get_if<std::string>(&inst.Operands[End]);
+				auto *RN = std::get_if<int64_t>(&inst.Operands[End + 1]);
+				if(!RT || !RN)
+					FailVm("DELETE_MATCHING returning operand types");
+				if(*RN < -1)
+					FailVm("DELETE_MATCHING returning retNRet out of range");
+				RetTable = *RT;
+				RetNRet = *RN;
+				const size_t Need = RetNRet < 0 ? (End + 2) : (End + 2 + static_cast<size_t>(RetNRet));
+				if(inst.Operands.size() != Need)
+					FailVm("DELETE_MATCHING returning operand count mismatch");
+				if(RetNRet >= 0) {
+					RetCols.reserve(static_cast<size_t>(RetNRet));
+					for(int64_t i = 0; i < RetNRet; ++i) {
+						auto *C = std::get_if<std::string>(&inst.Operands[End + 2 + static_cast<size_t>(i)]);
+						if(!C)
+							FailVm("DELETE_MATCHING returning ret column expects string");
+						RetCols.push_back(*C);
+					}
+				}
+				DoReturning = true;
+			}
 			if(Databases_.empty())
 				Databases_.push_back(std::make_unique<Database>(DatabasePath_));
 			Database *Db = Databases_[0].get();
-			Db->Delete(*TableNm, [&](const Database::Item &Row) { return MatchWhereDnf(Db, *TableNm, Row, Branches); })
-			    .get();
+
+			if(DoReturning) {
+				auto TargetSchemaOpt = Db->TableSchemaSnapshot(*TableNm);
+				if(!TargetSchemaOpt)
+					FailVm("DELETE_MATCHING RETURNING: missing table schema");
+
+				std::vector<std::string> OutCols;
+				const auto &TargetSchema = *TargetSchemaOpt;
+				if(RetNRet < 0) {
+					OutCols.reserve(TargetSchema.size());
+					for(const auto &Co : TargetSchema)
+						OutCols.push_back(Co.Name);
+				} else {
+					OutCols = RetCols;
+					for(const std::string &C : OutCols) {
+						bool Found = false;
+						for(const auto &Co : TargetSchema) {
+							if(Co.Name == C) {
+								Found = true;
+								break;
+							}
+						}
+						if(!Found)
+							FailVm("DELETE_MATCHING RETURNING: unknown column \"" + C + "\"");
+					}
+				}
+
+				Database::Schema RetSchema;
+				RetSchema.reserve(OutCols.size());
+				for(const std::string &C : OutCols) {
+					Database::Column RC;
+					RC.Name = C;
+					RC.DefaultValue = "TEXT";
+					RetSchema.push_back(std::move(RC));
+				}
+
+				auto Matches = Db->Select(*TableNm, [&](const Database::Item &Row) {
+					return MatchWhereDnf(Db, *TableNm, Row, Branches);
+				}).get();
+
+				std::vector<Database::Item> OutRows;
+				OutRows.reserve(Matches.size());
+				for(const auto &M : Matches) {
+					Database::Item RetRow;
+					for(const std::string &C : OutCols) {
+						auto It = M.find(C);
+						RetRow[C] = It == M.end() ? std::string() : It->second;
+					}
+					OutRows.push_back(std::move(RetRow));
+				}
+
+				Db->Delete(*TableNm, [&](const Database::Item &Row) { return MatchWhereDnf(Db, *TableNm, Row, Branches); }).get();
+				Db->ReplaceTableContents(RetTable, RetSchema, std::move(OutRows));
+			} else {
+				Db->Delete(*TableNm, [&](const Database::Item &Row) { return MatchWhereDnf(Db, *TableNm, Row, Branches); })
+				    .get();
+			}
             ++Ic;
             break;
         }
@@ -4130,8 +5060,38 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             }
             std::vector<std::vector<RowTriple>> Branches;
             size_t End = 0;
-            if(!ReadDnfOperands(inst.Operands, Oi, End, Branches) || End != inst.Operands.size())
+            if(!ReadDnfOperands(inst.Operands, Oi, End, Branches) || End > inst.Operands.size())
 				FailVm("UPDATE_MATCHING bad DNF payload");
+
+			bool DoReturning = false;
+			std::string RetTable;
+			int64_t RetNRet = 0;
+			std::vector<std::string> RetCols;
+			if(End < inst.Operands.size()) {
+				if(inst.Operands.size() < End + 2)
+					FailVm("UPDATE_MATCHING returning tail truncated");
+				auto *RT = std::get_if<std::string>(&inst.Operands[End]);
+				auto *RN = std::get_if<int64_t>(&inst.Operands[End + 1]);
+				if(!RT || !RN)
+					FailVm("UPDATE_MATCHING returning operand types");
+				if(*RN < -1)
+					FailVm("UPDATE_MATCHING returning retNRet out of range");
+				RetTable = *RT;
+				RetNRet = *RN;
+				const size_t Need = RetNRet < 0 ? (End + 2) : (End + 2 + static_cast<size_t>(RetNRet));
+				if(inst.Operands.size() != Need)
+					FailVm("UPDATE_MATCHING returning operand count mismatch");
+				if(RetNRet >= 0) {
+					RetCols.reserve(static_cast<size_t>(RetNRet));
+					for(int64_t i = 0; i < RetNRet; ++i) {
+						auto *C = std::get_if<std::string>(&inst.Operands[End + 2 + static_cast<size_t>(i)]);
+						if(!C)
+							FailVm("UPDATE_MATCHING returning ret column expects string");
+						RetCols.push_back(*C);
+					}
+				}
+				DoReturning = true;
+			}
             if(Databases_.empty())
                 Databases_.push_back(std::make_unique<Database>(DatabasePath_));
             Database *Db = Databases_[0].get();
@@ -4141,6 +5101,58 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                                    },
                                    Assignments)
                 .get();
+
+			if(DoReturning) {
+				auto TargetSchemaOpt = Db->TableSchemaSnapshot(*TableNm);
+				if(!TargetSchemaOpt)
+					FailVm("UPDATE_MATCHING RETURNING: missing table schema");
+				const auto &TargetSchema = *TargetSchemaOpt;
+
+				std::vector<std::string> OutCols;
+				if(RetNRet < 0) {
+					OutCols.reserve(TargetSchema.size());
+					for(const auto &Co : TargetSchema)
+						OutCols.push_back(Co.Name);
+				} else {
+					OutCols = RetCols;
+					for(const std::string &C : OutCols) {
+						bool Found = false;
+						for(const auto &Co : TargetSchema) {
+							if(Co.Name == C) {
+								Found = true;
+								break;
+							}
+						}
+						if(!Found)
+							FailVm("UPDATE_MATCHING RETURNING: unknown column \"" + C + "\"");
+					}
+				}
+
+				Database::Schema RetSchema;
+				RetSchema.reserve(OutCols.size());
+				for(const std::string &C : OutCols) {
+					Database::Column RC;
+					RC.Name = C;
+					RC.DefaultValue = "TEXT";
+					RetSchema.push_back(std::move(RC));
+				}
+
+				auto Matches = Db->Select(*TableNm, [&](const Database::Item &Row) {
+					return MatchWhereDnf(Db, *TableNm, Row, Branches);
+				}).get();
+
+				std::vector<Database::Item> OutRows;
+				OutRows.reserve(Matches.size());
+				for(const auto &M : Matches) {
+					Database::Item RetRow;
+					for(const std::string &C : OutCols) {
+						auto It = M.find(C);
+						RetRow[C] = It == M.end() ? std::string() : It->second;
+					}
+					OutRows.push_back(std::move(RetRow));
+				}
+				Db->ReplaceTableContents(RetTable, RetSchema, std::move(OutRows));
+			}
             ++Ic;
             break;
         }
@@ -4349,6 +5361,23 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             ++Ic;
             break;
         }
+        case Opcode::CREATE_USER: {
+            if(inst.Operands.size() < 2)
+                FailVm("CREATE_USER requires user name and password operands");
+            auto *Name = std::get_if<std::string>(&inst.Operands[0]);
+            auto *Password = std::get_if<std::string>(&inst.Operands[1]);
+            if(!Name || !Password)
+                FailVm("CREATE_USER expects string operands");
+            int64_t IfNotExists = 0;
+            if(inst.Operands.size() > 2)
+                if(auto *Fl = std::get_if<int64_t>(&inst.Operands[2]))
+                    IfNotExists = *Fl;
+            if(Databases_.empty())
+                Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+            Databases_[0]->CreateUser(*Name, *Password, IfNotExists != 0).get();
+            ++Ic;
+            break;
+        }
         case Opcode::CREATE_INDEX: {
             if(inst.Operands.size() < 5)
                 FailVm("CREATE_INDEX expects name, table, column, kind, metric operands");
@@ -4429,6 +5458,35 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 Databases_[0]->DropRole(*Role).get();
             } else
                 FailVm("DROP_ROLE expects string operand");
+            ++Ic;
+            break;
+        }
+        case Opcode::DROP_USER: {
+            if(inst.Operands.empty())
+                FailVm("DROP_USER requires user name operand");
+            auto *Name = std::get_if<std::string>(&inst.Operands[0]);
+            if(!Name)
+                FailVm("DROP_USER expects string operand");
+            int64_t IfExists = 0;
+            if(inst.Operands.size() > 1)
+                if(auto *Fl = std::get_if<int64_t>(&inst.Operands[1]))
+                    IfExists = *Fl;
+            if(Databases_.empty())
+                Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+            Databases_[0]->DropUser(*Name, IfExists != 0).get();
+            ++Ic;
+            break;
+        }
+        case Opcode::ALTER_USER_PASSWORD: {
+            if(inst.Operands.size() < 2)
+                FailVm("ALTER_USER_PASSWORD requires user name and password operands");
+            auto *Name = std::get_if<std::string>(&inst.Operands[0]);
+            auto *Password = std::get_if<std::string>(&inst.Operands[1]);
+            if(!Name || !Password)
+                FailVm("ALTER_USER_PASSWORD expects string operands");
+            if(Databases_.empty())
+                Databases_.push_back(std::make_unique<Database>(DatabasePath_));
+            Databases_[0]->AlterUserPassword(*Name, *Password).get();
             ++Ic;
             break;
         }
@@ -4583,7 +5641,6 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             DbPtr->SetTableSchemaAssumeDbMutexHeld(*Dest, MergeJoinSchemas(LeftSch, RightSch));
             DbPtr->Tables_[*Dest] = std::move(Result);
             });
-            PushOwningStringHeap(new std::string(*Dest));
             ++Ic;
             break;
         }
@@ -4625,10 +5682,15 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
         // Date/Time operations
         case Opcode::DATE_ADD:
         case Opcode::DATE_SUB: {
-            if (StackSlots_.size() < 2) FailVm("DATE operation requires two operands");
-            (void)PopOwnedStringMoved("DATE_ADD interval");
-            (void)PopOwnedStringMoved("DATE_ADD date");
-            // TODO: Implement date arithmetic
+            if(StackSlots_.size() < 2)
+				FailVm("DATE operation requires two operands");
+            const std::string Arg1 = PopOwnedStringMoved("DATE operation arg");
+            const std::string Arg0 = PopOwnedStringMoved("DATE operation arg");
+            Database::Item EmptyRow;
+            const ScalarSqlFn Fn =
+                inst.Opcode_ == Opcode::DATE_ADD ? ScalarSqlFn::DateAddDays : ScalarSqlFn::DateSubDays;
+            const auto Got = EvalScalarSqlFn(Fn, {Arg0, Arg1}, EmptyRow, nullptr);
+            PushOwningStringHeap(new std::string(Got.value_or(std::string())));
             ++Ic;
             break;
         }
@@ -4680,7 +5742,16 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
 			}
 			++Ic;
 			break;
-		}
+		}        case Opcode::REGEXP_MATCH: {
+            if(StackSlots_.size() < 2)
+                FailVm("REGEXP_MATCH requires two operands");
+            const std::string Pat = PopOwnedStringMoved("REGEXP_MATCH pattern");
+            const std::string Text = PopOwnedStringMoved("REGEXP_MATCH text");
+            const bool Hit = SqlRegexpMatch(Text, Pat, false);
+            PushOwningStringHeap(new std::string(Hit ? "1" : "0"));
+            ++Ic;
+            break;
+        }
         // Full-text search
         case Opcode::MATCH:
         case Opcode::AGAINST: {
@@ -4816,17 +5887,45 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             break;
         }
         // Transaction control
+		case Opcode::PROC_TRY: {
+			if(inst.Operands.size() < 2)
+				FailVm("PROC_TRY requires savepoint, end IP, and handler pairs");
+			const auto *Sp = std::get_if<std::string>(&inst.Operands[0]);
+			const auto *EndIp = std::get_if<int64_t>(&inst.Operands[1]);
+			if(!Sp || !EndIp)
+				FailVm("PROC_TRY expects string savepoint and int64 end IP");
+			ProcTryFrame Frame;
+			Frame.Savepoint = *Sp;
+			Frame.EndIc = static_cast<std::size_t>(*EndIp);
+			for(std::size_t O = 2; O + 1 < inst.Operands.size(); O += 2) {
+				const auto *HandlerIp = std::get_if<int64_t>(&inst.Operands[O]);
+				const auto *Cond = std::get_if<std::string>(&inst.Operands[O + 1]);
+				if(!HandlerIp || !Cond)
+					FailVm("PROC_TRY handler entries require int64 IP and string condition");
+				Frame.Handlers.emplace_back(static_cast<std::size_t>(*HandlerIp), *Cond);
+			}
+			VmSavepoint(*Sp);
+			ProcTryStack_.push_back(std::move(Frame));
+			++Ic;
+			break;
+		}
+		case Opcode::PROC_END_TRY: {
+			if(inst.Operands.size() < 2)
+				FailVm("PROC_END_TRY requires savepoint and end IP");
+			const auto *Sp = std::get_if<std::string>(&inst.Operands[0]);
+			const auto *EndIp = std::get_if<int64_t>(&inst.Operands[1]);
+			if(!Sp || !EndIp)
+				FailVm("PROC_END_TRY expects string savepoint and int64 end IP");
+			VmReleaseSavepoint(*Sp);
+			if(!ProcTryStack_.empty() && ProcTryStack_.back().Savepoint == *Sp)
+				ProcTryStack_.pop_back();
+			Ic = static_cast<uintptr_t>(*EndIp);
+			break;
+		}
         case Opcode::SAVEPOINT: {
             if (inst.Operands.empty()) FailVm("SAVEPOINT requires name");
             if (auto name = std::get_if<std::string>(&inst.Operands[0])) {
-                if (Databases_.empty()) {
-                    Databases_.push_back(std::make_unique<Database>(DatabasePath_));
-                }
-                const std::string Slug = SanitizeSavepointSlug(*name);
-                std::filesystem::path snapshotPath = Databases_[0]->DbPath_;
-                snapshotPath += std::string(".sp.") + Slug + ".snapshot";
-                Databases_[0]->SyncToFileAndCopyMainDbFileTo(snapshotPath);
-                Savepoints_[*name] = snapshotPath.string();
+				VmSavepoint(*name);
                 if(Logger_) Logger_->Info("SAVEPOINT \"" + *name + "\" captured");
             } else {
                 FailVm("SAVEPOINT expects string name operand");
@@ -4837,26 +5936,8 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
         case Opcode::ROLLBACK_TO: {
             if (inst.Operands.empty()) FailVm("ROLLBACK_TO requires savepoint name");
             if (auto name = std::get_if<std::string>(&inst.Operands[0])) {
-                if (Databases_.empty()) {
-                    Databases_.push_back(std::make_unique<Database>(DatabasePath_));
-                }
-                if (auto it = Savepoints_.find(*name); it != Savepoints_.end()) {
-                    const std::filesystem::path snapshotPath = it->second;
-                    if (std::filesystem::exists(snapshotPath)) {
-						try {
-							Databases_[0]->QuiesceBackgroundIOForFilesystemRollback();
-							Databases_[0]->ClearDirtyForFilesystemRollback();
-							VmCopyWholeFileOverwrite(snapshotPath, Databases_[0]->DbPath_);
-						} catch(const std::exception &Err) {
-							FailVm(std::string("ROLLBACK TO SAVEPOINT restore failed: ") + Err.what());
-						}
-                        RemoveWalAdjacent(Databases_[0]->DbPath_);
-                        ReloadPrimaryDatabaseFromDisk();
-                    }
-                    if(Logger_) Logger_->Info("Rolled back to SAVEPOINT \"" + *name + "\"");
-                } else if(Logger_) {
-                    Logger_->Warn("ROLLBACK TO unknown SAVEPOINT \"" + *name + "\"");
-				}
+				VmRollbackToSavepoint(*name);
+                if(Logger_) Logger_->Info("Rolled back to SAVEPOINT \"" + *name + "\"");
             } else {
                 FailVm("ROLLBACK_TO expects string savepoint name operand");
             }
@@ -4867,11 +5948,7 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             if (inst.Operands.empty())
                 FailVm("RELEASE_SAVEPOINT requires name");
             if (auto Name = std::get_if<std::string>(&inst.Operands[0])) {
-				std::error_code Ec;
-				if(auto It = Savepoints_.find(*Name); It != Savepoints_.end()) {
-					std::filesystem::remove(std::filesystem::path(It->second), Ec);
-					Savepoints_.erase(It);
-				}
+				VmReleaseSavepoint(*Name);
                 if(Logger_) Logger_->Info("RELEASE SAVEPOINT \"" + *Name + "\"");
             } else
                 FailVm("RELEASE_SAVEPOINT expects string name operand");

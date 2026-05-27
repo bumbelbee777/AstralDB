@@ -8,6 +8,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(ASTRALDB_WARNINGS_AS_ERRORS "Treat warnings as errors" ON)
 
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/AstralDBCompileOptions.cmake)
+
 add_library(astraldb_core STATIC
     sources/Database/Database.cxx
     sources/Database/AdvancedTypes.cxx
@@ -15,6 +17,10 @@ add_library(astraldb_core STATIC
     sources/Database/MathSciSignal.cxx
     sources/Database/MathSciAutograd.cxx
     sources/Database/MathSciSolves.cxx
+    sources/Database/MathSciClassify.cxx
+    sources/Database/MathSciNlp.cxx
+    sources/Database/MathSciEmbeddings.cxx
+    sources/Database/MathSciComplex.cxx
     sources/Database/ColumnarStorage.cxx
     sources/Database/HybridStorageScheduler.cxx
     sources/Database/HybridTable.cxx
@@ -23,8 +29,12 @@ add_library(astraldb_core STATIC
     sources/Database/GeoSpatial.cxx
     sources/Database/Graph.cxx
     sources/Database/GraphStorage.cxx
+    sources/Database/EmbeddingStorage.cxx
     sources/Database/User.cxx
     sources/Database/WriteAheadLog.cxx
+    sources/DS/glTF.cxx
+    sources/DS/Geometry2D.cxx
+    sources/DS/Regex.cxx
     sources/IO/SIMD.cxx
     sources/IO/MemoryGuard.cxx
     sources/SQL/AST.cxx
@@ -33,11 +43,16 @@ add_library(astraldb_core STATIC
     sources/SQL/BytecodeInspect.cxx
     sources/SQL/BytecodeDebug.cxx
     sources/SQL/BytecodeProcedures.cxx
+    sources/SQL/BytecodeTriggers.cxx
+    sources/Database/TriggerRuntime.cxx
     sources/SQL/Codegen.cxx
     sources/SQL/Optimizer.cxx
+    sources/SQL/MathSciOptimizer.cxx
     sources/SQL/GraphOptimizer.cxx
     sources/SQL/GraphCypher.cxx
     sources/SQL/Parser.cxx
+    sources/SQL/DialectCompat.cxx
+    sources/SQL/ProcedureParser.cxx
     sources/SQL/SetExprEval.cxx
     sources/SQL/JsonSql.cxx
     sources/SQL/XmlSql.cxx
@@ -54,21 +69,24 @@ target_include_directories(astraldb_core
 )
 
 if(MSVC)
-    target_compile_options(astraldb_core PRIVATE /W4 /O2)
+    target_compile_options(astraldb_core PRIVATE /W4)
     if(ASTRALDB_WARNINGS_AS_ERRORS)
         target_compile_options(astraldb_core PRIVATE /WX)
     endif()
 else()
-    target_compile_options(astraldb_core PRIVATE -Wall -Wextra -O2)
+    target_compile_options(astraldb_core PRIVATE -Wall -Wextra)
     if(ASTRALDB_WARNINGS_AS_ERRORS)
         target_compile_options(astraldb_core PRIVATE -Werror)
     endif()
 endif()
 
+astraldb_apply_target_options(astraldb_core)
+
 add_executable(astraldb
     sources/Program.cxx
 )
 target_link_libraries(astraldb PRIVATE astraldb_core)
+astraldb_apply_target_options(astraldb)
 
 add_executable(astraldb_tests
     tests/TestMain.cxx
@@ -77,6 +95,10 @@ add_executable(astraldb_tests
 target_link_libraries(astraldb_tests PRIVATE astraldb_core)
 target_include_directories(astraldb_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 set_target_properties(astraldb_tests PROPERTIES OUTPUT_NAME run_tests)
+astraldb_apply_target_options(astraldb_tests)
 
 enable_testing()
-add_test(NAME astraldb_all_tests COMMAND $<TARGET_FILE:astraldb_tests>)
+add_test(NAME astraldb_fast_tests COMMAND $<TARGET_FILE:astraldb_tests>)
+set_tests_properties(astraldb_fast_tests PROPERTIES LABELS "fast")
+add_test(NAME astraldb_perf_tests COMMAND $<TARGET_FILE:astraldb_tests> --test-suite=perf)
+set_tests_properties(astraldb_perf_tests PROPERTIES LABELS "perf")

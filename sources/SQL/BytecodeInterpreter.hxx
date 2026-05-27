@@ -13,6 +13,7 @@
 #include <IO/Logger.hxx>
 #include <unordered_map>
 #include <filesystem>
+#include <vector>
 
 namespace AstralDB {
 namespace SQL {
@@ -43,6 +44,20 @@ class BytecodeInterpreter {
 	std::size_t StepsExecuted_ = 0;
 	VmDebugSession *DebugSession_ = nullptr;
 	std::optional<StorageLayout> SessionStorageHint_;
+	/** Extra SELECT columns pushed by the most recent \c COLUMNS_EXPAND in this query. */
+	size_t ColumnsExpandExtra_ = 0;
+
+	struct ProcTryFrame {
+		std::string Savepoint;
+		std::size_t EndIc = 0;
+		std::vector<std::pair<std::size_t, std::string>> Handlers;
+	};
+	std::vector<ProcTryFrame> ProcTryStack_;
+
+	bool DispatchProcedureException(const std::runtime_error &Err);
+	void VmSavepoint(const std::string &Name);
+	void VmRollbackToSavepoint(const std::string &Name);
+	void VmReleaseSavepoint(const std::string &Name);
 
 	void CleanupStack();
 
@@ -104,12 +119,32 @@ public:
 
 	std::vector<uint64_t> Registers() const { return Registers_; }
 
-	Database *PrimaryDatabase() { return Databases_.empty() ? nullptr : Databases_[0].get(); }
+	Database *BorrowedPrimary_ = nullptr;
+	Database *PrimaryDatabase() {
+		if(BorrowedPrimary_)
+			return BorrowedPrimary_;
+		return Databases_.empty() ? nullptr : Databases_[0].get();
+	}
 
-	const Database *PrimaryDatabase() const { return Databases_.empty() ? nullptr : Databases_[0].get(); }
+	const Database *PrimaryDatabase() const {
+		if(BorrowedPrimary_)
+			return BorrowedPrimary_;
+		return Databases_.empty() ? nullptr : Databases_[0].get();
+	}
 
 	/** Open the primary Database instance at DatabasePath without executing bytecode (catalog used at compile-time). */
 	void EnsurePrimaryDatabaseOpened();
+	/** Use an already-open session database (trigger/procedure nested execution under DbMutex). */
+	void SetBorrowedPrimaryDatabase(Database *Db) { BorrowedPrimary_ = Db; }
+
+	/** DML/DDL target; uses \c BorrowedPrimary_ when set (nested trigger/procedure bytecode). */
+	Database *MutatingDatabase() {
+		if(BorrowedPrimary_)
+			return BorrowedPrimary_;
+		if(Databases_.empty())
+			Databases_.push_back(std::make_unique<Database>(DatabasePath_, Logger_));
+		return Databases_[0].get();
+	}
 
 	/** Recreate primary database connection from DbPath disk state (used after WAL/snapshot restores). */
 	void ReloadPrimaryDatabaseFromDisk();

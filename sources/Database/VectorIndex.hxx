@@ -14,6 +14,8 @@ class VectorIndex {
 	VectorMetric Metric_ = VectorMetric::Cosine;
 	std::vector<size_t> RowIds_;
 	std::vector<std::vector<double>> Vectors_;
+	std::vector<std::vector<float>> FloatVectors_;
+	std::vector<float> Norms_;
 
 public:
 	void Clear();

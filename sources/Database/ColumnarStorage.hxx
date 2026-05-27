@@ -27,4 +27,13 @@ struct ColumnarGroupBy {
 	static bool TryRun(RowTable &Tbl, const SQL::Instruction &Inst, const std::vector<std::string> &ActiveKeys);
 };
 
+/** O(n) sliding SUM for \c ROWS BETWEEN fixed preceding and \c CURRENT ROW on columnar storage. */
+bool TrySlidingSumRowsFrame(ColumnarTable &Col, const std::string &PartCol, const std::string &OrderCol,
+                            const std::string &SrcCol, const std::string &OutCol, std::size_t PrecedingRows,
+                            bool OrderAscending);
+
+/** Append \p Count synthetic rows into columnar columns (schema-aware names). */
+void AppendBulkSyntheticColumnar(ColumnarTable &Col, const std::vector<std::string> &ColNames, int64_t Count,
+                                 int64_t StartId, int64_t Step);
+
 } // namespace AstralDB

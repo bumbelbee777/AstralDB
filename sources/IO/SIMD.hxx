@@ -18,6 +18,13 @@ namespace Simd {
 
 enum class Arch : int8_t { Scalar = 0, Sse2 = 1, Avx2 = 2, Neon = 3, Riscv = 4 };
 
+struct KernelConfig {
+	size_t VectorWidthF32;
+	size_t DotUnroll;
+	size_t GemvMr;
+	size_t GemvKc;
+};
+
 constexpr Arch DetectArch() {
 #if defined(__AVX2__)
 	return Arch::Avx2;
@@ -31,6 +38,8 @@ constexpr Arch DetectArch() {
 	return Arch::Scalar;
 #endif
 }
+
+KernelConfig ActiveKernelConfig();
 
 inline void Memcpy(void *Dst, const void *Src, size_t Size) {
 #if defined(__AVX2__)
@@ -89,6 +98,7 @@ inline void Memset(void *Dst, uint8_t Value, size_t Size) {
 }
 
 float DotProductF32(const float *A, const float *B, size_t Count);
+float L2SquaredF32(const float *A, const float *B, size_t Count);
 void AddF32(float *Dst, const float *A, const float *B, size_t Count);
 void SubF32(float *Dst, const float *A, const float *B, size_t Count);
 void MulF32(float *Dst, const float *A, const float *B, size_t Count);
@@ -99,7 +109,14 @@ void ComplexMulF32(const float *ARe, const float *AIm, const float *BRe, const f
 /** \p OutRe/OutIm += A ⊙ B in the complex sense, length \p Count. */
 void ComplexMulAccumulateF32(const float *ARe, const float *AIm, const float *BRe, const float *BIm, float *OutRe,
                              float *OutIm, size_t Count);
+/** Interleaved [re,im,…] buffers; \p OutRe/OutIm += sum conj(A[i])·B[i]. */
+void ComplexDotHermitianInterleavedF32(const float *A, const float *B, size_t Slots, float &OutRe, float &OutIm);
+void ComplexAddInterleavedF32(float *Dst, const float *A, const float *B, size_t Slots);
+void ComplexScaleInterleavedF32(float *Dst, const float *A, float ScaleRe, float ScaleIm, size_t Slots);
+void ComplexNormSqInterleavedF32(const float *A, size_t Slots, float &OutRe, float &OutIm);
 void MatrixVectorMulF32(const float *MatrixRowMajor, const float *Vector, float *Out, size_t Rows, size_t Cols);
+/** Complex matrix (row-major interleaved per entry) × interleaved vector. */
+void ComplexMatVecInterleavedF32(const float *Mat, const float *Vec, float *Out, size_t Rows, size_t Cols);
 
 } // namespace Simd
 

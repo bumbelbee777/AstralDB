@@ -29,8 +29,9 @@ jobs:
               -G Ninja
               -DCMAKE_BUILD_TYPE=Release
               -DCMAKE_CXX_COMPILER=g++
+              -DASTRALDB_RELEASE_PROFILE=size
             build: cmake --build build-ci
-            test: ctest --test-dir build-ci --output-on-failure
+            test: ctest --test-dir build-ci -L fast --output-on-failure
             cli: build-ci/astraldb
             artifact: astraldb-linux-amd64
 
@@ -42,7 +43,7 @@ jobs:
               -DCMAKE_BUILD_TYPE=Release
               -DCMAKE_CXX_COMPILER=clang++-18
             build: cmake --build build-ci
-            test: ctest --test-dir build-ci --output-on-failure
+            test: ctest --test-dir build-ci -L fast --output-on-failure
             cli: build-ci/astraldb
             artifact: astraldb-linux-amd64-clang
 
@@ -53,7 +54,7 @@ jobs:
               -G Ninja
               -DCMAKE_BUILD_TYPE=Release
             build: cmake --build build-ci
-            test: ctest --test-dir build-ci --output-on-failure
+            test: ctest --test-dir build-ci -L fast --output-on-failure
             cli: build-ci/astraldb
             artifact: astraldb-macos-arm64
 
@@ -64,10 +65,25 @@ jobs:
               -G Ninja
               -DCMAKE_BUILD_TYPE=Release
               -DCMAKE_CXX_COMPILER=clang++
+              -DASTRALDB_RELEASE_PROFILE=size
             build: cmake --build build-ci
-            test: ctest --test-dir build-ci --output-on-failure
+            test: ctest --test-dir build-ci -L fast --output-on-failure
             cli: build-ci/astraldb.exe
             artifact: astraldb-windows-amd64
+
+          - name: Linux (GCC speed + SIMD)
+            os: ubuntu-24.04
+            configure: >-
+              cmake -S . -B build-ci
+              -G Ninja
+              -DCMAKE_BUILD_TYPE=Release
+              -DCMAKE_CXX_COMPILER=g++
+              -DASTRALDB_RELEASE_PROFILE=speed
+              -DASTRALDB_SIMD=avx2
+            build: cmake --build build-ci
+            test: ctest --test-dir build-ci -L fast --output-on-failure
+            cli: build-ci/astraldb
+            artifact: astraldb-linux-amd64-speed
 
     steps:
       - name: Checkout

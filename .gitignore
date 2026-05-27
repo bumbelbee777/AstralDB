@@ -1,27 +1,55 @@
+# Binaries and build trees
 AstralDB
 AstralDB.exe
-astral.db.wal
-debug.log
+astraldb
+astraldb.exe
 *.o
 *.obj
 .cache/
 obj/
 build/
-build-cmake/
-.pytest_cache/
-__pycache__/
-.quasar/
-app/
-*.pyc
 build-ci/
-dist/
-quasar.egg-info/
-.vscode/
-.build/
+build-cmake/
 buildtmp/
+.build/
 bin/
 app/.build/
+
+# CMake / Python packaging
+dist/
+quasar.egg-info/
+.pytest_cache/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Session databases and catalogs
+astral.db
+astral.db.wal
+astraldb_procs.json
+astraldb_triggers.json
+astraldb_procs_cache/
+astraldb_triggers_cache/
+
+# Logs and local scratch
+*.log
+debug.log
 build.log
 build.log.old
 astraldb.log
-astral.db
+opt_unit.log
+bc_tools.log
+tmp*.sql
+tmp*.cxx
+tmp.abc
+
+# IDE / local tooling
+.vscode/
+.quasar/
+app/
+.codegraph/
+
+# Cursor (keep rules in repo; ignore local state)
+.cursor/*
+!.cursor/rules/

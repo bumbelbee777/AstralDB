@@ -2,6 +2,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT
 #include <doctest/doctest.h>
 #include <filesystem>
+#include <string_view>
 
 namespace {
 namespace fs = std::filesystem;
@@ -19,6 +20,15 @@ void NormalizeWorkingDirectoryToRepoRoot() {
 		P = P.parent_path();
 	}
 }
+bool ArgRequestsTestSuite(int Argc, char **Argv) {
+	for(int I = 1; I < Argc; ++I) {
+		const std::string_view A(Argv[I]);
+		if(A == "--test-suite" || A == "-ts" || A.starts_with("--test-suite=") || A.starts_with("-ts="))
+			return true;
+	}
+	return false;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -26,5 +36,7 @@ int main(int argc, char **argv) {
 	doctest::Context Ctx;
 	Ctx.applyCommandLine(argc, argv);
 	Ctx.setOption("duration", false);
+	if(!ArgRequestsTestSuite(argc, argv))
+		Ctx.addFilter("test-suite-exclude", "perf");
 	return Ctx.run();
 }

@@ -10,32 +10,36 @@
 namespace AstralDB {
 namespace {
 
-double L2Distance(const std::vector<double> &A, const std::vector<double> &B) {
-	if(A.size() != B.size())
-		return std::numeric_limits<double>::infinity();
-	double Acc = 0.0;
-	for(size_t I = 0; I < A.size(); ++I) {
-		const double D = A[I] - B[I];
-		Acc += D * D;
-	}
-	return std::sqrt(Acc);
+std::vector<float> ToFloatVector(const std::vector<double> &In) {
+	std::vector<float> Out;
+	Out.reserve(In.size());
+	for(double X : In)
+		Out.push_back(static_cast<float>(X));
+	return Out;
 }
 
-double CosineDistance(const std::vector<double> &A, const std::vector<double> &B) {
+float NormF32(const std::vector<float> &V) {
+	if(V.empty())
+		return 0.f;
+	return std::sqrt(Simd::DotProductF32(V.data(), V.data(), V.size()));
+}
+
+double L2Distance(const std::vector<float> &A, const std::vector<float> &B) {
+	if(A.size() != B.size())
+		return std::numeric_limits<double>::infinity();
+	if(A.empty())
+		return std::numeric_limits<double>::infinity();
+	const float DistSq = Simd::L2SquaredF32(A.data(), B.data(), A.size());
+	return std::sqrt(static_cast<double>(DistSq));
+}
+
+double CosineDistance(const std::vector<float> &A, const std::vector<float> &B, float NormA, float NormB) {
 	if(A.size() != B.size() || A.empty())
 		return std::numeric_limits<double>::infinity();
-	std::vector<float> Af(A.begin(), A.end());
-	std::vector<float> Bf(B.begin(), B.end());
-	const float Dot = Simd::DotProductF32(Af.data(), Bf.data(), Af.size());
-	double Na = 0.0;
-	double Nb = 0.0;
-	for(double X : A)
-		Na += X * X;
-	for(double X : B)
-		Nb += X * X;
-	if(Na == 0.0 || Nb == 0.0)
+	if(NormA == 0.f || NormB == 0.f)
 		return std::numeric_limits<double>::infinity();
-	const double Sim = static_cast<double>(Dot) / (std::sqrt(Na) * std::sqrt(Nb));
+	const float Dot = Simd::DotProductF32(A.data(), B.data(), A.size());
+	const double Sim = static_cast<double>(Dot) / (static_cast<double>(NormA) * static_cast<double>(NormB));
 	return 1.0 - Sim;
 }
 
@@ -44,6 +48,8 @@ double CosineDistance(const std::vector<double> &A, const std::vector<double> &B
 void VectorIndex::Clear() {
 	RowIds_.clear();
 	Vectors_.clear();
+	FloatVectors_.clear();
+	Norms_.clear();
 }
 
 void VectorIndex::BuildFromColumn(const std::vector<std::unordered_map<std::string, std::string>> &Rows,
@@ -51,6 +57,8 @@ void VectorIndex::BuildFromColumn(const std::vector<std::unordered_map<std::stri
 	Clear();
 	RowIds_.reserve(Rows.size());
 	Vectors_.reserve(Rows.size());
+	FloatVectors_.reserve(Rows.size());
+	Norms_.reserve(Rows.size());
 	for(size_t I = 0; I < Rows.size(); ++I) {
 		auto It = Rows[I].find(Column);
 		if(It == Rows[I].end())
@@ -60,6 +68,8 @@ void VectorIndex::BuildFromColumn(const std::vector<std::unordered_map<std::stri
 			continue;
 		RowIds_.push_back(I);
 		Vectors_.push_back(*Vec);
+		FloatVectors_.push_back(ToFloatVector(*Vec));
+		Norms_.push_back(NormF32(FloatVectors_.back()));
 	}
 }
 
@@ -67,11 +77,15 @@ void VectorIndex::UpsertRow(size_t RowId, const std::vector<double> &Vec) {
 	for(size_t I = 0; I < RowIds_.size(); ++I) {
 		if(RowIds_[I] == RowId) {
 			Vectors_[I] = Vec;
+			FloatVectors_[I] = ToFloatVector(Vec);
+			Norms_[I] = NormF32(FloatVectors_[I]);
 			return;
 		}
 	}
 	RowIds_.push_back(RowId);
 	Vectors_.push_back(Vec);
+	FloatVectors_.push_back(ToFloatVector(Vec));
+	Norms_.push_back(NormF32(FloatVectors_.back()));
 }
 
 void VectorIndex::RemoveRow(size_t RowId) {
@@ -79,6 +93,8 @@ void VectorIndex::RemoveRow(size_t RowId) {
 		if(RowIds_[I] == RowId) {
 			RowIds_.erase(RowIds_.begin() + static_cast<std::ptrdiff_t>(I));
 			Vectors_.erase(Vectors_.begin() + static_cast<std::ptrdiff_t>(I));
+			FloatVectors_.erase(FloatVectors_.begin() + static_cast<std::ptrdiff_t>(I));
+			Norms_.erase(Norms_.begin() + static_cast<std::ptrdiff_t>(I));
 			return;
 		}
 	}
@@ -89,11 +105,14 @@ std::vector<size_t> VectorIndex::TopK(const std::vector<double> &Query, std::siz
 		size_t RowId;
 		double Score;
 	};
+	const std::vector<float> QueryF = ToFloatVector(Query);
+	const float QueryNorm = NormF32(QueryF);
 	std::vector<Scored> Ranked;
 	Ranked.reserve(RowIds_.size());
 	for(size_t I = 0; I < RowIds_.size(); ++I) {
-		const double Dist = Metric_ == VectorMetric::Cosine ? CosineDistance(Vectors_[I], Query) :
-		                                                      L2Distance(Vectors_[I], Query);
+		const double Dist = Metric_ == VectorMetric::Cosine ?
+		                        CosineDistance(FloatVectors_[I], QueryF, Norms_[I], QueryNorm) :
+		                        L2Distance(FloatVectors_[I], QueryF);
 		Ranked.push_back({RowIds_[I], Dist});
 	}
 	const std::size_t Take = std::min(K, Ranked.size());

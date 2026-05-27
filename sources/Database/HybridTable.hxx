@@ -40,6 +40,8 @@ struct HybridTableSlot {
 	void RecordRead(bool AggregateQuery) const;
 	void RebuildColumnarFromRows();
 	void SyncColumnarAfterRowMutation();
+	/** When bulk used columnar-only append, build row store for VM scans. */
+	void EnsureRowStoreFromColumnar();
 	const Table &RowsForRead(std::optional<StorageLayout> QueryHint, bool AggregateQuery) const;
 };
 

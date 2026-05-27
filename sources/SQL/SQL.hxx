@@ -5,6 +5,8 @@
 #include <Database/User.hxx>
 #include <Database/HybridStorageScheduler.hxx>
 #include <SQL/Bytecode.hxx>
+#include <SQL/ProcedureParser.hxx>
+#include <SQL/BytecodeTriggers.hxx>
 #include <DS/Tree.hxx>
 #include <DS/BPlusTree.hxx>
 #include <DS/RadixTree.hxx>
@@ -142,6 +144,22 @@ struct ExistsPredAST : public ExpressionAST {
         : Negated(Neg), InnerTable(std::move(Tbl)), InnerWhere(std::move(W)) {}
     void EmitBytecode(BytecodeScratch& Instructions) const override;
 };
+
+/** \c col IN (SELECT inner_col FROM T [WHERE ...]) / \c NOT IN — same correlation rules as \c ExistsPredAST. */
+struct InSubqueryPredAST : public ExpressionAST {
+    bool Negated = false;
+    std::string LhsColumn;
+    std::string InnerTable;
+    std::string InnerValueColumn;
+    std::unique_ptr<ExpressionAST> InnerWhere;
+    InSubqueryPredAST(bool Neg, std::string LhsCol, std::string Tbl, std::string InnerCol,
+                      std::unique_ptr<ExpressionAST> W)
+        : Negated(Neg), LhsColumn(std::move(LhsCol)), InnerTable(std::move(Tbl)),
+          InnerValueColumn(std::move(InnerCol)), InnerWhere(std::move(W)) {}
+    void EmitBytecode(BytecodeScratch& Instructions) const override;
+};
+
+enum class WindowFrameUnit : int8_t { Rows = 0, Range = 1 };
 
 /** Target family for `CAST(... AS type)` (cells stay strings; selects conversion rules in the VM). */
 enum class SqlCastTarget : int8_t { Text = 0, Integer = 1, Real = 2, Boolean = 3, Advanced = 4 };
@@ -326,6 +344,87 @@ enum class ScalarSqlFn : int16_t {
 	StElevation = 174,
 	StDemSample = 175,
 	StTerrainSlope = 176,
+	/** \c LIST_TRANSFORM(list, x -> expr) — DuckDB-style list map with a lambda. */
+	ListTransform = 177,
+	OdeTrapezoid = 178,
+	OdeSemiImplicit = 179,
+	OdeCrankNicolson = 180,
+	ClassifyLinear = 181,
+	ClassifyLogistic = 182,
+	ClassifyArgmax = 183,
+	ClassifyOneVsRest = 184,
+	NlpTokenize = 185,
+	NlpNgrams = 186,
+	NlpJaccard = 187,
+	NlpEditDist = 188,
+	NlpStem = 189,
+	NlpEmbedBuild = 190,
+	NlpEmbedLookup = 191,
+	NlpEmbedBatch = 192,
+	NlpEmbedSerialize = 193,
+	NlpEmbedLoad = 194,
+	NlpEmbedFingerprint = 195,
+	NlpEmbedMean = 196,
+	StMeshDefine = 197,
+	StMeshImportGltf = 198,
+	StMeshExportGltf = 199,
+	StMeshSew = 200,
+	StMeshUnion = 201,
+	StMeshIntersection = 202,
+	StMeshDifference = 203,
+	StPolygon = 204,
+	StPolygonWkt = 205,
+	StGeomAsText = 206,
+	StGeomArea = 207,
+	StGeomPerimeter = 208,
+	StGeomCentroid = 209,
+	StGeomContains = 210,
+	StGeomWithin = 211,
+	StGeomIntersects = 212,
+	StGeomOverlaps = 213,
+	StGeomTouches = 214,
+	StGeomUnion = 215,
+	StGeomIntersection = 216,
+	StGeomDifference = 217,
+	StGeomSymDifference = 218,
+	StGeomBuffer = 219,
+	StGeomSimplify = 220,
+	StGeomConvexHull = 221,
+	StGeojsonImport = 222,
+	StGeojsonExport = 223,
+	StMeshVolume = 224,
+	StMeshSurfaceArea = 225,
+	StMeshCentroid = 226,
+	StMeshTranslate = 227,
+	StMeshScale = 228,
+	StMeshRotate = 229,
+	StMeshBounds = 230,
+	StMeshMerge = 231,
+	StGeomValidate = 232,
+	StGeomRepair = 233,
+	StMeshValidate = 234,
+	StMeshRepair = 235,
+	RegexpMatch = 236,
+	OdeRk3 = 237,
+	OdeAdamsBashforth2 = 238,
+	OdeMarch = 239,
+	SdeMarch = 240,
+	LinearJacobiStep = 241,
+	LinearGaussSeidelStep = 242,
+	LinearSorStep = 243,
+	LinearRichardsonStep = 244,
+	LinearCgSolve = 245,
+	SolveLinear = 246,
+	PdePoissonGsStep = 247,
+	PdePoissonSorStep = 248,
+	PdePoissonSolve = 249,
+	PdeHeatMarch = 250,
+	SolvePde = 251,
+	RootNewtonStep = 252,
+	RootSecantStep = 253,
+	RootBisectStep = 254,
+	RootHalleyStep = 255,
+	SolveRoot = 256,
 };
 
 static_assert(sizeof(std::underlying_type_t<ScalarSqlFn>) >= 2,
@@ -363,6 +462,47 @@ struct CaseExprAST : public ExpressionAST {
         : Arms(std::move(A)), ElseResult(std::move(Else)) {}
 
     void EmitBytecode(BytecodeScratch& Instructions) const override;
+};
+
+/** \c COALESCE / \c IFNULL / \c NVL — arbitrary scalar arguments (nested calls allowed). */
+struct CoalesceExprAST : public ExpressionAST {
+	std::vector<std::unique_ptr<ExpressionAST>> Args;
+
+	explicit CoalesceExprAST(std::vector<std::unique_ptr<ExpressionAST>> ArgsIn) : Args(std::move(ArgsIn)) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
+/** Oracle \c NVL2(expr, not_null_val, null_val). */
+struct Nvl2ExprAST : public ExpressionAST {
+	std::unique_ptr<ExpressionAST> Subject;
+	std::unique_ptr<ExpressionAST> NotNullVal;
+	std::unique_ptr<ExpressionAST> NullVal;
+
+	Nvl2ExprAST(std::unique_ptr<ExpressionAST> SubjectIn, std::unique_ptr<ExpressionAST> NotNullIn,
+	            std::unique_ptr<ExpressionAST> NullIn)
+	    : Subject(std::move(SubjectIn)), NotNullVal(std::move(NotNullIn)), NullVal(std::move(NullIn)) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
+/** DuckDB-style lambda: \c param -> body (param bound per call site). */
+struct LambdaExprAST : public ExpressionAST {
+	std::vector<std::string> Params;
+	std::unique_ptr<ExpressionAST> Body;
+
+	LambdaExprAST(std::vector<std::string> ParamsIn, std::unique_ptr<ExpressionAST> BodyIn)
+	    : Params(std::move(ParamsIn)), Body(std::move(BodyIn)) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
+enum class ColumnsPickMode : int8_t { All = 0, Glob = 1, Lambda = 2 };
+
+/** \c COLUMNS(*) / \c COLUMNS('pat') / \c COLUMNS(c -> pred) — expanded at SELECT codegen/VM time. */
+struct ColumnsExprAST : public ExpressionAST {
+	ColumnsPickMode Mode = ColumnsPickMode::All;
+	std::string GlobPattern;
+	std::unique_ptr<LambdaExprAST> Lambda;
+
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
 };
 
 /** `CAST(expr AS type)` in SELECT projections; lowered via \c Opcode::CAST_EVAL . */
@@ -578,9 +718,20 @@ struct WindowSpec {
     bool OrderAscending = true;
     std::string OutputColumn;
     int64_t FrameOffset = 1;
-    bool HasExplicitRowsFrame = false;
+    bool HasExplicitFrame = false;
+    WindowFrameUnit FrameUnit = WindowFrameUnit::Rows;
     WindowFrameBound FrameStart{WindowFrameBoundKind::UnboundedPreceding};
     WindowFrameBound FrameEnd{WindowFrameBoundKind::CurrentRow};
+};
+
+/** Oracle \c CONNECT BY / \c START WITH hierarchy over a single table. */
+struct ConnectBySpec {
+	std::string ParentColumn;
+	std::string ChildColumn;
+	/** When true, \c PRIOR was written on the parent side of the equality. */
+	bool PriorOnParent = true;
+	std::unique_ptr<ExpressionAST> StartWith;
+	bool NoCycle = false;
 };
 
 class SelectAST : public StatementAST {
@@ -660,6 +811,8 @@ public:
 	void SetAsOfTimestamp(std::optional<std::string> Ts) { AsOfTimestamp_ = std::move(Ts); }
 	const std::optional<MatchRecognizeSpec> &MatchRecognize() const { return MatchRecognize_; }
 	void SetMatchRecognize(std::optional<MatchRecognizeSpec> Spec) { MatchRecognize_ = std::move(Spec); }
+	const std::optional<ConnectBySpec> &ConnectBy() const { return ConnectBy_; }
+	void SetConnectBy(std::optional<ConnectBySpec> Spec) { ConnectBy_ = std::move(Spec); }
 
 	/** Output column name for \c COUNT(*) / \c COUNT(DISTINCT…) in this SELECT (empty when no count aggregate). */
 	const std::string &CountAggregateOutputColumn() const { return CountAggregateOutputColumn_; }
@@ -667,8 +820,10 @@ public:
     /** Parser attaches trailing ORDER BY / LIMIT after the FROM…HAVING clause (single SELECT only). */
     void ApplyQueryOrdering(std::vector<std::pair<std::string, bool>> OrderByColumns, int64_t Limit, int64_t Offset) {
         OrderByColumns_ = std::move(OrderByColumns);
-        Limit_ = Limit;
-        Offset_ = Offset;
+        if(Limit >= 0)
+            Limit_ = Limit;
+        if(Offset > 0)
+            Offset_ = Offset;
     }
 
     /** Join/filter/project pipeline through window step; JOIN scratch tables use JoinDestPrefix + index. */
@@ -702,6 +857,7 @@ private:
 	std::optional<StorageLayout> StorageHint_;
 	std::optional<std::string> AsOfTimestamp_;
 	std::optional<MatchRecognizeSpec> MatchRecognize_;
+	std::optional<ConnectBySpec> ConnectBy_;
 };
 
 enum class CompoundSetOpKind : int8_t {
@@ -753,9 +909,20 @@ struct CreateProcedureAST : public StatementAST {
 	std::string ProcedureName;
 	std::string BodySql_;
 	bool IfNotExists = false;
+	bool OrReplace = false;
+	/** \c plsql, \c plpgsql, or empty for AstralDB parenthesized syntax. */
+	std::string SourceDialect_;
+	std::vector<ProcedureExceptionWhen> ExceptionHandlers_;
 
-	CreateProcedureAST(std::string Name_, std::string BodySql_, bool IfNotExists_ = false)
-	    : ProcedureName(std::move(Name_)), BodySql_(std::move(BodySql_)), IfNotExists(IfNotExists_) {}
+	CreateProcedureAST(std::string Name_, std::string BodySql_, bool IfNotExists_ = false, bool OrReplace_ = false,
+	                    std::string SourceDialect_ = {},
+	                    std::vector<ProcedureExceptionWhen> ExceptionHandlers_ = {})
+	    : ProcedureName(std::move(Name_)),
+	      BodySql_(std::move(BodySql_)),
+	      IfNotExists(IfNotExists_),
+	      OrReplace(OrReplace_),
+	      SourceDialect_(std::move(SourceDialect_)),
+	      ExceptionHandlers_(std::move(ExceptionHandlers_)) {}
 
 	void EmitBytecode(BytecodeScratch &Instructions) const override;
 };
@@ -770,11 +937,48 @@ struct DropProcedureAST : public StatementAST {
 	void EmitBytecode(BytecodeScratch &Instructions) const override;
 };
 
-/** \c CALL name or \c EXECUTE PROCEDURE name . */
+/** \c CALL / \c EXEC / \c EXECUTE [PROCEDURE] name — all lower to \c CALL_PROCEDURE . */
 struct CallProcedureAST : public StatementAST {
 	std::string ProcedureName;
+	/** \c call, \c execute, or \c exec — stored for procedure dependency / audit metadata. */
+	std::string InvokeKind = "call";
 
-	explicit CallProcedureAST(std::string Name_) : ProcedureName(std::move(Name_)) {}
+	CallProcedureAST(std::string Name_, std::string InvokeKind_ = "call")
+	    : ProcedureName(std::move(Name_)), InvokeKind(std::move(InvokeKind_)) {}
+
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
+struct CreateTriggerAST : public StatementAST {
+	std::string TriggerName;
+	std::string TableName;
+	TriggerTiming Timing = TriggerTiming::After;
+	TriggerEvent Event = TriggerEvent::Insert;
+	bool ForEachRow = true;
+	std::string ActionKind;
+	std::string ProcedureName;
+	std::string BodySql_;
+	bool IfNotExists = false;
+	bool OrReplace = false;
+
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
+struct DropTriggerAST : public StatementAST {
+	std::string TriggerName;
+	bool IfExists = false;
+
+	explicit DropTriggerAST(std::string Name_, bool IfExists_ = false)
+	    : TriggerName(std::move(Name_)), IfExists(IfExists_) {}
+
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
+struct AlterTriggerAST : public StatementAST {
+	std::string TriggerName;
+	bool Enable = true;
+
+	AlterTriggerAST(std::string Name_, bool Enable_) : TriggerName(std::move(Name_)), Enable(Enable_) {}
 
 	void EmitBytecode(BytecodeScratch &Instructions) const override;
 };
@@ -807,17 +1011,30 @@ struct UpsertSpec {
 	OnConflict Mode = OnConflict::Update;
 	std::vector<std::string> ConflictColumns;
 	std::vector<UpsertAssign> UpdateAssignments;
+	/** SQLite \c REPLACE INTO: on PK conflict, refresh all inserted columns from the new row. */
+	bool SqliteReplace = false;
+	/** \c REPLACE INTO without a column list: assign every table column from \c EXCLUDED at runtime. */
+	bool SqliteReplaceImplicitSchema = false;
 };
 
 struct InsertAST : public ExpressionAST {
     std::unique_ptr<TableAST> Table;
     std::vector<std::string> Columns;
-    std::vector<std::vector<std::string>> Values;
+    std::vector<std::vector<std::unique_ptr<ExpressionAST>>> Values;
 	std::optional<UpsertSpec> Upsert_;
+	/** Optional Postgres-style RETURNING clause. */
+	bool HasReturning = false;
+	/** If true, RETURNING * (otherwise ReturningColumns is used). */
+	bool ReturningAll = false;
+	/** Explicit RETURNING column list (only used when ReturningAll == false). */
+	std::vector<std::string> ReturningColumns;
 public:
     InsertAST(std::unique_ptr<TableAST> Table, std::vector<std::string> Columns,
-              std::vector<std::vector<std::string>> Values, std::optional<UpsertSpec> Upsert = std::nullopt)
-        : Table(std::move(Table)), Columns(std::move(Columns)), Values(std::move(Values)), Upsert_(std::move(Upsert)) {}
+              std::vector<std::vector<std::unique_ptr<ExpressionAST>>> Values,
+              std::optional<UpsertSpec> Upsert = std::nullopt,
+              bool HasReturningIn = false, bool ReturningAllIn = false, std::vector<std::string> ReturningColumnsIn = {})
+        : Table(std::move(Table)), Columns(std::move(Columns)), Values(std::move(Values)), Upsert_(std::move(Upsert)),
+          HasReturning(HasReturningIn), ReturningAll(ReturningAllIn), ReturningColumns(std::move(ReturningColumnsIn)) {}
     void EmitBytecode(BytecodeScratch& Instructions) const override;
 };
 
@@ -864,9 +1081,17 @@ struct UpdateAST : public ExpressionAST {
 
     UpdateAST(std::string TableName,
               std::vector<std::pair<std::string, std::unique_ptr<ExpressionAST>>> Assignments,
-              std::unique_ptr<ExpressionAST> Condition)
+              std::unique_ptr<ExpressionAST> Condition, bool HasReturningIn = false, bool ReturningAllIn = false,
+              std::vector<std::string> ReturningColumnsIn = {})
         : TableName(std::move(TableName)), Assignments(std::move(Assignments)),
-          Condition(std::move(Condition)) {}
+          Condition(std::move(Condition)), HasReturning(HasReturningIn), ReturningAll(ReturningAllIn),
+          ReturningColumns(std::move(ReturningColumnsIn)) {}
+	/** Optional Postgres-style RETURNING clause. */
+	bool HasReturning = false;
+	/** If true, RETURNING * (otherwise ReturningColumns is used). */
+	bool ReturningAll = false;
+	/** Explicit RETURNING column list (only used when ReturningAll == false). */
+	std::vector<std::string> ReturningColumns;
     void EmitBytecode(BytecodeScratch& Instructions) const override;
 };
 
@@ -874,8 +1099,16 @@ struct DeleteAST : public ExpressionAST {
     std::string TableName;
     std::unique_ptr<ExpressionAST> Condition;
 
-    DeleteAST(std::string TableName, std::unique_ptr<ExpressionAST> Condition)
-        : TableName(std::move(TableName)), Condition(std::move(Condition)) {}
+    DeleteAST(std::string TableName, std::unique_ptr<ExpressionAST> Condition, bool HasReturningIn = false,
+              bool ReturningAllIn = false, std::vector<std::string> ReturningColumnsIn = {})
+        : TableName(std::move(TableName)), Condition(std::move(Condition)), HasReturning(HasReturningIn),
+          ReturningAll(ReturningAllIn), ReturningColumns(std::move(ReturningColumnsIn)) {}
+	/** Optional Postgres-style RETURNING clause. */
+	bool HasReturning = false;
+	/** If true, RETURNING * (otherwise ReturningColumns is used). */
+	bool ReturningAll = false;
+	/** Explicit RETURNING column list (only used when ReturningAll == false). */
+	std::vector<std::string> ReturningColumns;
     void EmitBytecode(BytecodeScratch& Instructions) const override;
 };
 
@@ -956,6 +1189,33 @@ struct DropRoleAST : public StatementAST {
 	void EmitBytecode(BytecodeScratch &Instructions) const override;
 };
 
+struct CreateUserAST : public StatementAST {
+	std::string UserName;
+	std::string Password;
+	bool IfNotExists = false;
+
+	CreateUserAST(std::string Name, std::string Password, bool IfNotExists)
+	    : UserName(std::move(Name)), Password(std::move(Password)), IfNotExists(IfNotExists) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
+struct DropUserAST : public StatementAST {
+	std::string UserName;
+	bool IfExists = false;
+
+	DropUserAST(std::string Name, bool IfExists) : UserName(std::move(Name)), IfExists(IfExists) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
+struct AlterUserPasswordAST : public StatementAST {
+	std::string UserName;
+	std::string Password;
+
+	AlterUserPasswordAST(std::string Name, std::string Password)
+	    : UserName(std::move(Name)), Password(std::move(Password)) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
 struct CreateSequenceAST : public StatementAST {
 	std::string SequenceName;
 	int64_t Start = 1;
@@ -1017,6 +1277,25 @@ struct DropDatasetAST : public StatementAST {
 	std::string DatasetName;
 
 	explicit DropDatasetAST(std::string Name) : DatasetName(std::move(Name)) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
+struct CreateEmbeddingAST : public StatementAST {
+	std::string EmbeddingName;
+	std::string SourceTable;
+	std::string TokenColumn;
+	std::string VectorColumn;
+
+	CreateEmbeddingAST(std::string Name, std::string Table, std::string TokenCol, std::string VecCol)
+	    : EmbeddingName(std::move(Name)), SourceTable(std::move(Table)), TokenColumn(std::move(TokenCol)),
+	      VectorColumn(std::move(VecCol)) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
+struct DropEmbeddingAST : public StatementAST {
+	std::string EmbeddingName;
+
+	explicit DropEmbeddingAST(std::string Name) : EmbeddingName(std::move(Name)) {}
 	void EmitBytecode(BytecodeScratch &Instructions) const override;
 };
 
@@ -1239,11 +1518,18 @@ class Parser {
 
     ASTNode ParseExpression();
     ASTNode ParseCreateStatement();
+	ASTNode ParseCreateUserStatement();
+	std::string ParseIdentifiedByPassword();
 	ASTNode ParseCreateIndexStatement();
 	ASTNode ParseCreateViewStatement();
-	ASTNode ParseCreateProcedureStatement();
+	ASTNode ParseCreateProcedureStatement(bool OrReplace = false);
+	std::string_view SliceStatementFrom(std::size_t BeginByte) const;
+	void AdvanceThroughStatementSemicolon(std::size_t StmtStart);
 	ASTNode ParseDropProcedureStatement();
-	ASTNode ParseCallProcedureStatement();
+	ASTNode ParseCallProcedureStatement(std::string DefaultInvokeKind = "call");
+	ASTNode ParseCreateTriggerStatement(bool OrReplace = false);
+	ASTNode ParseDropTriggerStatement();
+	ASTNode ParseAlterTriggerStatement();
     ASTNode ParseSelectStatement();
     /** After consuming the SELECT keyword: one arm through HAVING (no ORDER BY / LIMIT). */
     std::unique_ptr<SelectAST> ParseSelectArmThroughHaving();
@@ -1251,7 +1537,15 @@ class Parser {
     void ApplyCteSubstitution(std::string &TableName) const;
     std::unique_ptr<CaseExprAST> ParseSearchedCaseExpression();
     std::unique_ptr<CaseExprAST> ParseCoalesceExpression();
+    std::unique_ptr<CoalesceExprAST> ParseCoalesceCallExpression();
     std::unique_ptr<ExpressionAST> ParseCaseScalarResult();
+    /** Scalar SELECT expression: literals, columns, calls, \c :: casts, \c || concat, arithmetic. */
+    std::unique_ptr<ExpressionAST> ParseScalarExpression();
+    std::unique_ptr<ExpressionAST> ParseScalarAddSub();
+    std::unique_ptr<ExpressionAST> ParseScalarMulDiv();
+    std::unique_ptr<ExpressionAST> ParseScalarConcat();
+    std::unique_ptr<LambdaExprAST> TryParseLambdaExpression();
+    std::unique_ptr<ColumnsExprAST> ParseColumnsExpression();
     /** RHS for UPDATE / UPSERT / MERGE SET (literals, qualified refs, + - * /). */
     std::unique_ptr<ExpressionAST> ParseSetValueExpression(const std::optional<std::string> &TargetAlias,
                                                          const std::optional<std::string> &SourceAlias,
@@ -1261,7 +1555,8 @@ class Parser {
     /** `ParseDataType()` result → cast family; \c ParseFail on unsupported `CAST` targets. */
     SqlCastTarget ParseCastTargetFromDataType(std::string ParsedType);
     ASTNode ParseExistsPredicate(bool Negated);
-    ASTNode ParseInsertStatement();
+    ASTNode ParseInSubqueryPredicate(bool Negated, std::unique_ptr<ExpressionAST> Lhs);
+    ASTNode ParseInsertStatement(bool SqliteReplace = false);
 	ASTNode ParseMergeStatement();
     ASTNode ParseUpdateStatement();
     ASTNode ParseDeleteStatement();
@@ -1280,7 +1575,11 @@ class Parser {
     ASTNode ParseReleaseSavepointStatement();
 	std::unique_ptr<StatementAST> ParseDataExchangeStatement();
     ASTNode ParseRollbackStatement();
-    std::string ParseDataType();
+    std::string ParseDataType(std::vector<std::string> *DialectConstraints = nullptr);
+    std::unique_ptr<ScalarFuncExprAST> TryParseConcatProjection();
+    std::unique_ptr<CaseExprAST> ParseDecodeExpression();
+    std::unique_ptr<Nvl2ExprAST> ParseNvl2Expression();
+    std::unique_ptr<ExpressionAST> ParseScalarPrimary();
     std::vector<std::string> ParseColumnConstraintList();
     TableConstraintDef ParseTableConstraint();
     ASTNode ParseUnaryOrPostfixPredicate();

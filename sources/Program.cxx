@@ -5,6 +5,7 @@
 #include <SQL/BytecodeInspect.hxx>
 #include <SQL/BytecodeDebug.hxx>
 #include <SQL/BytecodeProcedures.hxx>
+#include <SQL/BytecodeTriggers.hxx>
 #include <IO/Logger.hxx>
 #include <IO/Error.hxx>
 #include <Database/Database.hxx>
@@ -39,7 +40,7 @@ std::string ReadFile(const std::string& Path) {
 	return Contents;
 }
 
-static constexpr const char* AstralDbVersionString = "1.0";
+static constexpr const char* AstralDbVersionString = "2.0-rc1";
 
 struct CliBytecodeOptions {
 	bool TraceExecution = false;
@@ -77,6 +78,17 @@ static void PrintBytecodeHelpLines() {
 	std::cout << "  --proc-call NAME (-px)            Execute registered .abc\n";
 	std::cout << "  --proc-relations (-pg)            Procedure <-> .abc relation graph\n";
 	std::cout << "  SQL: CREATE PROCEDURE n AS (…); CALL n; DROP PROCEDURE n;\n";
+	std::cout << "  Triggers (catalog + astraldb_triggers_cache/*.abc):\n";
+	std::cout << "  --trig-list (-tl)                 List triggers\n";
+	std::cout << "  --trig-info NAME (-ti)            Trigger metadata\n";
+	std::cout << "  --trig-relations (-tg)            Table → trigger index\n";
+	std::cout << "  --trig-fires (-tf)                Recent trigger fire log\n";
+	std::cout << "  SQL: CREATE TRIGGER …; ALTER TRIGGER … ENABLE|DISABLE; DROP TRIGGER …;\n";
+}
+
+
+static std::filesystem::path ResolveTrigCatalog(const std::filesystem::path &SessionDb) {
+	return AstralDB::SQL::DefaultTriggerCatalogPath(SessionDb);
 }
 
 static std::filesystem::path ResolveProcCatalog(const std::filesystem::path &SessionDb,
@@ -502,6 +514,46 @@ int main(int Argc, char** Argv) {
 				}
 				throw std::runtime_error("No file after --debug-bytecode / -dbg");
 			}
+
+			if(CliArgIs(Arg, {"--trig-relations", "-tg"})) {
+				auto Catalog = AstralDB::SQL::LoadTriggerCatalog(ResolveTrigCatalog(SessionDbPath));
+				if(Catalog.CatalogPath.empty())
+					Catalog.CatalogPath = ResolveTrigCatalog(SessionDbPath);
+				AstralDB::SQL::RebuildTriggerRelations(Catalog);
+				std::cout << AstralDB::SQL::FormatTriggerRelations(Catalog);
+				return 0;
+			}
+			if(CliArgIs(Arg, {"--trig-list", "-tl"})) {
+				const auto Catalog = AstralDB::SQL::LoadTriggerCatalog(ResolveTrigCatalog(SessionDbPath));
+				if(Catalog.Triggers.empty()) {
+					std::cout << "(no triggers registered)\n";
+					return 0;
+				}
+				for(const auto &E : Catalog.Triggers) {
+					std::cout << E.Name << "\t" << E.TableName << "\t"
+					          << AstralDB::SQL::TriggerTimingTag(E.Timing) << "\t"
+					          << AstralDB::SQL::TriggerEventTag(E.Event) << "\t"
+					          << (E.Enabled ? "enabled" : "disabled") << "\n";
+				}
+				return 0;
+			}
+			if(CliArgIs(Arg, {"--trig-info", "-ti"})) {
+				if(I + 1 < Argc) {
+					const std::string Name = Argv[++I];
+					const auto Catalog = AstralDB::SQL::LoadTriggerCatalog(ResolveTrigCatalog(SessionDbPath));
+					const auto Entry = AstralDB::SQL::FindTrigger(Catalog, Name);
+					if(!Entry)
+						throw std::runtime_error("Trigger not found: " + Name);
+					std::cout << AstralDB::SQL::FormatTriggerEntrySummary(*Entry);
+					return 0;
+				}
+				throw std::runtime_error("No name after --trig-info / -ti");
+			}
+			if(CliArgIs(Arg, {"--trig-fires", "-tf"})) {
+				const auto Catalog = AstralDB::SQL::LoadTriggerCatalog(ResolveTrigCatalog(SessionDbPath));
+				std::cout << AstralDB::SQL::FormatTriggerFireLog(Catalog);
+				return 0;
+			}
 			if(CliArgIs(Arg, {"--proc-relations", "-pg", "--proc-graph"})) {
 				auto Catalog = AstralDB::SQL::LoadProcedureCatalog(
 				    ResolveProcCatalog(SessionDbPath, BcOpts.ProcCatalog));
@@ -520,6 +572,10 @@ int main(int Argc, char** Argv) {
 				}
 				for(const auto &P : Catalog.Procedures) {
 					std::cout << P.Name << "\tabc=" << P.AbcPath.string();
+					if(!P.SourceDialect.empty())
+						std::cout << "\tdialect=" << P.SourceDialect;
+					if(P.BytecodeMeta.HasExceptionHandlers)
+						std::cout << "\texceptions=" << P.BytecodeMeta.ExceptionHandlerCount;
 					if(!P.DependsOn.empty()) {
 						std::cout << "\tdepends=";
 						for(std::size_t D = 0; D < P.DependsOn.size(); ++D) {

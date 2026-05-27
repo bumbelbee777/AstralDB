@@ -61,7 +61,7 @@ private:
     static std::array<uint8_t, 32> XChaChaKey_;
     static std::array<uint8_t, 24> XChaChaNonce_;
     static void InitSalts();
-    std::vector<uint8_t> SaltAndHashPassword(const std::string& Password) const;
+    std::vector<uint8_t> SaltAndHashPassword(const std::string &PlainPassword) const;
     static std::vector<uint8_t> GetCombinedSalt();
 };
 }

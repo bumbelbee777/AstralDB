@@ -21,7 +21,9 @@ enum class TypeFamily : int8_t {
 	List = 6,
 	Point = 7,
 	Variant = 8,
-	Terrain = 9
+	Terrain = 9,
+	Mesh = 10,
+	Polygon = 11
 };
 
 struct TypeDescriptor {

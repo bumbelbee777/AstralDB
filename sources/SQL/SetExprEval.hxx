@@ -23,4 +23,14 @@ std::string SerializeSetValueExpr(const ExpressionAST *Expr);
 /** Deserialize and evaluate a serialized assignment expression. */
 std::optional<std::string> EvalSerializedSetValueExpr(std::string_view Blob, const RowEvalContext &Ctx);
 
+/** Deep-copy \a Root replacing \c ColumnRefAST nodes named \a Param with \a BindingCol . */
+std::unique_ptr<ExpressionAST> BindLambdaParameter(const ExpressionAST *Root, std::string_view Param,
+                                                   std::string_view BindingCol);
+
+/** True when \a Expr evaluates to a non-empty, non-zero value under \a Ctx . */
+bool EvalExpressionTruthy(const ExpressionAST *Expr, const RowEvalContext &Ctx);
+
+/** Serialize a lambda for \c COLUMNS_EXPAND / \c LIST_TRANSFORM operands. */
+std::string SerializeLambdaExpr(const LambdaExprAST &Lambda);
+
 } // namespace AstralDB::SQL

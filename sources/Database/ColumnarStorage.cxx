@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <numeric>
 #include <sstream>
 #include <unordered_map>
 #include <vector>
@@ -280,6 +281,163 @@ bool ColumnarGroupBy::TryRun(RowTable &Tbl, const SQL::Instruction &Inst,
 	std::sort(Tbl.begin(), Tbl.end(), [&](const RowItem &A, const RowItem &B) {
 		return GroupKeySignature(A, ActiveKeys) < GroupKeySignature(B, ActiveKeys);
 	});
+	return true;
+}
+
+namespace {
+
+std::string UpperCol(std::string S) {
+	for(char &C : S)
+		C = static_cast<char>(std::toupper(static_cast<unsigned char>(C)));
+	return S;
+}
+
+enum class BulkSyntheticKind : uint8_t {
+	Id,
+	Acct,
+	Amount,
+	Ts,
+	TextB,
+	TextC,
+	TextD,
+	Offset
+};
+
+BulkSyntheticKind ClassifyBulkSyntheticKind(const std::string &Col, std::size_t ColIndex, std::size_t ColCount) {
+	const std::string Key = UpperCol(Col);
+	if(Key == "ID")
+		return BulkSyntheticKind::Id;
+	if(Key == "ACCT" || Key == "A")
+		return BulkSyntheticKind::Acct;
+	if(Key == "AMOUNT")
+		return BulkSyntheticKind::Amount;
+	if(Key == "TS" || Key == "TIMESTAMP")
+		return BulkSyntheticKind::Ts;
+	if(Key == "B" || (ColCount == 5 && ColIndex == 2))
+		return BulkSyntheticKind::TextB;
+	if(Key == "C" || (ColCount == 5 && ColIndex == 3))
+		return BulkSyntheticKind::TextC;
+	if(Key == "D" || (ColCount == 5 && ColIndex == 4))
+		return BulkSyntheticKind::TextD;
+	return BulkSyntheticKind::Offset;
+}
+
+std::string BulkCellValue(BulkSyntheticKind Kind, int64_t RowId, std::size_t ColIndex) {
+	switch(Kind) {
+	case BulkSyntheticKind::Id:
+		return std::to_string(RowId);
+	case BulkSyntheticKind::Acct:
+		return std::to_string(RowId % 997);
+	case BulkSyntheticKind::Amount:
+		return std::to_string(RowId % 10000) + "." + std::to_string((RowId / 100) % 100);
+	case BulkSyntheticKind::Ts:
+		return std::to_string(1'704'067'200LL + RowId);
+	case BulkSyntheticKind::TextB:
+		return std::string("txt_") + std::to_string(RowId);
+	case BulkSyntheticKind::TextC:
+		return std::string("chk_") + std::to_string(RowId % 71);
+	case BulkSyntheticKind::TextD:
+		return std::string("e_") + std::to_string(RowId / 17);
+	case BulkSyntheticKind::Offset:
+	default:
+		return std::to_string(RowId + static_cast<int64_t>(ColIndex));
+	}
+}
+
+std::optional<double> ParseNum(const std::string &S) {
+	try {
+		size_t Pos = 0;
+		const double D = std::stod(S, &Pos);
+		if(Pos > 0)
+			return D;
+	} catch(...) {
+	}
+	return std::nullopt;
+}
+
+} // namespace
+
+void AppendBulkSyntheticColumnar(ColumnarTable &Col, const std::vector<std::string> &ColNames, int64_t Count,
+                                 int64_t StartId, int64_t Step) {
+	const std::size_t ColCount = ColNames.size();
+	const std::size_t Base = Col.RowCount;
+	const std::size_t NewTotal = Base + static_cast<std::size_t>(Count);
+	for(const auto &Cn : ColNames) {
+		auto &Vec = Col.Columns[Cn];
+		if(Vec.size() < Base)
+			Vec.assign(Base, "");
+		Vec.reserve(NewTotal);
+	}
+	std::vector<BulkSyntheticKind> Kinds;
+	Kinds.reserve(ColCount);
+	for(std::size_t Ci = 0; Ci < ColCount; ++Ci)
+		Kinds.push_back(ClassifyBulkSyntheticKind(ColNames[Ci], Ci, ColCount));
+	for(int64_t K = 0; K < Count; ++K) {
+		const int64_t RowId = StartId + K * Step;
+		for(std::size_t Ci = 0; Ci < ColCount; ++Ci)
+			Col.Columns[ColNames[Ci]].push_back(BulkCellValue(Kinds[Ci], RowId, Ci));
+	}
+	Col.RowCount = NewTotal;
+}
+
+bool TrySlidingSumRowsFrame(ColumnarTable &Col, const std::string &PartCol, const std::string &OrderCol,
+                            const std::string &SrcCol, const std::string &OutCol, std::size_t PrecedingRows,
+                            bool OrderAscending) {
+	if(Col.RowCount == 0)
+		return false;
+	auto PartIt = Col.Columns.find(PartCol);
+	auto OrdIt = Col.Columns.find(OrderCol);
+	auto SrcIt = Col.Columns.find(SrcCol);
+	if(PartIt == Col.Columns.end() || OrdIt == Col.Columns.end() || SrcIt == Col.Columns.end())
+		return false;
+	if(PartIt->second.size() != Col.RowCount || OrdIt->second.size() != Col.RowCount ||
+	   SrcIt->second.size() != Col.RowCount)
+		return false;
+	const std::vector<std::string> &Part = PartIt->second;
+	const std::vector<std::string> &Ord = OrdIt->second;
+	const std::vector<std::string> &Src = SrcIt->second;
+	std::vector<std::size_t> Order(Col.RowCount);
+	std::iota(Order.begin(), Order.end(), std::size_t{0});
+	const auto Less = [&](std::size_t A, std::size_t B) {
+		if(Part[A] != Part[B])
+			return Part[A] < Part[B];
+		const auto Na = ParseNum(Ord[A]);
+		const auto Nb = ParseNum(Ord[B]);
+		if(Na && Nb)
+			return OrderAscending ? *Na < *Nb : *Na > *Nb;
+		return OrderAscending ? Ord[A] < Ord[B] : Ord[A] > Ord[B];
+	};
+	std::stable_sort(Order.begin(), Order.end(), Less);
+	auto &Out = Col.Columns[OutCol];
+	Out.assign(Col.RowCount, "");
+	const std::size_t Width = PrecedingRows + 1;
+	std::size_t PartStart = 0;
+	for(std::size_t R = 0; R <= Col.RowCount; ++R) {
+		const bool Boundary = R == Col.RowCount || (R > 0 && Part[Order[R]] != Part[Order[R - 1]]);
+		if(!Boundary)
+			continue;
+		if(R > PartStart) {
+			double Ring[32]{};
+			std::size_t RingLen = 0;
+			std::size_t RingPos = 0;
+			double Sum = 0;
+			for(std::size_t K = PartStart; K < R; ++K) {
+				const std::size_t Ix = Order[K];
+				const double V = ParseNum(Src[Ix]).value_or(0.);
+				if(RingLen < Width) {
+					Ring[RingLen++] = V;
+					Sum += V;
+				} else {
+					Sum -= Ring[RingPos];
+					Ring[RingPos] = V;
+					Sum += V;
+					RingPos = (RingPos + 1) % Width;
+				}
+				Out[Ix] = std::to_string(static_cast<long long>(std::llround(Sum)));
+			}
+		}
+		PartStart = R;
+	}
 	return true;
 }
 

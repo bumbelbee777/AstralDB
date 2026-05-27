@@ -72,10 +72,22 @@ void HybridTableSlot::RebuildColumnarFromRows() {
 
 void HybridTableSlot::SyncColumnarAfterRowMutation() {
 	if(DeclaredPolicy == StorageLayout::Columnar || DeclaredPolicy == StorageLayout::Hybrid ||
-	   DeclaredPolicy == StorageLayout::Auto)
-		RebuildColumnarFromRows();
-	else
+	   DeclaredPolicy == StorageLayout::Auto) {
+		if(RowStore.empty() && Columnar.RowCount > 0)
+			ColumnarSynced = true;
+		else
+			RebuildColumnarFromRows();
+	} else
 		ColumnarSynced = false;
+}
+
+void HybridTableSlot::EnsureRowStoreFromColumnar() {
+	if(Columnar.RowCount == 0)
+		return;
+	if(RowStore.size() == Columnar.RowCount && !RowStore.empty() && !RowStore.front().empty())
+		return;
+	RowStore = Columnar.MaterializeAllRows();
+	ColumnarSynced = true;
 }
 
 const HybridTableSlot::Table &HybridTableSlot::RowsForRead(std::optional<StorageLayout> QueryHint,

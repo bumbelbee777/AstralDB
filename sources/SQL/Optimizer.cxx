@@ -267,8 +267,9 @@ void RunAdvancedPasses(Bytecode &Code, Logger *Logger, const int Rounds) {
 	const auto RunPass = [&](OptimizationPass &Pass) -> bool { return Pass.Run(Code, Logger); };
 	PeepholePass Peephole;
 	InstructionCombiningPass Combine;
+	JumpThreadingPass Thread;
 	for(int Round = 0; Round < Rounds; ++Round) {
-		const bool Changed = RunPass(Peephole) || RunPass(Combine);
+		const bool Changed = RunPass(Peephole) || RunPass(Combine) || RunPass(Thread);
 		if(!Changed)
 			break;
 	}
@@ -316,9 +317,10 @@ void RunOptimizerPipeline(Bytecode &Code, const OptimizationLevel OptLevel, Logg
 	if(OptLevel >= OptimizationLevel::Advanced)
 		RunAdvancedPasses(Code, Logger, AdvRounds);
 	if(OptLevel >= OptimizationLevel::Aggressive)
-		RegisterAllocationPass().Run(Code, Logger);
+		UnreachableBlockPass().Run(Code, Logger);
 	if(OptLevel >= OptimizationLevel::Maximum) {
 		RunAdvancedPasses(Code, Logger, AdvRounds);
+		DeadCodeEliminationPass().Run(Code, Logger);
 		RunBasicPasses(Code, Logger, BasicRounds);
 		DeadCodeEliminationPass().Run(Code, Logger);
 	}
@@ -477,14 +479,86 @@ bool DeadCodeEliminationPass::Run(Bytecode &Code, Logger *Logger) {
 }
 
 bool InstructionCombiningPass::Run(Bytecode &Code, Logger *Logger) {
-	return PeepholePass().Run(Code, Logger);
+	if(Logger)
+		Logger->Info("Running instruction combining optimization");
+	bool Modified = false;
+	for(size_t I = 0; I + 1 < Code.size(); ++I) {
+		int64_t Lit = 0;
+		if(IsPushInt64(Code[I], Lit) && Lit == 0 && Code[I + 1].Opcode_ == Opcode::ADD && Code[I + 1].Operands.empty()) {
+			Code[I] = MakeInstruction(Opcode::NOP);
+			Modified = true;
+		}
+	}
+	if(Modified)
+		DeadCodeEliminationPass().Run(Code, Logger);
+	return Modified;
 }
 
-bool RegisterAllocationPass::Run(Bytecode &Code, Logger *Logger) {
-	(void)Code;
-	if(Logger && Logger->IsVerbose())
-		Logger->Info("Register allocation pass skipped (stack VM)");
-	return false;
+bool JumpThreadingPass::Run(Bytecode &Code, Logger *Logger) {
+	if(Logger)
+		Logger->Info("Running jump threading optimization");
+	bool Modified = false;
+	for(size_t I = 0; I < Code.size(); ++I) {
+		if(Code[I].Opcode_ != Opcode::JMP || Code[I].Operands.empty())
+			continue;
+		auto *Cur = std::get_if<int64_t>(&Code[I].Operands[0]);
+		if(!Cur || *Cur < 0)
+			continue;
+		for(int Guard = 0; Guard < 32; ++Guard) {
+			const size_t Target = static_cast<size_t>(*Cur);
+			if(Target >= Code.size() || Code[Target].Opcode_ != Opcode::JMP ||
+			   Code[Target].Operands.empty())
+				break;
+			const auto *Next = std::get_if<int64_t>(&Code[Target].Operands[0]);
+			if(!Next || *Next < 0)
+				break;
+			*Cur = *Next;
+			Modified = true;
+		}
+	}
+	return Modified;
+}
+
+bool UnreachableBlockPass::Run(Bytecode &Code, Logger *Logger) {
+	if(Logger)
+		Logger->Info("Running unreachable block elimination");
+	if(Code.empty())
+		return false;
+	std::vector<bool> Reach(Code.size(), false);
+	std::vector<size_t> Work;
+	Reach[0] = true;
+	Work.push_back(0);
+	auto Enqueue = [&](size_t Ip) {
+		if(Ip < Code.size() && !Reach[Ip]) {
+			Reach[Ip] = true;
+			Work.push_back(Ip);
+		}
+	};
+	while(!Work.empty()) {
+		const size_t I = Work.back();
+		Work.pop_back();
+		if(I + 1 < Code.size() && Code[I].Opcode_ != Opcode::JMP && Code[I].Opcode_ != Opcode::HALT)
+			Enqueue(I + 1);
+		if(Code[I].Opcode_ == Opcode::JMP || Code[I].Opcode_ == Opcode::CALL) {
+			if(const auto *T = std::get_if<int64_t>(&Code[I].Operands[0]))
+				Enqueue(static_cast<size_t>(*T));
+		}
+		if(Code[I].Opcode_ == Opcode::RECURSIVE_CTE_FIXPOINT && Code[I].Operands.size() >= 4) {
+			if(const auto *Ls = std::get_if<int64_t>(&Code[I].Operands[3]))
+				Enqueue(static_cast<size_t>(*Ls));
+		}
+	}
+	MarkRecursiveCteRegions(Code, Reach);
+	bool Modified = false;
+	for(size_t I = 0; I < Code.size(); ++I) {
+		if(!Reach[I] && !Code[I].HasSideEffects() && Code[I].Opcode_ != Opcode::HALT) {
+			Code[I] = MakeInstruction(Opcode::NOP);
+			Modified = true;
+		}
+	}
+	if(Modified)
+		DeadCodeEliminationPass().Run(Code, Logger);
+	return Modified;
 }
 
 } // namespace SQL

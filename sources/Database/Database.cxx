@@ -1,10 +1,15 @@
 #include <Database/AdvancedTypes.hxx>
 #include <Database/Database.hxx>
 #include <Database/GraphStorage.hxx>
+#include <Database/MathSciComplex.hxx>
+#include <Database/ColumnarStorage.hxx>
+#include <Database/EmbeddingStorage.hxx>
+#include <IO/ArenaAllocator.hxx>
 #include <IO/MemoryGuard.hxx>
 #include <cstring>
 #include <Database/AtRestKey.hxx>
 #include <SQL/SetExprEval.hxx>
+#include <SQL/DialectCompat.hxx>
 #include <IO/Error.hxx>
 #include <DS/LZ4.hxx>
 #include <DS/XChaCha20.hxx>
@@ -35,6 +40,8 @@
 #include <DS/JSON.hxx>
 #include <SQL/Bytecode.hxx>
 #include <SQL/BytecodeProcedures.hxx>
+#include <SQL/BytecodeTriggers.hxx>
+#include <Database/TriggerRuntime.hxx>
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -43,6 +50,74 @@
 #endif
 
 namespace AstralDB {
+
+namespace {
+
+thread_local int TlDbExclusiveDepth = 0;
+
+std::vector<SQL::StoredTriggerEntry> TriggerRegistryVector(
+    const std::unordered_map<std::string, SQL::StoredTriggerEntry> &Map) {
+	std::vector<SQL::StoredTriggerEntry> Out;
+	Out.reserve(Map.size());
+	for(const auto &Pr : Map)
+		Out.push_back(Pr.second);
+	return Out;
+}
+
+} // namespace
+
+bool DatabaseVmAssumeDbMutexHeld() noexcept { return TlDbExclusiveDepth > 0; }
+
+void DatabaseVmBumpDbMutexDepth() noexcept { ++TlDbExclusiveDepth; }
+
+void DatabaseVmPopDbMutexDepth() noexcept {
+	if(TlDbExclusiveDepth > 0)
+		--TlDbExclusiveDepth;
+}
+
+static constexpr std::string_view kTriggerSnapshotMarkerSv = "<<<ASTRAL_DB_TRIGGERS>>>\n";
+
+static void AppendTriggerSnapshotTrailer(std::string &RawData,
+                                         const std::unordered_map<std::string, SQL::StoredTriggerEntry> &Triggers) {
+	if(Triggers.empty())
+		return;
+	RawData.append(kTriggerSnapshotMarkerSv.data(), kTriggerSnapshotMarkerSv.size());
+	const auto Blob = SQL::SerializeTriggerRegistry(TriggerRegistryVector(Triggers));
+	RawData += std::to_string(Blob.size());
+	RawData.push_back('\n');
+	RawData += Blob;
+	RawData.push_back('\n');
+}
+
+static bool StripAndParseTriggerSnapshotTrailer(std::string &RawData,
+                                              std::unordered_map<std::string, SQL::StoredTriggerEntry> &Out) {
+	Out.clear();
+	const size_t Mp = RawData.find(kTriggerSnapshotMarkerSv.data(), 0, kTriggerSnapshotMarkerSv.size());
+	if(Mp == std::string::npos)
+		return true;
+	std::string_view Tail(RawData.data() + Mp + kTriggerSnapshotMarkerSv.size(),
+	                     RawData.size() - Mp - kTriggerSnapshotMarkerSv.size());
+	const size_t NL = Tail.find('\n');
+	if(NL == std::string_view::npos)
+		return false;
+	std::uint64_t BN = 0;
+	for(unsigned char Ch : Tail.substr(0, NL)) {
+		if(Ch < '0' || Ch > '9')
+			return false;
+		BN = BN * 10 + static_cast<unsigned>(Ch - '0');
+	}
+	Tail = Tail.substr(NL + 1);
+	if(Tail.size() < BN + 1 || Tail[BN] != '\n')
+		return false;
+	const std::string Blob(Tail.substr(0, BN));
+	std::vector<SQL::StoredTriggerEntry> Entries;
+	if(!SQL::DeserializeTriggerRegistry(Blob, Entries))
+		return false;
+	for(SQL::StoredTriggerEntry &E : Entries)
+		Out.emplace(E.Name, std::move(E));
+	RawData.erase(Mp);
+	return true;
+}
 
 namespace {
 
@@ -1135,6 +1210,27 @@ void Database::AppendWalAfterDefineProcedure(const std::string &Name, const std:
 	Wal_.AppendLine(O.str());
 }
 
+
+void Database::AppendWalAfterDefineTrigger(const std::string &Name, const std::string &SpecJson) {
+	if(WalSuspended_.load(std::memory_order_acquire))
+		return;
+	std::ostringstream O;
+	O << "TR|" << Name << '|' << WalEncodeSqlBody(SpecJson);
+	Wal_.AppendLine(O.str());
+}
+
+void Database::AppendWalAfterDropTrigger(const std::string &Name) {
+	if(WalSuspended_.load(std::memory_order_acquire))
+		return;
+	Wal_.AppendLine(std::string("TD|") + Name);
+}
+
+void Database::AppendWalAfterSetTriggerEnabled(const std::string &Name, bool Enabled) {
+	if(WalSuspended_.load(std::memory_order_acquire))
+		return;
+	Wal_.AppendLine(std::string(Enabled ? "TE|" : "TX|") + Name);
+}
+
 void Database::AppendWalAfterDropProcedure(const std::string &Name) {
 	if(WalSuspended_.load(std::memory_order_acquire))
 		return;
@@ -1325,7 +1421,9 @@ void Database::SyncToFileUnlocked() {
 	AppendSequenceSnapshotTrailer(RawData, Sequences_);
 	AppendStorageSnapshotTrailer(RawData, Tables_);
 	AppendViewSnapshotTrailer(RawData, ViewDefinitionSql_);
+	AppendTriggerSnapshotTrailer(RawData, TriggerDefinitions_);
 	AppendGraphCatalogSnapshotTrailer(RawData, Graphs_);
+	AppendEmbeddingCatalogSnapshotTrailer(RawData, Embeddings_);
 	std::string CompressedData = CompressData(RawData);
 	std::string EncryptedData = EncryptData(CompressedData);
 	std::ofstream File(DbPath_, std::ios::binary);
@@ -1401,6 +1499,19 @@ void Database::ClearDirtyForFilesystemRollback() {
 
 void Database::CloneTable(const std::string &Dest, const std::string &Src) {
 	std::scoped_lock Guard(DbMutex_);
+	if(AstralDB::SQL::IsDialectDualTable(Src)) {
+		if(Dest.empty())
+			FailStorage("CLONE TABLE: destination name must be non-empty.");
+		TableSchemas_[Dest] = {};
+		Tables_[Dest] = HybridTableSlot{};
+		Tables_[Dest].RowStore = {Item{}};
+		Tables_[Dest].RecordWrite();
+		Indexes_.erase(Dest);
+		ForeignKeys_.erase(Dest);
+		TableCheckConstraints_.erase(Dest);
+		Dirty_.store(true, std::memory_order_release);
+		return;
+	}
 	auto TIt = Tables_.find(Src);
 	auto SIt = TableSchemas_.find(Src);
 		if(TIt == Tables_.end() || SIt == TableSchemas_.end())
@@ -1475,16 +1586,21 @@ std::unordered_map<std::string, std::string> Database::ProcedureDefinitionsSnaps
 	return ProcedureDefinitionSql_;
 }
 
-void Database::DefineProcedure(const std::string &ProcedureName, std::string SqlBody, bool IfNotExists) {
+void Database::DefineProcedure(const std::string &ProcedureName, std::string SqlBody, bool IfNotExists, bool OrReplace,
+                               std::string SourceDialect, std::string ExceptionHandlersJson) {
+	const auto ExceptionHandlers = SQL::DecodeExceptionHandlersJson(ExceptionHandlersJson);
 	std::string BodyForCache;
 	{
 		std::scoped_lock Guard(DbMutex_);
 		if(ProcedureName.empty())
 			FailStorage("CREATE PROCEDURE: name must be non-empty.");
-		if(ProcedureDefinitionSql_.find(ProcedureName) != ProcedureDefinitionSql_.end()) {
+		const auto Existing = ProcedureDefinitionSql_.find(ProcedureName);
+		if(Existing != ProcedureDefinitionSql_.end()) {
 			if(IfNotExists)
 				return;
-			FailStorage("CREATE PROCEDURE: \"" + ProcedureName + "\" already exists.");
+			if(!OrReplace)
+				FailStorage("CREATE PROCEDURE: \"" + ProcedureName + "\" already exists.");
+			ProcedureDefinitionSql_.erase(Existing);
 		}
 		ProcedureDefinitionSql_[ProcedureName] = SqlBody;
 		BodyForCache = ProcedureDefinitionSql_[ProcedureName];
@@ -1497,7 +1613,8 @@ void Database::DefineProcedure(const std::string &ProcedureName, std::string Sql
 	Catalog = SQL::LoadProcedureCatalog(CatPath);
 	SQL::UnregisterProcedure(Catalog, ProcedureName);
 	SQL::CacheProcedureFromSql(Catalog, DbPath_, ProcedureName, std::move(BodyForCache), Logger_,
-	                           SQL::OptimizationLevel::Basic, this, true);
+	                           SQL::OptimizationLevel::Advanced, this, true, OrReplace, std::move(SourceDialect),
+	                           ExceptionHandlers);
 	SQL::SaveProcedureCatalog(Catalog);
 }
 
@@ -1535,9 +1652,178 @@ void Database::ReplayWalDefineProcedure(const std::string &ProcedureName, std::s
 	const auto CatPath = SQL::DefaultProcedureCatalogPath(DbPath_);
 	Catalog.CatalogPath = CatPath;
 	Catalog = SQL::LoadProcedureCatalog(CatPath);
-	SQL::CacheProcedureFromSql(Catalog, DbPath_, ProcedureName, std::move(SqlBody), Logger_, SQL::OptimizationLevel::Basic,
+	SQL::CacheProcedureFromSql(Catalog, DbPath_, ProcedureName, std::move(SqlBody), Logger_, SQL::OptimizationLevel::Advanced,
 	                           this, true);
 	SQL::SaveProcedureCatalog(Catalog);
+}
+
+void Database::InstallTriggerScratchRowAssumeLocked(const std::string &TableName, const Item *Row) {
+	if(!Row || Row->empty()) {
+		Tables_.erase(TableName);
+		TableSchemas_.erase(TableName);
+		Indexes_.erase(TableName);
+		return;
+	}
+	Schema Sch;
+	Sch.reserve(Row->size());
+	for(const auto &[Col, Val] : *Row) {
+		Column C;
+		C.Name = Col;
+		C.DefaultValue = "TEXT";
+		(void)Val;
+		Sch.push_back(std::move(C));
+	}
+	TableSchemas_[TableName] = Sch;
+	HybridTableSlot Slot;
+	Slot.SetDeclaredPolicy(StorageLayout::Row);
+	Slot.RowStore = {*Row};
+	Slot.RecordWrite();
+	Slot.SyncColumnarAfterRowMutation();
+	Tables_[TableName] = std::move(Slot);
+}
+
+void Database::DefineTrigger(SQL::StoredTriggerEntry Spec, bool IfNotExists, bool OrReplace) {
+	if(Spec.Name.empty())
+		FailStorage("CREATE TRIGGER: name must be non-empty.");
+	if(Spec.TableName.empty())
+		FailStorage("CREATE TRIGGER: table name must be non-empty.");
+	const auto SpecJson = SQL::SerializeTriggerRegistry({Spec});
+	SQL::StoredTriggerEntry ForCache;
+	{
+		std::scoped_lock Guard(DbMutex_);
+		if(Tables_.find(Spec.TableName) == Tables_.end() &&
+		   ViewDefinitionSql_.find(Spec.TableName) == ViewDefinitionSql_.end())
+			FailStorage("CREATE TRIGGER: table \"" + Spec.TableName + "\" does not exist.");
+		const auto Existing = TriggerDefinitions_.find(Spec.Name);
+		if(Existing != TriggerDefinitions_.end()) {
+			if(IfNotExists)
+				return;
+			if(!OrReplace)
+				FailStorage("CREATE TRIGGER: \"" + Spec.Name + "\" already exists.");
+			TriggerDefinitions_.erase(Existing);
+		}
+		Spec.Enabled = true;
+		TriggerDefinitions_[Spec.Name] = Spec;
+		ForCache = TriggerDefinitions_[Spec.Name];
+		AppendWalAfterDefineTrigger(Spec.Name, SpecJson);
+		Dirty_.store(true, std::memory_order_release);
+	}
+	SQL::TriggerCatalog Catalog;
+	const auto CatPath = SQL::DefaultTriggerCatalogPath(DbPath_);
+	Catalog.CatalogPath = CatPath;
+	Catalog = SQL::LoadTriggerCatalog(CatPath);
+	SQL::UnregisterTrigger(Catalog, Spec.Name);
+	const SQL::StoredTriggerEntry Cached =
+	    SQL::CacheTriggerFromSql(Catalog, DbPath_, std::move(ForCache), Logger_, SQL::OptimizationLevel::Advanced, this,
+	                             true, OrReplace);
+	{
+		std::scoped_lock Guard(DbMutex_);
+		TriggerDefinitions_[Spec.Name] = Cached;
+	}
+	SQL::SaveTriggerCatalog(Catalog);
+}
+
+void Database::DropTriggerDefinition(const std::string &TriggerName, bool IfExists) {
+	{
+		std::scoped_lock Guard(DbMutex_);
+		auto It = TriggerDefinitions_.find(TriggerName);
+		if(It == TriggerDefinitions_.end()) {
+			if(!IfExists)
+				FailStorage("DROP TRIGGER: \"" + TriggerName + "\" does not exist.");
+		} else {
+			TriggerDefinitions_.erase(It);
+			AppendWalAfterDropTrigger(TriggerName);
+			Dirty_.store(true, std::memory_order_release);
+		}
+	}
+	SQL::TriggerCatalog Catalog;
+	const auto CatPath = SQL::DefaultTriggerCatalogPath(DbPath_);
+	Catalog = SQL::LoadTriggerCatalog(CatPath);
+	if(Catalog.CatalogPath.empty())
+		Catalog.CatalogPath = CatPath;
+	if(!SQL::UnregisterTrigger(Catalog, TriggerName) && !IfExists)
+		FailStorage("DROP TRIGGER: \"" + TriggerName + "\" does not exist.");
+	SQL::SaveTriggerCatalog(Catalog);
+}
+
+void Database::SetTriggerEnabled(const std::string &TriggerName, bool Enabled) {
+	{
+		std::scoped_lock Guard(DbMutex_);
+		auto It = TriggerDefinitions_.find(TriggerName);
+		if(It == TriggerDefinitions_.end())
+			FailStorage("ALTER TRIGGER: \"" + TriggerName + "\" does not exist.");
+		if(It->second.Enabled == Enabled)
+			return;
+		It->second.Enabled = Enabled;
+		AppendWalAfterSetTriggerEnabled(TriggerName, Enabled);
+		Dirty_.store(true, std::memory_order_release);
+	}
+	SQL::TriggerCatalog Catalog;
+	const auto CatPath = SQL::DefaultTriggerCatalogPath(DbPath_);
+	Catalog = SQL::LoadTriggerCatalog(CatPath);
+	if(Catalog.CatalogPath.empty())
+		Catalog.CatalogPath = CatPath;
+	for(SQL::StoredTriggerEntry &E : Catalog.Triggers) {
+		if(E.Name == TriggerName) {
+			E.Enabled = Enabled;
+			break;
+		}
+	}
+	SQL::SaveTriggerCatalog(Catalog);
+}
+
+void Database::ReplayWalDefineTrigger(const std::string &TriggerName, std::string SpecJson) {
+	std::vector<SQL::StoredTriggerEntry> Entries;
+	if(!SQL::DeserializeTriggerRegistry(SpecJson, Entries) || Entries.empty())
+		FailStorage("WAL replay CREATE TRIGGER: corrupt spec for \"" + TriggerName + "\".");
+	SQL::StoredTriggerEntry Spec = std::move(Entries.front());
+	Spec.Name = TriggerName;
+	{
+		std::scoped_lock Guard(DbMutex_);
+		TriggerDefinitions_[TriggerName] = Spec;
+	}
+	SQL::TriggerCatalog Catalog;
+	const auto CatPath = SQL::DefaultTriggerCatalogPath(DbPath_);
+	Catalog.CatalogPath = CatPath;
+	Catalog = SQL::LoadTriggerCatalog(CatPath);
+	SQL::UnregisterTrigger(Catalog, TriggerName);
+	SQL::CacheTriggerFromSql(Catalog, DbPath_, Spec, Logger_, SQL::OptimizationLevel::Advanced, this, true, true);
+	SQL::SaveTriggerCatalog(Catalog);
+}
+
+void Database::ReplayWalDropTrigger(const std::string &TriggerName) {
+	{
+		std::scoped_lock Guard(DbMutex_);
+		TriggerDefinitions_.erase(TriggerName);
+	}
+	SQL::TriggerCatalog Catalog;
+	const auto CatPath = SQL::DefaultTriggerCatalogPath(DbPath_);
+	Catalog = SQL::LoadTriggerCatalog(CatPath);
+	if(Catalog.CatalogPath.empty())
+		Catalog.CatalogPath = CatPath;
+	SQL::UnregisterTrigger(Catalog, TriggerName);
+	SQL::SaveTriggerCatalog(Catalog);
+}
+
+void Database::ReplayWalSetTriggerEnabled(const std::string &TriggerName, bool Enabled) {
+	{
+		std::scoped_lock Guard(DbMutex_);
+		auto It = TriggerDefinitions_.find(TriggerName);
+		if(It != TriggerDefinitions_.end())
+			It->second.Enabled = Enabled;
+	}
+	SQL::TriggerCatalog Catalog;
+	const auto CatPath = SQL::DefaultTriggerCatalogPath(DbPath_);
+	Catalog = SQL::LoadTriggerCatalog(CatPath);
+	if(Catalog.CatalogPath.empty())
+		Catalog.CatalogPath = CatPath;
+	for(SQL::StoredTriggerEntry &E : Catalog.Triggers) {
+		if(E.Name == TriggerName) {
+			E.Enabled = Enabled;
+			break;
+		}
+	}
+	SQL::SaveTriggerCatalog(Catalog);
 }
 
 void Database::ReplayWalDropProcedure(const std::string &ProcedureName) {
@@ -2494,15 +2780,53 @@ void Database::ReplayWalDropSequence(const std::string &Name) {
 	Sequences_.erase(Name);
 }
 
+namespace {
+
+bool IsEphemeralSessionDbPath(const std::filesystem::path &Path) {
+	return Path.string().find("astraldb_session_") != std::string::npos;
+}
+
+std::string UpperAscii(std::string S) {
+	for(char &C : S)
+		C = static_cast<char>(std::toupper(static_cast<unsigned char>(C)));
+	return S;
+}
+
+void AssignBulkSyntheticCell(Database::Item &Row, const std::string &Col, int64_t RowId, std::size_t ColIndex,
+                             std::size_t ColCount) {
+	const std::string Key = UpperAscii(Col);
+	if(Key == "ID")
+		Row[Col] = std::to_string(RowId);
+	else if(Key == "ACCT" || Key == "A")
+		Row[Col] = std::to_string(RowId % 997);
+	else if(Key == "AMOUNT" || (ColCount == 5 && ColIndex == 2))
+		Row[Col] = std::to_string(RowId % 10000) + "." + std::to_string((RowId / 100) % 100);
+	else if(Key == "TS" || Key == "TIMESTAMP" || (ColCount == 5 && ColIndex == 4))
+		Row[Col] = std::to_string(1'704'067'200LL + RowId);
+	else if(Key == "B" || (ColCount == 5 && ColIndex == 2))
+		Row[Col] = std::string("txt_") + std::to_string(RowId);
+	else if(Key == "C" || (ColCount == 5 && ColIndex == 3))
+		Row[Col] = std::string("chk_") + std::to_string(RowId % 71);
+	else if(Key == "D" || (ColCount == 5 && ColIndex == 4))
+		Row[Col] = std::string("e_") + std::to_string(RowId / 17);
+	else
+		Row[Col] = std::to_string(RowId + static_cast<int64_t>(ColIndex));
+}
+
+} // namespace
+
 void Database::InsertBulkSyntheticRows(const std::string &TableName, int64_t Count, int64_t StartId, int64_t Step) {
 	if(Count <= 0)
 		FailStorage("BULK INSERT row count must be a positive integer.");
-	if(static_cast<std::uint64_t>(Count) > Limits::MaxBulkInsertRows)
+	const bool Ephemeral = IsEphemeralSessionDbPath(DbPath_);
+	const std::uint64_t Cap = Ephemeral ? Limits::MaxBulkInsertRowsBench : Limits::MaxBulkInsertRows;
+	if(static_cast<std::uint64_t>(Count) > Cap)
 		FailStorage("BULK INSERT row count exceeds the configured maximum (see server limits).");
+	const bool FastPath = Ephemeral && static_cast<std::uint64_t>(Count) >= Limits::BulkFastPathMinRows;
 	const std::size_t EstBytes = static_cast<std::size_t>(Count) * 256U;
 	if(!MemoryGuard::SecureBoundsCheck(0, static_cast<std::size_t>(Count), 256U))
 		FailStorage("BULK INSERT row count exceeds safe bounds.");
-	if(!MemoryGuard::AllowAlloc(EstBytes))
+	if(!FastPath && !MemoryGuard::AllowAlloc(EstBytes))
 		FailStorage("BULK INSERT would exceed the session memory guard (spike protection).");
 	MemoryGuard::SpikeScope Spike;
 	std::scoped_lock Guard(DbMutex_);
@@ -2510,8 +2834,8 @@ void Database::InsertBulkSyntheticRows(const std::string &TableName, int64_t Cou
 	if(Tit == Tables_.end())
 		FailStorage("INSERT_BULK: table \"" + TableName + "\" does not exist.");
 	const auto Sch = TableSchemaAssumeDbMutexHeld(TableName);
-	if(!Sch.has_value() || Sch->size() != 5)
-		FailStorage("INSERT_BULK requires a table with exactly five columns (fixture / bench shape).");
+	if(!Sch.has_value() || Sch->empty())
+		FailStorage("INSERT_BULK requires a non-empty table schema.");
 	HybridTableSlot &Slot = Tit->second;
 	Table &TableRef = Slot.RowStore;
 	const size_t Begin = TableRef.size();
@@ -2522,34 +2846,54 @@ void Database::InsertBulkSyntheticRows(const std::string &TableName, int64_t Cou
 	ColNames.reserve(Sch->size());
 	for(const Column &Co : *Sch)
 		ColNames.push_back(Co.Name);
+	const std::size_t ColCount = ColNames.size();
+	if(FastPath) {
+		constexpr int64_t BulkStreamChunkRows = 65'536;
+		int64_t Remaining = Count;
+		int64_t ChunkStart = StartId;
+		while(Remaining > 0) {
+			const int64_t ChunkRows = std::min<int64_t>(Remaining, BulkStreamChunkRows);
+			const std::size_t ChunkEstimate = static_cast<std::size_t>(ChunkRows) * 96U;
+			if(!MemoryGuard::AllowAlloc(ChunkEstimate))
+				FailStorage("BULK INSERT fast path would exceed the session memory guard.");
+			Superfetch::PrefetchAppendTarget(Slot.RowStore);
+			AppendBulkSyntheticColumnar(Slot.Columnar, ColNames, ChunkRows, ChunkStart, Step);
+			ChunkStart += ChunkRows * Step;
+			Remaining -= ChunkRows;
+		}
+		Slot.ColumnarSynced = true;
+		Slot.RecordWrite();
+		Dirty_.store(true, std::memory_order_release);
+		return;
+	}
 	const auto IdxOuter = Indexes_.find(TableName);
 	for(int64_t K = 0; K < Count; ++K) {
 		const int64_t RowId = StartId + K * Step;
-		const std::string IdStr = std::to_string(RowId);
 		Item MutableRow;
-		MutableRow[ColNames[0]] = IdStr;
-		MutableRow[ColNames[1]] = std::to_string(RowId % 997);
-		MutableRow[ColNames[2]] = std::string("txt_") + IdStr;
-		MutableRow[ColNames[3]] = std::string("chk_") + std::to_string(RowId % 71);
-		MutableRow[ColNames[4]] = std::string("e_") + std::to_string(RowId / 17);
-		ResolveRowSequenceLiteralsAssumeLocked(MutableRow);
-		FillIdentityColumnsAssumeLocked(*Sch, MutableRow);
-		RequireSessionInsertAssumeLocked(TableName, MutableRow);
-		RejectRowIfChecksFailAssumeLocked(TableName, MutableRow);
-		RejectRowIfTypesFailAssumeLocked(TableName, MutableRow);
-		RejectRowIfForeignKeysFailAssumeLocked(TableName, MutableRow);
+		for(std::size_t Ci = 0; Ci < ColCount; ++Ci)
+			AssignBulkSyntheticCell(MutableRow, ColNames[Ci], RowId, Ci, ColCount);
+		if(!FastPath) {
+			ResolveRowSequenceLiteralsAssumeLocked(MutableRow);
+			FillIdentityColumnsAssumeLocked(*Sch, MutableRow);
+			RequireSessionInsertAssumeLocked(TableName, MutableRow);
+			RejectRowIfChecksFailAssumeLocked(TableName, MutableRow);
+			RejectRowIfTypesFailAssumeLocked(TableName, MutableRow);
+			RejectRowIfForeignKeysFailAssumeLocked(TableName, MutableRow);
+		}
 		TableRef.push_back(std::move(MutableRow));
 		const size_t RowIndex = TableRef.size() - 1;
 		const Item &Inserted = TableRef.back();
-		if(IdxOuter != Indexes_.end()) {
-			for(const auto &[ColumnName, Value] : Inserted) {
-				const auto ColIdx = IdxOuter->second.find(ColumnName);
-				if(ColIdx != IdxOuter->second.end())
-					std::get<BPlusTree<std::string, size_t>>(ColIdx->second.Index()).Insert(Value, RowIndex);
+		if(!FastPath) {
+			if(IdxOuter != Indexes_.end()) {
+				for(const auto &[ColumnName, Value] : Inserted) {
+					const auto ColIdx = IdxOuter->second.find(ColumnName);
+					if(ColIdx != IdxOuter->second.end())
+						std::get<BPlusTree<std::string, size_t>>(ColIdx->second.Index()).Insert(Value, RowIndex);
+				}
 			}
+			AppendWalAfterInsert(TableName, Inserted);
+			OnRowInsertedAssumeLocked(TableName, RowIndex, Inserted);
 		}
-		AppendWalAfterInsert(TableName, Inserted);
-		OnRowInsertedAssumeLocked(TableName, RowIndex, Inserted);
 	}
 	Slot.RecordWrite();
 	Slot.SyncColumnarAfterRowMutation();
@@ -2598,6 +2942,36 @@ void Database::DropDataset(const std::string &Name) {
 	Datasets_.erase(Name);
 }
 
+void Database::RegisterEmbedding(const std::string &Name, const std::string &TableName, const std::string &TokenColumn,
+                                 const std::string &VectorColumn) {
+	std::scoped_lock Guard(DbMutex_);
+	EmbeddingCatalogEntry Entry = BuildEmbeddingCatalogEntryFromTable(*this, Name, TableName, TokenColumn, VectorColumn);
+	InstallEmbeddingCatalogEntryAssumeLocked(*this, std::move(Entry));
+	AppendWalAfterEmbeddingRegister(Embeddings_.at(Name));
+	Dirty_.store(true, std::memory_order_release);
+}
+
+void Database::DropEmbedding(const std::string &Name) {
+	std::scoped_lock Guard(DbMutex_);
+	if(Embeddings_.find(Name) == Embeddings_.end())
+		return;
+	ReplayWalEmbeddingDropAssumeLocked(*this, Name);
+	AppendWalAfterEmbeddingDrop(Name);
+	Dirty_.store(true, std::memory_order_release);
+}
+
+std::optional<std::string> Database::EmbeddingWireCellAssumeDbMutexHeld(const std::string &Name) const {
+	const auto It = Embeddings_.find(Name);
+	if(It == Embeddings_.end())
+		return std::nullopt;
+	return It->second.WireCell;
+}
+
+std::optional<std::string> Database::EmbeddingWireCell(const std::string &Name) const {
+	std::scoped_lock Guard(DbMutex_);
+	return EmbeddingWireCellAssumeDbMutexHeld(Name);
+}
+
 void Database::AppendWalAfterGraphRegister(const GraphSpec &Spec) {
 	if(WalSuspended_.load(std::memory_order_acquire))
 		return;
@@ -2614,6 +2988,28 @@ void Database::AppendWalAfterGraphProjection(const GraphProjectionRequest &Req) 
 	if(WalSuspended_.load(std::memory_order_acquire))
 		return;
 	Wal_.AppendLine(GraphWalLineProjection(Req));
+}
+
+void Database::AppendWalAfterEmbeddingRegister(const EmbeddingCatalogEntry &Entry) {
+	if(WalSuspended_.load(std::memory_order_acquire))
+		return;
+	Wal_.AppendLine(EmbeddingWalLineRegister(Entry));
+}
+
+void Database::AppendWalAfterEmbeddingDrop(const std::string &Name) {
+	if(WalSuspended_.load(std::memory_order_acquire))
+		return;
+	Wal_.AppendLine(EmbeddingWalLineDrop(Name));
+}
+
+void Database::ReplayWalEmbeddingRegister(EmbeddingCatalogEntry Entry) {
+	std::scoped_lock Guard(DbMutex_);
+	ReplayWalEmbeddingRegisterAssumeLocked(*this, std::move(Entry));
+}
+
+void Database::ReplayWalEmbeddingDrop(const std::string &Name) {
+	std::scoped_lock Guard(DbMutex_);
+	ReplayWalEmbeddingDropAssumeLocked(*this, Name);
 }
 
 void Database::RegisterGraph(GraphSpec Spec) {
@@ -2914,42 +3310,64 @@ void Database::RepackTableConcurrently(const std::string &TableName) {
 	Dirty_.store(true, std::memory_order_release);
 }
 
+void Database::InsertRowAssumeLocked(const std::string &TableName, Item Row, bool RunTriggers) {
+	if(Tables_.find(TableName) == Tables_.end())
+		FailStorage("INSERT: table \"" + TableName + "\" does not exist.");
+	Item MutableRow = std::move(Row);
+	if(auto Sch = TableSchemaAssumeDbMutexHeld(TableName); Sch.has_value()) {
+		ResolveRowSequenceLiteralsAssumeLocked(MutableRow);
+		FillIdentityColumnsAssumeLocked(*Sch, MutableRow);
+	}
+	RequireSessionInsertAssumeLocked(TableName, MutableRow);
+	RejectRowIfChecksFailAssumeLocked(TableName, MutableRow);
+	RejectRowIfTypesFailAssumeLocked(TableName, MutableRow);
+	RejectRowIfForeignKeysFailAssumeLocked(TableName, MutableRow);
+	if(RunTriggers)
+		FireTriggersAssumeLocked(*this, TableName, SQL::TriggerTiming::Before, SQL::TriggerEvent::Insert, nullptr,
+		                         &MutableRow, true);
+	HybridTableSlot &Slot = Tables_[TableName];
+	Superfetch::PrefetchAppendTarget(Slot.RowStore);
+	Slot.RowStore.push_back(MutableRow);
+	Slot.RecordWrite();
+	Slot.SyncColumnarAfterRowMutation();
+	auto &TableRef = Slot.RowStore;
+	auto IdxOuter = Indexes_.find(TableName);
+	if(IdxOuter != Indexes_.end()) {
+		for(const auto &[ColumnName, Value] : MutableRow) {
+			auto ColIdx = IdxOuter->second.find(ColumnName);
+			if(ColIdx != IdxOuter->second.end()) {
+				auto &Index = ColIdx->second;
+				std::get<BPlusTree<std::string, size_t>>(Index.Index()).Insert(Value, TableRef.size() - 1);
+			}
+		}
+	}
+	AppendWalAfterInsert(TableName, MutableRow);
+	OnRowInsertedAssumeLocked(TableName, TableRef.size() - 1, MutableRow);
+	if(RunTriggers)
+		FireTriggersAssumeLocked(*this, TableName, SQL::TriggerTiming::After, SQL::TriggerEvent::Insert, nullptr,
+		                         &TableRef[TableRef.size() - 1], true);
+}
+
 std::future<void> Database::Insert(const std::string &TableName, const Item &Row) {
-	return DbDispatchAsync(this,[this, TableName, Row]() {
+	auto DoInsert = [this, TableName, Row]() {
+		if(DatabaseVmAssumeDbMutexHeld()) {
+			InsertRowAssumeLocked(TableName, Row, true);
+			Dirty_.store(true, std::memory_order_release);
+			return;
+		}
 		{
 			std::scoped_lock Guard(DbMutex_);
-			if(Tables_.find(TableName) == Tables_.end())
-				FailStorage("INSERT: table \"" + TableName + "\" does not exist.");
-			Item MutableRow = Row;
-			if(auto Sch = TableSchemaAssumeDbMutexHeld(TableName); Sch.has_value()) {
-				ResolveRowSequenceLiteralsAssumeLocked(MutableRow);
-				FillIdentityColumnsAssumeLocked(*Sch, MutableRow);
-			}
-			RequireSessionInsertAssumeLocked(TableName, MutableRow);
-			RejectRowIfChecksFailAssumeLocked(TableName, MutableRow);
-			RejectRowIfTypesFailAssumeLocked(TableName, MutableRow);
-			RejectRowIfForeignKeysFailAssumeLocked(TableName, MutableRow);
-			HybridTableSlot &Slot = Tables_[TableName];
-			Superfetch::PrefetchAppendTarget(Slot.RowStore);
-			Slot.RowStore.push_back(MutableRow);
-			Slot.RecordWrite();
-			Slot.SyncColumnarAfterRowMutation();
-			auto &TableRef = Slot.RowStore;
-			auto IdxOuter = Indexes_.find(TableName);
-			if(IdxOuter != Indexes_.end()) {
-				for(const auto& [ColumnName, Value] : MutableRow) {
-					auto ColIdx = IdxOuter->second.find(ColumnName);
-					if(ColIdx != IdxOuter->second.end()) {
-						auto& Index = ColIdx->second;
-						std::get<BPlusTree<std::string, size_t>>(Index.Index()).Insert(Value, TableRef.size() - 1);
-					}
-				}
-			}
-			AppendWalAfterInsert(TableName, MutableRow);
-			OnRowInsertedAssumeLocked(TableName, TableRef.size() - 1, MutableRow);
+			InsertRowAssumeLocked(TableName, Row, true);
 		}
 		Dirty_.store(true, std::memory_order_release);
-	});
+	};
+	if(DatabaseVmAssumeDbMutexHeld()) {
+		DoInsert();
+		std::promise<void> Done;
+		Done.set_value();
+		return Done.get_future();
+	}
+	return DbDispatchAsync(this, [DoInsert = std::move(DoInsert)]() { DoInsert(); });
 }
 
 namespace {
@@ -2971,7 +3389,8 @@ bool ExistingRowMatchesInsertKeys(const Database::Item &Existing, const Database
 
 std::future<void> Database::Upsert(const std::string &TableName, const Database::Item &InsertRow,
                                    const std::vector<std::string> &ConflictColumnsIn, bool DoNothingOnConflict,
-                                   const std::vector<std::pair<std::string, std::string>> &UpdateAssignments) {
+                                   const std::vector<std::pair<std::string, std::string>> &UpdateAssignments,
+                                   bool SqliteReplace) {
 	return DbDispatchAsync(this, [=, this]() {
 		{
 			std::scoped_lock Guard(DbMutex_);
@@ -3044,6 +3463,15 @@ std::future<void> Database::Upsert(const std::string &TableName, const Database:
 					auto V = SQL::EvalSerializedSetValueExpr(Blob, Ctx);
 					if(V)
 						Ex[Col] = *V;
+				}
+				if(SqliteReplace) {
+					auto SchIt = TableSchemas_.find(TableName);
+					if(SchIt != TableSchemas_.end()) {
+						for(const Column &Co : SchIt->second) {
+							if(InsertRow.find(Co.Name) == InsertRow.end())
+								Ex[Co.Name] = std::string();
+						}
+					}
 				}
 				Slot.RecordWrite();
 				Slot.SyncColumnarAfterRowMutation();
@@ -3210,6 +3638,7 @@ std::future<void> Database::Delete(const std::string &TableName, const std::func
 			};
 			for(size_t i = 0; i < TableRef.size(); ++i) {
 				if(DeleteCond(TableRef[i])) {
+					FireTriggersAssumeLocked(*this, TableName, SQL::TriggerTiming::Before, SQL::TriggerEvent::Delete, &TableRef[i], nullptr, true);
 					RejectDeleteIfReferencedAssumeLocked(TableName, TableRef[i]);
 					if(IdxOuter != Indexes_.end()) {
 						for(const auto& [ColumnName, Value] : TableRef[i]) {
@@ -3220,6 +3649,9 @@ std::future<void> Database::Delete(const std::string &TableName, const std::func
 							}
 						}
 					}
+					const Item DeletedRow = TableRef[i];
+					FireTriggersAssumeLocked(*this, TableName, SQL::TriggerTiming::After, SQL::TriggerEvent::Delete,
+					                         &DeletedRow, nullptr, true);
 				}
 			}
 			TableRef.erase(std::remove_if(TableRef.begin(), TableRef.end(), DeleteCond), TableRef.end());
@@ -3351,8 +3783,10 @@ std::future<void> Database::Update(const std::string &TableName,
 					}
 				}
 				Item OldRow = Row;
+				FireTriggersAssumeLocked(*this, TableName, SQL::TriggerTiming::Before, SQL::TriggerEvent::Update, &Row, &Merged, true);
 				for(const auto& [ColumnName, NewValue] : NewValues)
 					Row[ColumnName] = NewValue;
+				FireTriggersAssumeLocked(*this, TableName, SQL::TriggerTiming::After, SQL::TriggerEvent::Update, &OldRow, &Row, true);
 				OnRowUpdatedAssumeLocked(TableName, i, OldRow, Row);
 				Modified = true;
 			}
@@ -3492,8 +3926,14 @@ bool Database::LoadSnapshotFromDiskPathSynchronously(std::filesystem::path Path)
 	std::vector<GraphSpec> LoadedGraphs;
 	if(!StripAndParseGraphCatalogSnapshotTrailer(RawData, LoadedGraphs))
 		return false;
+	std::vector<EmbeddingCatalogEntry> LoadedEmbeddings;
+	if(!StripAndParseEmbeddingCatalogSnapshotTrailer(RawData, LoadedEmbeddings))
+		return false;
 	std::unordered_map<std::string, std::string> LoadedViews;
 	if(!StripAndParseViewSnapshotTrailer(RawData, LoadedViews))
+		return false;
+	std::unordered_map<std::string, SQL::StoredTriggerEntry> LoadedTriggers;
+	if(!StripAndParseTriggerSnapshotTrailer(RawData, LoadedTriggers))
 		return false;
 	std::unordered_map<std::string, StorageSnapshotEntry> LoadedStorage;
 	if(!StripAndParseStorageSnapshotTrailer(RawData, LoadedStorage))
@@ -3518,6 +3958,7 @@ bool Database::LoadSnapshotFromDiskPathSynchronously(std::filesystem::path Path)
 		TableSchemas_.clear();
 		Tables_.clear();
 		ViewDefinitionSql_.clear();
+		TriggerDefinitions_.clear();
 		Indexes_.clear();
 		FtsIndexes_.clear();
 		VectorIndexes_.clear();
@@ -3527,6 +3968,7 @@ bool Database::LoadSnapshotFromDiskPathSynchronously(std::filesystem::path Path)
 		Graphs_.clear();
 		GraphsByEdgeTable_.clear();
 		GraphProjectionsByBase_.clear();
+		Embeddings_.clear();
 		Users_.clear();
 		Acls_.clear();
 		Roles_.clear();
@@ -3579,6 +4021,7 @@ bool Database::LoadSnapshotFromDiskPathSynchronously(std::filesystem::path Path)
 				It->second.Scheduler.DeserializeWeights(Meta.Weights);
 		}
 		ViewDefinitionSql_ = std::move(LoadedViews);
+		TriggerDefinitions_ = std::move(LoadedTriggers);
 		Sequences_ = std::move(LoadedSeqs);
 		ForeignKeys_ = std::move(LoadedFks);
 		if(ParsedUserAclPresent && !ParsedUsers.empty()) {
@@ -3600,6 +4043,7 @@ bool Database::LoadSnapshotFromDiskPathSynchronously(std::filesystem::path Path)
 		EnsureBootstrapAdminAclAssumeLocked();
 		CurrentUser_.reset();
 		InstallGraphCatalogAssumeLocked(*this, std::move(LoadedGraphs));
+		InstallEmbeddingCatalogAssumeLocked(*this, std::move(LoadedEmbeddings));
 	}
 	return true;
 }
@@ -3886,6 +4330,66 @@ std::future<void> Database::RemoveUser(const User& UserRef) {
 		Users_.erase(It);
 		UserRoles_.erase(Name);
 		AuditRecordAssumeLocked("REMOVE_USER", Name, "OK");
+		Dirty_.store(true, std::memory_order_release);
+	});
+}
+
+std::future<void> Database::CreateUser(const std::string &UserName, const std::string &Password, bool IfNotExists) {
+	return DbDispatchAsync(this, [this, UserName, Password, IfNotExists]() {
+		std::scoped_lock Guard(DbMutex_);
+		RequireSessionGrantAdminAssumeLocked();
+		if(UserName.empty())
+			FailStorage("CREATE USER: name must be non-empty.");
+		for(const auto &Existing : Users_) {
+			if(Existing.Name == UserName) {
+				if(IfNotExists)
+					return;
+				FailStorage("CREATE USER: user \"" + UserName + "\" already exists.");
+			}
+		}
+		Users_.emplace_back(UserName, Password, static_cast<Permissions>(0));
+		AppendWalAfterAddUser(Users_.back());
+		AuditRecordAssumeLocked("CREATE_USER", UserName, "OK");
+		Dirty_.store(true, std::memory_order_release);
+	});
+}
+
+std::future<void> Database::DropUser(const std::string &UserName, bool IfExists) {
+	return DbDispatchAsync(this, [this, UserName, IfExists]() {
+		std::scoped_lock Guard(DbMutex_);
+		RequireSessionGrantAdminAssumeLocked();
+		const auto It = std::find_if(Users_.begin(), Users_.end(),
+		                             [&](const User &U) { return U.Name == UserName; });
+		if(It == Users_.end()) {
+			if(IfExists)
+				return;
+			FailStorage("DROP USER: user \"" + UserName + "\" not found.");
+		}
+		if(CurrentUser_.has_value() && CurrentUser_->Name == UserName)
+			CurrentUser_.reset();
+		AppendWalAfterRemoveUser(UserName);
+		Users_.erase(It);
+		UserRoles_.erase(UserName);
+		Acls_.erase(UserName);
+		AuditRecordAssumeLocked("DROP_USER", UserName, "OK");
+		Dirty_.store(true, std::memory_order_release);
+	});
+}
+
+std::future<void> Database::AlterUserPassword(const std::string &UserName, const std::string &NewPassword) {
+	return DbDispatchAsync(this, [this, UserName, NewPassword]() {
+		std::scoped_lock Guard(DbMutex_);
+		RequireSessionGrantAdminAssumeLocked();
+		const auto It = std::find_if(Users_.begin(), Users_.end(),
+		                             [&](const User &U) { return U.Name == UserName; });
+		if(It == Users_.end())
+			FailStorage("ALTER USER: user \"" + UserName + "\" not found.");
+		const User Updated(UserName, NewPassword, static_cast<Permissions>(0));
+		It->Password = Updated.Password;
+		AppendWalAfterAddUser(*It);
+		if(CurrentUser_.has_value() && CurrentUser_->Name == UserName)
+			CurrentUser_->Password = It->Password;
+		AuditRecordAssumeLocked("ALTER_USER_PASSWORD", UserName, "OK");
 		Dirty_.store(true, std::memory_order_release);
 	});
 }

@@ -3,6 +3,7 @@
 #include <Database/WriteAheadLog.hxx>
 #include <Database/HybridStorageScheduler.hxx>
 #include <Database/Dataset.hxx>
+#include <Database/EmbeddingCatalog.hxx>
 #include <Database/Graph.hxx>
 #include <Database/HybridTable.hxx>
 #include <Database/Superfetch.hxx>
@@ -29,8 +30,13 @@
 #include <atomic>
 #include <thread>
 #include <optional>
+#include <SQL/BytecodeTriggers.hxx>
 
 namespace AstralDB {
+
+bool DatabaseVmAssumeDbMutexHeld() noexcept;
+void DatabaseVmBumpDbMutexDepth() noexcept;
+void DatabaseVmPopDbMutexDepth() noexcept;
 
 struct FtsIndexSpec {
 	std::string Table;
@@ -80,6 +86,8 @@ void InstallGraphCatalogAssumeLocked(Database &Db, std::vector<GraphSpec> Specs)
 void ReplayWalGraphRegisterAssumeLocked(Database &Db, GraphSpec Spec);
 void ReplayWalGraphDropAssumeLocked(Database &Db, const std::string &Name);
 void ReplayWalGraphProjectionAssumeLocked(Database &Db, const GraphProjectionRequest &Req);
+void ReplayWalEmbeddingRegisterAssumeLocked(Database &Db, EmbeddingCatalogEntry Entry);
+void ReplayWalEmbeddingDropAssumeLocked(Database &Db, const std::string &Name);
 
 class Database {
 	friend void RegisterGraphCatalogEntryAssumeLocked(Database &Db, GraphSpec Spec);
@@ -87,6 +95,14 @@ class Database {
 	friend void ReplayWalGraphRegisterAssumeLocked(Database &Db, GraphSpec Spec);
 	friend void ReplayWalGraphDropAssumeLocked(Database &Db, const std::string &Name);
 	friend void ReplayWalGraphProjectionAssumeLocked(Database &Db, const GraphProjectionRequest &Req);
+	friend void ReplayWalEmbeddingRegisterAssumeLocked(Database &Db, EmbeddingCatalogEntry Entry);
+	friend void ReplayWalEmbeddingDropAssumeLocked(Database &Db, const std::string &Name);
+	friend void InstallEmbeddingCatalogEntryAssumeLocked(Database &Db, EmbeddingCatalogEntry Entry);
+	friend void InstallEmbeddingCatalogAssumeLocked(Database &Db, std::vector<EmbeddingCatalogEntry> Entries);
+	friend EmbeddingCatalogEntry BuildEmbeddingCatalogEntryFromTable(Database &Db, const std::string &Name,
+	                                                                 const std::string &TableName,
+	                                                                 const std::string &TokenColumn,
+	                                                                 const std::string &VectorColumn);
 
 public:
 	struct Column {
@@ -138,8 +154,12 @@ private:
 	std::unordered_map<std::string, std::string> ViewDefinitionSql_;
 	/** Persisted CREATE PROCEDURE bodies (cached \c .abc under \c astraldb_procs_cache ). */
 	std::unordered_map<std::string, std::string> ProcedureDefinitionSql_;
+	/** Persisted CREATE TRIGGER specs (catalog + snapshot + WAL). */
+	std::unordered_map<std::string, SQL::StoredTriggerEntry> TriggerDefinitions_;
+	int TriggerFireDepth_ = 0;
 	std::unordered_map<std::string, SequenceState> Sequences_;
 	std::unordered_map<std::string, DatasetCatalog> Datasets_;
+	std::unordered_map<std::string, EmbeddingCatalogEntry> Embeddings_;
 	/** Named graphs: spec + prebuilt out-adjacency for fast traversals. */
 	std::unordered_map<std::string, std::pair<GraphSpec, GraphAdjacency>> Graphs_;
 	/** Edge table name → graph names that use it (incremental adjacency updates). */
@@ -172,6 +192,9 @@ private:
 	void AppendWalAfterDropView(const std::string &ViewName);
 	void AppendWalAfterDefineProcedure(const std::string &Name, const std::string &SqlBody);
 	void AppendWalAfterDropProcedure(const std::string &Name);
+	void AppendWalAfterDefineTrigger(const std::string &Name, const std::string &SpecJson);
+	void AppendWalAfterDropTrigger(const std::string &Name);
+	void AppendWalAfterSetTriggerEnabled(const std::string &Name, bool Enabled);
 	void AppendWalAfterAddUser(const User &User);
 	void AppendWalAfterRemoveUser(const std::string &Name);
 	void AppendWalAfterGrantAcl(const std::string &UserName, const std::string &Table, int Bits);
@@ -269,6 +292,11 @@ public:
 	void InsertBulkSyntheticRows(const std::string &TableName, int64_t Count, int64_t StartId, int64_t Step);
 	void RegisterDataset(const std::string &Name, DatasetEntry Entry);
 	void DropDataset(const std::string &Name);
+	void RegisterEmbedding(const std::string &Name, const std::string &TableName, const std::string &TokenColumn,
+	                       const std::string &VectorColumn);
+	void DropEmbedding(const std::string &Name);
+	std::optional<std::string> EmbeddingWireCell(const std::string &Name) const;
+	std::optional<std::string> EmbeddingWireCellAssumeDbMutexHeld(const std::string &Name) const;
 	/** \p VersionId 0 loads the latest version; otherwise the matching snapshot is used. */
 	void LoadDatasetInto(const std::string &Name, const std::string &TargetTable, int64_t VersionId = 0);
 	void RegisterGraph(GraphSpec Spec);
@@ -290,7 +318,8 @@ public:
 	 *  otherwise \a UpdateValues are merged into the existing row. */
 	std::future<void> Upsert(const std::string &TableName, const Item &InsertRow,
 	                         const std::vector<std::string> &ConflictColumns, bool DoNothingOnConflict,
-	                         const std::vector<std::pair<std::string, std::string>> &UpdateAssignments);
+	                         const std::vector<std::pair<std::string, std::string>> &UpdateAssignments,
+	                         bool SqliteReplace = false);
 	/** For each row in \a SourceTable, match all \a KeyPairs (target col → source col); run \a OnMatch updates or
 	 *  build a row from \a OnInsert and insert. Assignment values are serialized SET expressions. */
 	std::future<void> MergeUsing(const std::string &TargetTable, const std::string &SourceTable,
@@ -325,6 +354,9 @@ public:
 
     std::future<void> AddUser(const User &User);
     std::future<void> RemoveUser(const User &User);
+    std::future<void> CreateUser(const std::string &UserName, const std::string &Password, bool IfNotExists);
+    std::future<void> DropUser(const std::string &UserName, bool IfExists);
+    std::future<void> AlterUserPassword(const std::string &UserName, const std::string &NewPassword);
     std::future<void> SetCurrentUser(const User &User);
 
     std::future<void> AddIndex(const std::string &TableName, const std::string &ColumnName);
@@ -398,6 +430,10 @@ public:
 	 *  \c Insert().get() / \c CreateTable().get() etc. from inside \a fn (async workers need the same mutex). */
 	template<class Fn>
 	void WithExclusiveBytecodeLock(Fn &&fn) {
+		if(DatabaseVmAssumeDbMutexHeld()) {
+			std::forward<Fn>(fn)();
+			return;
+		}
 		std::scoped_lock<SharedMutex> lock(DbMutex_);
 		std::forward<Fn>(fn)();
 	}
@@ -412,10 +448,31 @@ public:
 	void DefineView(const std::string &ViewName, std::string SqlBody);
 	void DropViewDefinition(const std::string &ViewName, bool IfExists);
 	std::unordered_map<std::string, std::string> ProcedureDefinitionsSnapshot() const;
-	void DefineProcedure(const std::string &ProcedureName, std::string SqlBody, bool IfNotExists = false);
+	void DefineProcedure(const std::string &ProcedureName, std::string SqlBody, bool IfNotExists = false,
+	                    bool OrReplace = false, std::string SourceDialect = {},
+	                    std::string ExceptionHandlersJson = {});
 	void DropProcedureDefinition(const std::string &ProcedureName, bool IfExists = false);
 	void ReplayWalDefineProcedure(const std::string &ProcedureName, std::string SqlBody);
 	void ReplayWalDropProcedure(const std::string &ProcedureName);
+	void DefineTrigger(SQL::StoredTriggerEntry Spec, bool IfNotExists = false, bool OrReplace = false);
+	void DropTriggerDefinition(const std::string &TriggerName, bool IfExists = false);
+	void SetTriggerEnabled(const std::string &TriggerName, bool Enabled);
+	void ReplayWalDefineTrigger(const std::string &TriggerName, std::string SpecJson);
+	void ReplayWalDropTrigger(const std::string &TriggerName);
+	void ReplayWalSetTriggerEnabled(const std::string &TriggerName, bool Enabled);
+	void InstallTriggerScratchRowAssumeLocked(const std::string &TableName, const Item *Row);
+	void InsertRowAssumeLocked(const std::string &TableName, Item Row, bool RunTriggers = true);
+	int TriggerFireDepth() const { return TriggerFireDepth_; }
+	int TriggerFireDepthLimit() const { return 8; }
+	void BumpTriggerFireDepth() { ++TriggerFireDepth_; }
+	void PopTriggerFireDepth() {
+		if(TriggerFireDepth_ > 0)
+			--TriggerFireDepth_;
+	}
+	/** Caller must hold \c DbMutex_ exclusively. */
+	const std::unordered_map<std::string, SQL::StoredTriggerEntry> &TriggerDefinitionsAssumeLocked() const {
+		return TriggerDefinitions_;
+	}
 	/** Idempotent WAL replay helpers (no new WAL rows; overwrite view SQL if name already mapped). */
     void ReplayWalDefineView(const std::string &ViewName, std::string SqlBody);
     void ReplayWalDropView(const std::string &ViewName);
@@ -440,5 +497,9 @@ public:
 	void AppendWalAfterGraphRegister(const GraphSpec &Spec);
 	void AppendWalAfterGraphDrop(const std::string &Name);
 	void AppendWalAfterGraphProjection(const GraphProjectionRequest &Req);
+	void ReplayWalEmbeddingRegister(EmbeddingCatalogEntry Entry);
+	void ReplayWalEmbeddingDrop(const std::string &Name);
+	void AppendWalAfterEmbeddingRegister(const EmbeddingCatalogEntry &Entry);
+	void AppendWalAfterEmbeddingDrop(const std::string &Name);
 };
 }

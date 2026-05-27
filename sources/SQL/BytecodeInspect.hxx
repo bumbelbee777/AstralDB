@@ -40,10 +40,13 @@ struct BytecodeAnalysis {
 	bool HasAggregates = false;
 	bool HasWindowAnalytics = false;
 	bool HasSecurityGrants = false;
+	bool HasProcedureExceptionHandlers = false;
 	std::map<std::string, std::size_t> OpcodeHistogram;
 	std::vector<std::string> ReferencedTables;
 	std::vector<std::string> ReferencedSequences;
 	std::vector<std::string> ReferencedRoles;
+	std::vector<std::string> ReferencedProcedures;
+	std::vector<std::string> ExceptionConditions;
 	std::vector<std::string> ScratchTables;
 };
 

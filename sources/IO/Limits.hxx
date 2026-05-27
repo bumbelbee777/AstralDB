@@ -18,12 +18,22 @@ struct Limits {
 	static constexpr unsigned SpinSleepMicrosecondsCap = 2'048U;
 	/** Rough ceiling on std::launch::async futures from Database::RunAsync (best-effort, see Database.cxx). */
 	static constexpr unsigned MaxOutstandingAsyncJobs = 1'024U;
-	/** INSERT ... BULK N codegen expands to N logical rows at compile time; keep bounded. */
+	/** INSERT ... BULK N for normal sessions (persistent DB). */
 	static constexpr std::uint64_t MaxBulkInsertRows = 500'000ULL;
+	/** INSERT ... BULK N on ephemeral session DB (\c -m) or under spike guard. */
+	static constexpr std::uint64_t MaxBulkInsertRowsBench = 10'000'000ULL;
+	/** Row count at or above which ephemeral bulk uses the fast append path. */
+	static constexpr std::uint64_t BulkFastPathMinRows = 4'096ULL;
 	/** Scratch for SQL bytecode staging (\c std::pmr::monotonic_buffer_resource); spills to heap after exhaustion. */
 	static constexpr std::size_t SqlBytecodeArenaBytes = 512ULL * 1024ULL;
 	/** LIKE DP grid \c (pat+1)*(str+1) cell cap — rejects absurd patterns before \c std::bad_array_new_length. */
 	static constexpr std::size_t MaxSqlLikeDpCells = 4ULL * 1024ULL * 1024ULL;
+	/** Maximum compiled regex pattern length (bytes). */
+	static constexpr std::size_t MaxRegexPatternBytes = 64ULL * 1024ULL;
+	/** Recursion depth cap for regex backtracking. */
+	static constexpr std::size_t MaxRegexMatchDepth = 256ULL;
+	/** Compiled-regex cache entries for \c DS::Regex::SqlMatch . */
+	static constexpr std::size_t MaxRegexCacheEntries = 512ULL;
 	static constexpr unsigned MaxSqlViewExpansionDepth = 16U;
 	/** `ROW_NUMBER() OVER (PARTITION BY …)` emits this many identifiers at codegen; rejects larger lists early. */
 	static constexpr std::size_t MaxWindowPartitionColumns = 16ULL;

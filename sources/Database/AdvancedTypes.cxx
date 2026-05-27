@@ -1,6 +1,8 @@
 #include <Database/AdvancedTypes.hxx>
 
 #include <Database/GeoSpatial.hxx>
+#include <DS/glTF.hxx>
+#include <DS/Geometry2D.hxx>
 #include <IO/SIMD.hxx>
 
 #include <cctype>
@@ -99,6 +101,10 @@ bool IsAdvancedTypeSpelling(std::string_view SqlType) {
 		return true;
 	if(U == "TERRAIN" || U == "TERRAIN_POINT")
 		return true;
+	if(U == "MESH" || StartsWith(U, "GEOMETRY(MESH"))
+		return true;
+	if(U == "POLYGON" || StartsWith(U, "GEOMETRY(POLYGON"))
+		return true;
 	return false;
 }
 
@@ -188,6 +194,14 @@ std::optional<TypeDescriptor> ParseTypeSpelling(std::string_view SqlType) {
 	}
 	if(U == "TERRAIN" || U == "TERRAIN_POINT") {
 		D.Family = TypeFamily::Terrain;
+		return D;
+	}
+	if(U == "MESH" || StartsWith(U, "GEOMETRY(MESH")) {
+		D.Family = TypeFamily::Mesh;
+		return D;
+	}
+	if(U == "POLYGON" || StartsWith(U, "GEOMETRY(POLYGON")) {
+		D.Family = TypeFamily::Polygon;
 		return D;
 	}
 	return std::nullopt;
@@ -464,6 +478,15 @@ bool ValidateCell(const TypeDescriptor &Type, std::string_view Cell) {
 		return ParseVariantCell(Cell).has_value();
 	case TypeFamily::Terrain:
 		return GeoSpatial::ParseTerrainCell(Cell).has_value() || GeoSpatial::ParseWktPointZ(Cell).has_value();
+	case TypeFamily::Mesh:
+		return DS::glTF::ParseMeshCell(Cell).has_value();
+	case TypeFamily::Polygon: {
+		if(const auto P = DS::Geometry2D::ParsePolygonCell(Cell))
+			return DS::Geometry2D::ValidatePolygon(*P).Ok;
+		if(const auto W = DS::Geometry2D::ParseWktPolygon(Cell))
+			return DS::Geometry2D::ValidatePolygon(*W).Ok;
+		return false;
+	}
 	default:
 		return true;
 	}
@@ -512,6 +535,18 @@ std::optional<std::string> NormalizeCell(const TypeDescriptor &Type, std::string
 			return GeoSpatial::FormatTerrainCell(T->Lon, T->Lat, T->ElevM);
 		if(const auto W = GeoSpatial::ParseWktPointZ(Cell))
 			return GeoSpatial::FormatTerrainCell(W->Lon, W->Lat, W->ElevM);
+		return std::nullopt;
+	}
+	case TypeFamily::Mesh: {
+		if(const auto M = DS::glTF::ParseMeshCell(Cell))
+			return DS::glTF::FormatMeshCell(*M);
+		return std::nullopt;
+	}
+	case TypeFamily::Polygon: {
+		if(const auto P = DS::Geometry2D::ParsePolygonCell(Cell))
+			return DS::Geometry2D::FormatPolygonCell(*P);
+		if(const auto W = DS::Geometry2D::ParseWktPolygon(Cell))
+			return DS::Geometry2D::FormatPolygonCell(*W);
 		return std::nullopt;
 	}
 	default:

@@ -64,8 +64,17 @@ bool OpcodeIsDdl(Opcode Op) {
 	case Opcode::DROP_SEQUENCE:
 	case Opcode::CREATE_ROLE:
 	case Opcode::DROP_ROLE:
+	case Opcode::CREATE_USER:
+	case Opcode::DROP_USER:
+	case Opcode::ALTER_USER_PASSWORD:
 	case Opcode::CREATE_PROCEDURE:
 	case Opcode::DROP_PROCEDURE:
+	case Opcode::CREATE_TRIGGER:
+	case Opcode::DROP_TRIGGER:
+	case Opcode::ALTER_TRIGGER:
+	case Opcode::CALL_PROCEDURE:
+	case Opcode::PROC_TRY:
+	case Opcode::PROC_END_TRY:
 		return true;
 	default:
 		return false;
@@ -129,6 +138,9 @@ bool OpcodeIsSecurity(Opcode Op) {
 	switch(Op) {
 	case Opcode::GRANT:
 	case Opcode::REVOKE:
+	case Opcode::CREATE_USER:
+	case Opcode::DROP_USER:
+	case Opcode::ALTER_USER_PASSWORD:
 	case Opcode::GRANT_ROLE_MEMBERSHIP:
 	case Opcode::REVOKE_ROLE_MEMBERSHIP:
 	case Opcode::GRANT_COLUMN:
@@ -187,6 +199,16 @@ void HarvestOperands(const Instruction &Inst, BytecodeAnalysis &Analysis) {
 		if(const auto *S = FirstString())
 			MaybeAddUnique(Analysis.ReferencedRoles, *S);
 		break;
+	case Opcode::CALL_PROCEDURE:
+		if(const auto *S = FirstString())
+			MaybeAddUnique(Analysis.ReferencedProcedures, *S);
+		break;
+	case Opcode::PROC_TRY:
+		Analysis.HasProcedureExceptionHandlers = true;
+		for(std::size_t O = 3; O + 1 < Inst.Operands.size(); O += 2)
+			if(const auto *C = std::get_if<std::string>(&Inst.Operands[O + 1]))
+				MaybeAddUnique(Analysis.ExceptionConditions, *C);
+		break;
 	default:
 		break;
 	}
@@ -208,6 +230,10 @@ std::string OpcodeName(Opcode Op) {
 		return "LOAD_DATASET";
 	case Opcode::DROP_DATASET:
 		return "DROP_DATASET";
+	case Opcode::REGISTER_EMBEDDING:
+		return "REGISTER_EMBEDDING";
+	case Opcode::DROP_EMBEDDING:
+		return "DROP_EMBEDDING";
 	case Opcode::VACUUM:
 		return "VACUUM";
 	case Opcode::REPACK_CONCURRENTLY:
@@ -292,6 +318,8 @@ std::string OpcodeName(Opcode Op) {
 		return "DIV";
 	case Opcode::MOD:
 		return "MOD";
+	case Opcode::INT_DIV:
+		return "INT_DIV";
 	case Opcode::PUSH:
 		return "PUSH";
 	case Opcode::POP:
@@ -318,6 +346,12 @@ std::string OpcodeName(Opcode Op) {
 		return "CREATE_ROLE";
 	case Opcode::DROP_ROLE:
 		return "DROP_ROLE";
+	case Opcode::CREATE_USER:
+		return "CREATE_USER";
+	case Opcode::DROP_USER:
+		return "DROP_USER";
+	case Opcode::ALTER_USER_PASSWORD:
+		return "ALTER_USER_PASSWORD";
 	case Opcode::CREATE_SEQUENCE:
 		return "CREATE_SEQUENCE";
 	case Opcode::DROP_SEQUENCE:
@@ -422,8 +456,18 @@ std::string OpcodeName(Opcode Op) {
 		return "CREATE_PROCEDURE";
 	case Opcode::DROP_PROCEDURE:
 		return "DROP_PROCEDURE";
+	case Opcode::CREATE_TRIGGER:
+		return "CREATE_TRIGGER";
+	case Opcode::DROP_TRIGGER:
+		return "DROP_TRIGGER";
+	case Opcode::ALTER_TRIGGER:
+		return "ALTER_TRIGGER";
 	case Opcode::CALL_PROCEDURE:
 		return "CALL_PROCEDURE";
+case Opcode::PROC_TRY:
+		return "PROC_TRY";
+case Opcode::PROC_END_TRY:
+		return "PROC_END_TRY";
 	case Opcode::CREATE_SCHEMA:
 		return "CREATE_SCHEMA";
 	case Opcode::DROP_SCHEMA:
@@ -454,6 +498,8 @@ std::string OpcodeName(Opcode Op) {
 		return "MATCH_RECOGNIZE";
 	case Opcode::RECURSIVE_CTE_FIXPOINT:
 		return "RECURSIVE_CTE_FIXPOINT";
+	case Opcode::CONNECT_BY_EXPAND:
+		return "CONNECT_BY_EXPAND";
 	case Opcode::WINDOW_ROW_NUMBER:
 		return "WINDOW_ROW_NUMBER";
 	case Opcode::SLICE_RANGE:
@@ -466,6 +512,10 @@ std::string OpcodeName(Opcode Op) {
 		return "CAST_EVAL";
 	case Opcode::SCALAR_FUNC_EVAL:
 		return "SCALAR_FUNC_EVAL";
+	case Opcode::SCALAR_ARITH_EVAL:
+		return "SCALAR_ARITH_EVAL";
+	case Opcode::COLUMNS_EXPAND:
+		return "COLUMNS_EXPAND";
 	}
 	return "OP_" + std::to_string(static_cast<int>(Op));
 }
@@ -558,6 +608,9 @@ std::string FormatBytecodeAnalysis(const BytecodeAnalysis &Analysis) {
 	EmitList("scratch_tables", Analysis.ScratchTables);
 	EmitList("sequences", Analysis.ReferencedSequences);
 	EmitList("roles", Analysis.ReferencedRoles);
+	EmitList("procedures", Analysis.ReferencedProcedures);
+	EmitList("exception_conditions", Analysis.ExceptionConditions);
+	Out << "procedure_exception_handlers=" << (Analysis.HasProcedureExceptionHandlers ? "yes" : "no") << "\n";
 	Out << "opcode_histogram:\n";
 	for(const auto &[Name, Count] : Analysis.OpcodeHistogram)
 		Out << "  " << Name << " " << Count << "\n";

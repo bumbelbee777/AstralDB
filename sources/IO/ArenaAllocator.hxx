@@ -31,6 +31,11 @@ public:
 	std::size_t capacity() const noexcept { return Data_.size(); }
 
 	void reset() noexcept { Offset_ = 0; }
+
+	template<class T>
+	[[nodiscard]] T *Allocate(std::size_t Count, std::size_t Align = alignof(T)) {
+		return static_cast<T *>(Allocate(Count * sizeof(T), Align));
+	}
 };
 
 } // namespace AstralDB

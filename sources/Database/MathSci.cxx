@@ -2,6 +2,11 @@
 
 #include <Database/AdvancedTypes.hxx>
 #include <Database/MathSciAutograd.hxx>
+#include <Database/MathSciClassify.hxx>
+#include <Database/MathSciComplex.hxx>
+#include <Database/MathSciEmbeddings.hxx>
+#include <Database/MathSciNlp.hxx>
+#include <Database/MathSciSimdUtil.hxx>
 #include <Database/MathSciSignal.hxx>
 #include <Database/MathSciSolves.hxx>
 #include <Database/GeoSpatial.hxx>
@@ -9,9 +14,13 @@
 #include <IO/MathUtil.hxx>
 #include <IO/SIMD.hxx>
 #include <DS/JSON.hxx>
+#include <DS/glTF.hxx>
+#include <DS/Geometry2D.hxx>
+#include <SQL/DialectCompat.hxx>
 #include <SQL/JsonSql.hxx>
 #include <SQL/XmlSql.hxx>
 #include <SQL/SQL.hxx>
+#include <SQL/SetExprEval.hxx>
 #include <SQL/TextSearch.hxx>
 
 #include <algorithm>
@@ -76,19 +85,9 @@ std::optional<std::string> FormatSeqList(const std::vector<double> &V) {
 	return AdvancedTypes::FormatListCell(Cells);
 }
 
-std::vector<float> SeqToF32(const std::vector<double> &V) {
-	std::vector<float> Out(V.size());
-	for(size_t I = 0; I < V.size(); ++I)
-		Out[I] = static_cast<float>(V[I]);
-	return Out;
-}
+std::vector<float> SeqToF32(const std::vector<double> &V) { return MathSciSimdUtil::SeqToF32(V); }
 
-std::vector<double> ToF64Vec(const std::vector<float> &V) {
-	std::vector<double> Out(V.size());
-	for(size_t I = 0; I < V.size(); ++I)
-		Out[I] = static_cast<double>(V[I]);
-	return Out;
-}
+std::vector<double> ToF64Vec(const std::vector<float> &V) { return MathSciSimdUtil::ToF64(V); }
 
 std::optional<std::vector<double>> AsDoubles(const std::vector<std::string> &Cells) {
 	std::vector<double> Out;
@@ -135,6 +134,30 @@ std::optional<std::vector<double>> ParseSeq(std::string_view Cell) {
 	if(const auto N = ToNum(Cell)) {
 		std::vector<double> One{*N};
 		return One;
+	}
+	return std::nullopt;
+}
+
+std::optional<DS::Geometry2D::Polygon> ParseGeomPoly(std::string_view Cell) {
+	if(const auto P = DS::Geometry2D::ParsePolygonCell(Cell))
+		return P;
+	if(const auto W = DS::Geometry2D::ParseWktPolygon(Cell))
+		return W;
+	if(const auto G = DS::Geometry2D::ImportGeoJsonPolygon(Cell))
+		return G;
+	if(Cell.starts_with("POLYGON"))
+		return DS::Geometry2D::ParseWktPolygon(Cell);
+	return std::nullopt;
+}
+
+std::optional<DS::Geometry2D::Vec2> ParseGeomPoint(std::string_view Cell) {
+	if(const auto P = GeoSpatial::ParsePointCell(Cell))
+		return DS::Geometry2D::Vec2{P->Lon, P->Lat};
+	if(const auto W = GeoSpatial::ParseWktPoint(Cell))
+		return DS::Geometry2D::Vec2{W->Lon, W->Lat};
+	if(const auto V = AdvancedTypes::ParseVectorCell(Cell)) {
+		if(V->size() >= 2)
+			return DS::Geometry2D::Vec2{(*V)[0], (*V)[1]};
 	}
 	return std::nullopt;
 }
@@ -299,6 +322,7 @@ const std::unordered_map<std::string, Entry> &BuiltinTable() {
 	    {"ZSCORE", {ScalarSqlFn::ZScore, 1, 1}},
 	    {"LIST_LEN", {ScalarSqlFn::ListLen, 1, 1}},
 	    {"LIST_GET", {ScalarSqlFn::ListGet, 2, 2}},
+	    {"LIST_TRANSFORM", {ScalarSqlFn::ListTransform, 2, 2}},
 	    {"LIST_APPEND", {ScalarSqlFn::ListAppend, 2, 2}},
 	    {"LIST_CONCAT", {ScalarSqlFn::ListConcat, 2, 2}},
 	    {"LIST_CONTAINS", {ScalarSqlFn::ListContains, 2, 2}},
@@ -334,6 +358,7 @@ const std::unordered_map<std::string, Entry> &BuiltinTable() {
 	    {"GREATEST", {ScalarSqlFn::Greatest, 2, 2}},
 	    {"LEAST", {ScalarSqlFn::Least, 2, 2}},
 	    {"TEXT_CONTAINS", {ScalarSqlFn::TextContains, 2, 2}},
+	    {"REGEXP_MATCH", {ScalarSqlFn::RegexpMatch, 2, 2}},
 	    {"MATCH_AGAINST", {ScalarSqlFn::TextMatch, 2, 2}},
 	    {"XML_EXTRACT", {ScalarSqlFn::XmlExtract, 2, 2}},
 	    {"XML_SERIALIZE", {ScalarSqlFn::XmlSerialize, 1, 1}},
@@ -393,9 +418,87 @@ const std::unordered_map<std::string, Entry> &BuiltinTable() {
 	    {"ST_ELEVATION", {ScalarSqlFn::StElevation, 1, 1}},
 	    {"ST_DEM_SAMPLE", {ScalarSqlFn::StDemSample, 9, 9}},
 	    {"ST_TERRAIN_SLOPE", {ScalarSqlFn::StTerrainSlope, 9, 9}},
+	    {"ST_MESH", {ScalarSqlFn::StMeshDefine, 2, 2}},
+	    {"ST_MESH_IMPORT_GLTF", {ScalarSqlFn::StMeshImportGltf, 1, 1}},
+	    {"ST_MESH_EXPORT_GLTF", {ScalarSqlFn::StMeshExportGltf, 1, 1}},
+	    {"ST_MESH_SEW", {ScalarSqlFn::StMeshSew, 2, 2}},
+	    {"ST_MESH_UNION", {ScalarSqlFn::StMeshUnion, 2, 2}},
+	    {"ST_MESH_INTERSECTION", {ScalarSqlFn::StMeshIntersection, 2, 2}},
+	    {"ST_MESH_DIFFERENCE", {ScalarSqlFn::StMeshDifference, 2, 2}},
+	    {"ST_MESH_VOLUME", {ScalarSqlFn::StMeshVolume, 1, 1}},
+	    {"ST_MESH_SURFACE_AREA", {ScalarSqlFn::StMeshSurfaceArea, 1, 1}},
+	    {"ST_MESH_CENTROID", {ScalarSqlFn::StMeshCentroid, 1, 1}},
+	    {"ST_MESH_TRANSLATE", {ScalarSqlFn::StMeshTranslate, 4, 4}},
+	    {"ST_MESH_SCALE", {ScalarSqlFn::StMeshScale, 4, 4}},
+	    {"ST_MESH_ROTATE", {ScalarSqlFn::StMeshRotate, 4, 4}},
+	    {"ST_MESH_BOUNDS", {ScalarSqlFn::StMeshBounds, 1, 1}},
+	    {"ST_MESH_MERGE", {ScalarSqlFn::StMeshMerge, 2, 3}},
+	    {"ST_POLYGON", {ScalarSqlFn::StPolygon, 1, 1}},
+	    {"ST_POLYGON_WKT", {ScalarSqlFn::StPolygonWkt, 1, 1}},
+	    {"ST_GEOM_AS_TEXT", {ScalarSqlFn::StGeomAsText, 1, 1}},
+	    {"ST_GEOM_AREA", {ScalarSqlFn::StGeomArea, 1, 1}},
+	    {"ST_GEOM_PERIMETER", {ScalarSqlFn::StGeomPerimeter, 1, 1}},
+	    {"ST_GEOM_CENTROID", {ScalarSqlFn::StGeomCentroid, 1, 1}},
+	    {"ST_GEOM_CONTAINS", {ScalarSqlFn::StGeomContains, 2, 2}},
+	    {"ST_GEOM_WITHIN", {ScalarSqlFn::StGeomWithin, 2, 2}},
+	    {"ST_GEOM_INTERSECTS", {ScalarSqlFn::StGeomIntersects, 2, 2}},
+	    {"ST_GEOM_OVERLAPS", {ScalarSqlFn::StGeomOverlaps, 2, 2}},
+	    {"ST_GEOM_TOUCHES", {ScalarSqlFn::StGeomTouches, 2, 2}},
+	    {"ST_GEOM_UNION", {ScalarSqlFn::StGeomUnion, 2, 2}},
+	    {"ST_GEOM_INTERSECTION", {ScalarSqlFn::StGeomIntersection, 2, 2}},
+	    {"ST_GEOM_DIFFERENCE", {ScalarSqlFn::StGeomDifference, 2, 2}},
+	    {"ST_GEOM_SYMDIFFERENCE", {ScalarSqlFn::StGeomSymDifference, 2, 2}},
+	    {"ST_GEOM_BUFFER", {ScalarSqlFn::StGeomBuffer, 2, 2}},
+	    {"ST_GEOM_SIMPLIFY", {ScalarSqlFn::StGeomSimplify, 2, 2}},
+	    {"ST_GEOM_CONVEX_HULL", {ScalarSqlFn::StGeomConvexHull, 1, 1}},
+	    {"ST_GEOJSON_IMPORT", {ScalarSqlFn::StGeojsonImport, 1, 1}},
+	    {"ST_GEOJSON_EXPORT", {ScalarSqlFn::StGeojsonExport, 1, 1}},
+	    {"ST_GEOM_VALIDATE", {ScalarSqlFn::StGeomValidate, 1, 1}},
+	    {"ST_GEOM_REPAIR", {ScalarSqlFn::StGeomRepair, 1, 1}},
+	    {"ST_MESH_VALIDATE", {ScalarSqlFn::StMeshValidate, 1, 1}},
+	    {"ST_MESH_REPAIR", {ScalarSqlFn::StMeshRepair, 1, 1}},
 	    {"TS_COMPRESS", {ScalarSqlFn::TsCompress, 1, 1}},
 	    {"TS_DECOMPRESS", {ScalarSqlFn::TsDecompress, 1, 1}},
 	    {"TS_COMPRESS_SERIES", {ScalarSqlFn::TsCompressSeries, 2, 2}},
+	    {"ODE_TRAPEZOID", {ScalarSqlFn::OdeTrapezoid, 4, 4}},
+	    {"ODE_SEMI_IMPLICIT", {ScalarSqlFn::OdeSemiImplicit, 4, 4}},
+	    {"ODE_CRANK_NICOLSON", {ScalarSqlFn::OdeCrankNicolson, 4, 4}},
+	    {"ODE_RK3", {ScalarSqlFn::OdeRk3, 5, 5}},
+	    {"ODE_ADAMS_BASHFORTH2", {ScalarSqlFn::OdeAdamsBashforth2, 4, 4}},
+	    {"ODE_MARCH", {ScalarSqlFn::OdeMarch, 8, 8}},
+	    {"SDE_MARCH", {ScalarSqlFn::SdeMarch, 6, 6}},
+	    {"LINEAR_JACOBI_STEP", {ScalarSqlFn::LinearJacobiStep, 3, 3}},
+	    {"LINEAR_GS_STEP", {ScalarSqlFn::LinearGaussSeidelStep, 3, 3}},
+	    {"LINEAR_SOR_STEP", {ScalarSqlFn::LinearSorStep, 4, 4}},
+	    {"LINEAR_RICHARDSON_STEP", {ScalarSqlFn::LinearRichardsonStep, 4, 4}},
+	    {"LINEAR_CG_SOLVE", {ScalarSqlFn::LinearCgSolve, 5, 5}},
+	    {"SOLVE_LINEAR", {ScalarSqlFn::SolveLinear, 7, 7}},
+	    {"PDE_POISSON_GS_STEP", {ScalarSqlFn::PdePoissonGsStep, 2, 2}},
+	    {"PDE_POISSON_SOR_STEP", {ScalarSqlFn::PdePoissonSorStep, 3, 3}},
+	    {"PDE_POISSON_SOLVE", {ScalarSqlFn::PdePoissonSolve, 5, 5}},
+	    {"PDE_HEAT_MARCH", {ScalarSqlFn::PdeHeatMarch, 5, 5}},
+	    {"SOLVE_PDE", {ScalarSqlFn::SolvePde, 9, 9}},
+	    {"ROOT_NEWTON_STEP", {ScalarSqlFn::RootNewtonStep, 3, 3}},
+	    {"ROOT_SECANT_STEP", {ScalarSqlFn::RootSecantStep, 4, 4}},
+	    {"ROOT_BISECT_STEP", {ScalarSqlFn::RootBisectStep, 4, 4}},
+	    {"ROOT_HALLEY_STEP", {ScalarSqlFn::RootHalleyStep, 4, 4}},
+	    {"SOLVE_ROOT", {ScalarSqlFn::SolveRoot, 5, 5}},
+	    {"CLASSIFY_LINEAR", {ScalarSqlFn::ClassifyLinear, 3, 3}},
+	    {"CLASSIFY_LOGISTIC", {ScalarSqlFn::ClassifyLogistic, 2, 2}},
+	    {"CLASSIFY_ARGMAX", {ScalarSqlFn::ClassifyArgmax, 1, 1}},
+	    {"CLASSIFY_ONE_VS_REST", {ScalarSqlFn::ClassifyOneVsRest, 2, 2}},
+	    {"NLP_TOKENIZE", {ScalarSqlFn::NlpTokenize, 1, 1}},
+	    {"NLP_NGRAMS", {ScalarSqlFn::NlpNgrams, 2, 2}},
+	    {"NLP_JACCARD", {ScalarSqlFn::NlpJaccard, 2, 2}},
+	    {"NLP_EDIT_DIST", {ScalarSqlFn::NlpEditDist, 2, 2}},
+	    {"NLP_STEM", {ScalarSqlFn::NlpStem, 1, 1}},
+	    {"NLP_EMBED_BUILD", {ScalarSqlFn::NlpEmbedBuild, 2, 2}},
+	    {"NLP_EMBED_LOOKUP", {ScalarSqlFn::NlpEmbedLookup, 2, 2}},
+	    {"NLP_EMBED_BATCH", {ScalarSqlFn::NlpEmbedBatch, 2, 2}},
+	    {"NLP_EMBED_SERIALIZE", {ScalarSqlFn::NlpEmbedSerialize, 1, 1}},
+	    {"NLP_EMBED_LOAD", {ScalarSqlFn::NlpEmbedLoad, 1, 1}},
+	    {"NLP_EMBED_FINGERPRINT", {ScalarSqlFn::NlpEmbedFingerprint, 1, 1}},
+	    {"NLP_EMBED_MEAN", {ScalarSqlFn::NlpEmbedMean, 2, 2}},
 	};
 	return T;
 }
@@ -417,7 +520,8 @@ const std::unordered_map<ScalarSqlFn, BuiltinArity> &ArityTable() {
 bool IsMathSciScalarFn(ScalarSqlFn Fn) {
 	return (Fn >= ScalarSqlFn::Abs && Fn <= ScalarSqlFn::TextMatch) ||
 	       (Fn >= ScalarSqlFn::XmlExtract && Fn <= ScalarSqlFn::VectorTopK) ||
-	       (Fn >= ScalarSqlFn::Fft && Fn <= ScalarSqlFn::StTerrainSlope);
+	       (Fn >= ScalarSqlFn::Fft && Fn <= ScalarSqlFn::StMeshRepair) ||
+	       (Fn >= ScalarSqlFn::OdeRk3 && Fn <= ScalarSqlFn::SolveRoot);
 }
 
 BuiltinArity ArityFor(ScalarSqlFn Fn) {
@@ -445,7 +549,7 @@ std::optional<BuiltinSpec> LookupBuiltin(std::string_view Name) {
 	return BuiltinSpec{It->second.Fn, {It->second.Min, It->second.Max}};
 }
 
-std::optional<std::string> EvalScalar(ScalarSqlFn Fn, const std::vector<std::string> &Cells) {
+std::optional<std::string> EvalScalar(ScalarSqlFn Fn, const std::vector<std::string> &Cells, Database *Db) {
 	if(!IsMathSciScalarFn(Fn))
 		return std::nullopt;
 
@@ -806,6 +910,46 @@ std::optional<std::string> EvalScalar(ScalarSqlFn Fn, const std::vector<std::str
 			return std::nullopt;
 		return (*L)[I];
 	}
+	case ScalarSqlFn::ListTransform: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		const auto L = AdvancedTypes::ParseListCell(Cells[0]);
+		if(!L)
+			return std::nullopt;
+		std::string_view Blob = Cells[1];
+		if(Blob.size() < 3 || Blob[0] != 'M')
+			return std::nullopt;
+		size_t Off = 1;
+		const size_t CntEnd = Blob.find('|', Off);
+		if(CntEnd == std::string_view::npos)
+			return std::nullopt;
+		const int64_t Np = std::stoll(std::string(Blob.substr(Off, CntEnd - Off)));
+		Off = CntEnd + 1;
+		if(Np < 1)
+			return std::nullopt;
+		const size_t PEnd = Blob.find('|', Off);
+		if(PEnd == std::string_view::npos)
+			return std::nullopt;
+		const std::string Param(Blob.substr(Off, PEnd - Off));
+		Off = PEnd + 1;
+		for(int64_t P = 1; P < Np; ++P) {
+			const size_t Nx = Blob.find('|', Off);
+			if(Nx == std::string_view::npos)
+				return std::nullopt;
+			Off = Nx + 1;
+		}
+		const std::string Body = std::string(Blob.substr(Off));
+		std::vector<std::string> Out;
+		Out.reserve(L->size());
+		for(const std::string &Elem : *L) {
+			Database::Item Probe;
+			Probe[Param] = Elem;
+			const SQL::RowEvalContext Ctx{&Probe, nullptr, nullptr};
+			const auto V = SQL::EvalSerializedSetValueExpr(Body, Ctx);
+			Out.push_back(V.value_or(std::string()));
+		}
+		return AdvancedTypes::FormatListCell(Out);
+	}
 	case ScalarSqlFn::ListAppend: {
 		if(Cells.size() != 2)
 			return std::nullopt;
@@ -988,20 +1132,9 @@ std::optional<std::string> EvalScalar(ScalarSqlFn Fn, const std::vector<std::str
 		return FmtNum(*S);
 	}
 	case ScalarSqlFn::CosineSim: {
-		const auto P = BinarySeq(Cells);
-		if(!P)
+		if(Cells.size() != 2)
 			return std::nullopt;
-		double Dot = 0.0;
-		double Na = 0.0;
-		double Nb = 0.0;
-		for(size_t I = 0; I < P->first.size(); ++I) {
-			Dot += P->first[I] * P->second[I];
-			Na += P->first[I] * P->first[I];
-			Nb += P->second[I] * P->second[I];
-		}
-		if(Na == 0 || Nb == 0)
-			return std::nullopt;
-		return FmtNum(Dot / (std::sqrt(Na) * std::sqrt(Nb)));
+		return MathSciComplex::CosineSimCellFromReal(Cells[0], Cells[1]);
 	}
 	case ScalarSqlFn::EuclideanDist: {
 		const auto P = BinarySeq(Cells);
@@ -1026,22 +1159,7 @@ std::optional<std::string> EvalScalar(ScalarSqlFn Fn, const std::vector<std::str
 	case ScalarSqlFn::MatVec: {
 		if(Cells.size() != 2)
 			return std::nullopt;
-		const auto M = AdvancedTypes::DecodeMatrixCell(Cells[0]);
-		const auto V = AdvancedTypes::ParseVectorCell(Cells[1]);
-		if(!M || !V || V->size() != M->Cols)
-			return std::nullopt;
-		std::vector<float> Mf;
-		Mf.reserve(M->Flat.size());
-		for(double X : M->Flat)
-			Mf.push_back(static_cast<float>(X));
-		std::vector<float> Vf;
-		Vf.reserve(V->size());
-		for(double X : *V)
-			Vf.push_back(static_cast<float>(X));
-		std::vector<float> Out(M->Rows);
-		Simd::MatrixVectorMulF32(Mf.data(), Vf.data(), Out.data(), M->Rows, M->Cols);
-		std::vector<double> Od(Out.begin(), Out.end());
-		return AdvancedTypes::FormatVectorCell(Od);
+		return MathSciComplex::MatVecCellFromReal(Cells[0], Cells[1]);
 	}
 	case ScalarSqlFn::ListSort:
 		if(Cells.size() != 1)
@@ -1145,6 +1263,10 @@ std::optional<std::string> EvalScalar(ScalarSqlFn Fn, const std::vector<std::str
 		if(Cells.size() != 2)
 			return std::nullopt;
 		return SQL::TextSearch::MatchesQuery(Cells[0], Cells[1]) ? std::string("1") : std::string("0");
+	case ScalarSqlFn::RegexpMatch:
+		if(Cells.size() != 2)
+			return std::nullopt;
+		return SQL::SqlRegexpMatch(Cells[0], Cells[1], false) ? std::string("1") : std::string("0");
 	case ScalarSqlFn::TextMatch:
 		if(Cells.size() != 2)
 			return std::nullopt;
@@ -1651,6 +1773,348 @@ std::optional<std::string> EvalScalar(ScalarSqlFn Fn, const std::vector<std::str
 			return std::nullopt;
 		return FmtNum(*Val);
 	}
+	case ScalarSqlFn::StMeshDefine: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		const auto Vert = AdvancedTypes::ParseVectorCell(Cells[0]);
+		const auto Idx = AdvancedTypes::ParseListCell(Cells[1]);
+		if(!Vert || !Idx || Vert->empty() || Vert->size() % 3 != 0 || Idx->size() % 3 != 0)
+			return std::nullopt;
+		DS::glTF::Mesh M;
+		M.Vertices = *Vert;
+		M.Indices.reserve(Idx->size());
+		for(const auto &S : *Idx) {
+			const auto N = ToNum(S);
+			if(!N || *N < 0.0)
+				return std::nullopt;
+			M.Indices.push_back(static_cast<std::uint32_t>(*N));
+		}
+		return DS::glTF::FormatMeshCell(M);
+	}
+	case ScalarSqlFn::StMeshImportGltf: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		const auto M = DS::glTF::ImportMeshFromGltfJson(Cells[0]);
+		return M ? std::optional<std::string>(DS::glTF::FormatMeshCell(*M)) : std::nullopt;
+	}
+	case ScalarSqlFn::StMeshExportGltf: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		const auto M = DS::glTF::ParseMeshCell(Cells[0]);
+		return M ? std::optional<std::string>(DS::glTF::ExportMeshToGltfJson(*M)) : std::nullopt;
+	}
+	case ScalarSqlFn::StMeshSew: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		const auto M = DS::glTF::ParseMeshCell(Cells[0]);
+		const auto Eps = ToNum(Cells[1]);
+		if(!M || !Eps)
+			return std::nullopt;
+		return DS::glTF::FormatMeshCell(DS::glTF::SewMesh(*M, *Eps));
+	}
+	case ScalarSqlFn::StMeshUnion:
+	case ScalarSqlFn::StMeshIntersection:
+	case ScalarSqlFn::StMeshDifference: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		const auto A = DS::glTF::ParseMeshCell(Cells[0]);
+		const auto B = DS::glTF::ParseMeshCell(Cells[1]);
+		if(!A || !B)
+			return std::nullopt;
+		DS::glTF::Mesh R;
+		if(Fn == ScalarSqlFn::StMeshUnion)
+			R = DS::glTF::CsgUnion(*A, *B);
+		else if(Fn == ScalarSqlFn::StMeshIntersection)
+			R = DS::glTF::CsgIntersection(*A, *B);
+		else
+			R = DS::glTF::CsgDifference(*A, *B);
+		return DS::glTF::FormatMeshCell(R);
+	}
+	case ScalarSqlFn::StMeshVolume: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		const auto M = DS::glTF::ParseMeshCell(Cells[0]);
+		return M ? std::optional<std::string>(FmtNum(DS::glTF::Volume(*M))) : std::nullopt;
+	}
+	case ScalarSqlFn::StMeshSurfaceArea: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		const auto M = DS::glTF::ParseMeshCell(Cells[0]);
+		return M ? std::optional<std::string>(FmtNum(DS::glTF::SurfaceArea(*M))) : std::nullopt;
+	}
+	case ScalarSqlFn::StMeshCentroid: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		const auto M = DS::glTF::ParseMeshCell(Cells[0]);
+		if(!M)
+			return std::nullopt;
+		double X = 0.0, Y = 0.0, Z = 0.0;
+		DS::glTF::Centroid(*M, X, Y, Z);
+		return GeoSpatial::FormatTerrainCell(X, Y, Z);
+	}
+	case ScalarSqlFn::StMeshTranslate: {
+		if(Cells.size() != 4)
+			return std::nullopt;
+		const auto M = DS::glTF::ParseMeshCell(Cells[0]);
+		const auto Dx = ToNum(Cells[1]);
+		const auto Dy = ToNum(Cells[2]);
+		const auto Dz = ToNum(Cells[3]);
+		if(!M || !Dx || !Dy || !Dz)
+			return std::nullopt;
+		return DS::glTF::FormatMeshCell(DS::glTF::Translate(*M, *Dx, *Dy, *Dz));
+	}
+	case ScalarSqlFn::StMeshScale: {
+		if(Cells.size() != 4)
+			return std::nullopt;
+		const auto M = DS::glTF::ParseMeshCell(Cells[0]);
+		const auto Sx = ToNum(Cells[1]);
+		const auto Sy = ToNum(Cells[2]);
+		const auto Sz = ToNum(Cells[3]);
+		if(!M || !Sx || !Sy || !Sz)
+			return std::nullopt;
+		return DS::glTF::FormatMeshCell(DS::glTF::Scale(*M, *Sx, *Sy, *Sz));
+	}
+	case ScalarSqlFn::StMeshRotate: {
+		if(Cells.size() != 4)
+			return std::nullopt;
+		const auto M = DS::glTF::ParseMeshCell(Cells[0]);
+		const auto Rx = ToNum(Cells[1]);
+		const auto Ry = ToNum(Cells[2]);
+		const auto Rz = ToNum(Cells[3]);
+		if(!M || !Rx || !Ry || !Rz)
+			return std::nullopt;
+		return DS::glTF::FormatMeshCell(DS::glTF::Rotate(*M, *Rx, *Ry, *Rz));
+	}
+	case ScalarSqlFn::StMeshBounds: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		const auto M = DS::glTF::ParseMeshCell(Cells[0]);
+		if(!M)
+			return std::nullopt;
+		const auto B = DS::glTF::ComputeBounds(*M);
+		if(!B.Valid)
+			return std::nullopt;
+		std::vector<std::string> Parts{FmtNum(B.MinX), FmtNum(B.MinY), FmtNum(B.MinZ),
+		                               FmtNum(B.MaxX), FmtNum(B.MaxY), FmtNum(B.MaxZ)};
+		return AdvancedTypes::FormatListCell(Parts);
+	}
+	case ScalarSqlFn::StMeshMerge: {
+		if(Cells.size() < 2 || Cells.size() > 3)
+			return std::nullopt;
+		const auto A = DS::glTF::ParseMeshCell(Cells[0]);
+		const auto B = DS::glTF::ParseMeshCell(Cells[1]);
+		if(!A || !B)
+			return std::nullopt;
+		double Eps = 1e-6;
+		if(Cells.size() == 3) {
+			const auto E = ToNum(Cells[2]);
+			if(!E)
+				return std::nullopt;
+			Eps = *E;
+		}
+		return DS::glTF::FormatMeshCell(DS::glTF::MergeMeshes(*A, *B, Eps));
+	}
+	case ScalarSqlFn::StPolygon: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		const auto Coords = ParseSeq(Cells[0]);
+		if(!Coords || Coords->size() < 6 || Coords->size() % 2 != 0)
+			return std::nullopt;
+		return DS::Geometry2D::FormatPolygonCell(DS::Geometry2D::PolygonFromRing(*Coords));
+	}
+	case ScalarSqlFn::StPolygonWkt: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		const auto P = DS::Geometry2D::ParseWktPolygon(Cells[0]);
+		return P ? std::optional<std::string>(DS::Geometry2D::FormatPolygonCell(*P)) : std::nullopt;
+	}
+	case ScalarSqlFn::StGeomAsText: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		const auto P = ParseGeomPoly(Cells[0]);
+		return P ? std::optional<std::string>(DS::Geometry2D::FormatWktPolygon(*P)) : std::nullopt;
+	}
+	case ScalarSqlFn::StGeomArea: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		const auto P = ParseGeomPoly(Cells[0]);
+		return P ? std::optional<std::string>(FmtNum(DS::Geometry2D::PolygonArea(*P))) : std::nullopt;
+	}
+	case ScalarSqlFn::StGeomPerimeter: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		const auto P = ParseGeomPoly(Cells[0]);
+		return P ? std::optional<std::string>(FmtNum(DS::Geometry2D::PolygonPerimeter(*P))) : std::nullopt;
+	}
+	case ScalarSqlFn::StGeomCentroid: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		const auto P = ParseGeomPoly(Cells[0]);
+		if(!P)
+			return std::nullopt;
+		const auto C = DS::Geometry2D::PolygonCentroid(*P);
+		return GeoSpatial::FormatPointCell(C.X, C.Y);
+	}
+	case ScalarSqlFn::StGeomContains: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		const auto Outer = ParseGeomPoly(Cells[0]);
+		if(!Outer)
+			return std::nullopt;
+		if(const auto Pt = ParseGeomPoint(Cells[1]))
+			return DS::Geometry2D::PointInPolygon(*Pt, *Outer) ? "1" : "0";
+		if(const auto Inner = ParseGeomPoly(Cells[1]))
+			return DS::Geometry2D::PolygonContains(*Outer, *Inner) ? "1" : "0";
+		return std::nullopt;
+	}
+	case ScalarSqlFn::StGeomWithin: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		const auto Inner = ParseGeomPoly(Cells[0]);
+		const auto Outer = ParseGeomPoly(Cells[1]);
+		if(!Inner || !Outer)
+			return std::nullopt;
+		return DS::Geometry2D::PolygonWithin(*Inner, *Outer) ? "1" : "0";
+	}
+	case ScalarSqlFn::StGeomIntersects: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		const auto A = ParseGeomPoly(Cells[0]);
+		const auto B = ParseGeomPoly(Cells[1]);
+		return (A && B && DS::Geometry2D::PolygonsIntersect(*A, *B)) ? "1" : "0";
+	}
+	case ScalarSqlFn::StGeomOverlaps: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		const auto A = ParseGeomPoly(Cells[0]);
+		const auto B = ParseGeomPoly(Cells[1]);
+		return (A && B && DS::Geometry2D::PolygonsOverlap(*A, *B)) ? "1" : "0";
+	}
+	case ScalarSqlFn::StGeomTouches: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		const auto A = ParseGeomPoly(Cells[0]);
+		const auto B = ParseGeomPoly(Cells[1]);
+		return (A && B && DS::Geometry2D::PolygonsTouch(*A, *B)) ? "1" : "0";
+	}
+	case ScalarSqlFn::StGeomUnion: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		const auto A = ParseGeomPoly(Cells[0]);
+		const auto B = ParseGeomPoly(Cells[1]);
+		if(!A || !B)
+			return std::nullopt;
+		return DS::Geometry2D::FormatPolygonCell(DS::Geometry2D::Union(*A, *B));
+	}
+	case ScalarSqlFn::StGeomIntersection: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		const auto A = ParseGeomPoly(Cells[0]);
+		const auto B = ParseGeomPoly(Cells[1]);
+		if(!A || !B)
+			return std::nullopt;
+		return DS::Geometry2D::FormatPolygonCell(DS::Geometry2D::Intersection(*A, *B));
+	}
+	case ScalarSqlFn::StGeomDifference: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		const auto A = ParseGeomPoly(Cells[0]);
+		const auto B = ParseGeomPoly(Cells[1]);
+		if(!A || !B)
+			return std::nullopt;
+		return DS::Geometry2D::FormatPolygonCell(DS::Geometry2D::Difference(*A, *B));
+	}
+	case ScalarSqlFn::StGeomSymDifference: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		const auto A = ParseGeomPoly(Cells[0]);
+		const auto B = ParseGeomPoly(Cells[1]);
+		if(!A || !B)
+			return std::nullopt;
+		return DS::Geometry2D::FormatPolygonCell(DS::Geometry2D::SymDifference(*A, *B));
+	}
+	case ScalarSqlFn::StGeomBuffer: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		const auto P = ParseGeomPoly(Cells[0]);
+		const auto Dist = ToNum(Cells[1]);
+		if(!P || !Dist)
+			return std::nullopt;
+		return DS::Geometry2D::FormatPolygonCell(DS::Geometry2D::Buffer(*P, *Dist));
+	}
+	case ScalarSqlFn::StGeomSimplify: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		const auto P = ParseGeomPoly(Cells[0]);
+		const auto Tol = ToNum(Cells[1]);
+		if(!P || !Tol)
+			return std::nullopt;
+		return DS::Geometry2D::FormatPolygonCell(DS::Geometry2D::Simplify(*P, *Tol));
+	}
+	case ScalarSqlFn::StGeomConvexHull: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		const auto P = ParseGeomPoly(Cells[0]);
+		if(P)
+			return DS::Geometry2D::FormatPolygonCell(DS::Geometry2D::ConvexHull(*P));
+		if(const auto Pt = ParseGeomPoint(Cells[0]))
+			return DS::Geometry2D::FormatPolygonCell(
+			    DS::Geometry2D::ConvexHullPoints({*Pt}));
+		if(const auto Seq = ParseSeq(Cells[0])) {
+			std::vector<DS::Geometry2D::Vec2> Pts;
+			for(size_t I = 0; I + 1 < Seq->size(); I += 2)
+				Pts.push_back({(*Seq)[I], (*Seq)[I + 1]});
+			return DS::Geometry2D::FormatPolygonCell(DS::Geometry2D::ConvexHullPoints(Pts));
+		}
+		return std::nullopt;
+	}
+	case ScalarSqlFn::StGeojsonImport: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		const auto P = DS::Geometry2D::ImportGeoJsonPolygon(Cells[0]);
+		return P ? std::optional<std::string>(DS::Geometry2D::FormatPolygonCell(*P)) : std::nullopt;
+	}
+	case ScalarSqlFn::StGeojsonExport: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		const auto P = ParseGeomPoly(Cells[0]);
+		return P ? std::optional<std::string>(DS::Geometry2D::ExportGeoJsonPolygon(*P)) : std::nullopt;
+	}
+	case ScalarSqlFn::StGeomValidate: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		const auto P = ParseGeomPoly(Cells[0]);
+		if(!P)
+			return "0";
+		return DS::Geometry2D::ValidatePolygon(*P).Ok ? "1" : "0";
+	}
+	case ScalarSqlFn::StGeomRepair: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		if(const auto P = ParseGeomPoly(Cells[0]))
+			return DS::Geometry2D::FormatPolygonCell(DS::Geometry2D::RepairPolygon(*P));
+		return std::nullopt;
+	}
+	case ScalarSqlFn::StMeshValidate: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		const auto M = DS::glTF::ParseMeshCell(Cells[0]);
+		if(!M) {
+			if(const auto Raw = DS::glTF::ImportMeshFromGltfJson(Cells[0]))
+				return DS::glTF::ValidateMesh(*Raw).Ok ? "1" : "0";
+			return "0";
+		}
+		return DS::glTF::ValidateMesh(*M).Ok ? "1" : "0";
+	}
+	case ScalarSqlFn::StMeshRepair: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		if(const auto M = DS::glTF::ParseMeshCell(Cells[0]))
+			return DS::glTF::FormatMeshCell(DS::glTF::RepairMesh(*M));
+		if(const auto M = DS::glTF::ImportMeshFromGltfJson(Cells[0]))
+			return DS::glTF::FormatMeshCell(DS::glTF::RepairMesh(*M));
+		return std::nullopt;
+	}
 	case ScalarSqlFn::TsCompress: {
 		if(Cells.size() != 1)
 			return std::nullopt;
@@ -1686,6 +2150,341 @@ std::optional<std::string> EvalScalar(ScalarSqlFn Fn, const std::vector<std::str
 		const std::string Out = TimeSeriesCompression::CompressSeries(*E, *V);
 		return Out.empty() ? std::nullopt : std::optional<std::string>(Out);
 	}
+	case ScalarSqlFn::OdeTrapezoid: {
+		if(Cells.size() != 4)
+			return std::nullopt;
+		const auto Y = ParseSeq(Cells[0]);
+		const auto K0 = ParseSeq(Cells[1]);
+		const auto K1 = ParseSeq(Cells[2]);
+		const auto Dt = ToNum(Cells[3]);
+		if(!Y || !K0 || !K1 || !Dt || Y->empty())
+			return std::nullopt;
+		return FormatSeqList(MathSciSolves::OdeTrapezoidFromReal(*Y, *Dt, *K0, *K1));
+	}
+	case ScalarSqlFn::OdeSemiImplicit: {
+		if(Cells.size() != 4)
+			return std::nullopt;
+		const auto Y = ParseSeq(Cells[0]);
+		const auto K1 = ParseSeq(Cells[1]);
+		const auto K2 = ParseSeq(Cells[2]);
+		const auto Dt = ToNum(Cells[3]);
+		if(!Y || !K1 || !K2 || !Dt || Y->empty())
+			return std::nullopt;
+		return FormatSeqList(MathSciSolves::OdeSemiImplicitFromReal(*Y, *Dt, *K1, *K2));
+	}
+	case ScalarSqlFn::OdeCrankNicolson: {
+		if(Cells.size() != 4)
+			return std::nullopt;
+		const auto Y = ParseSeq(Cells[0]);
+		const auto Lam = ParseSeq(Cells[1]);
+		const auto K = ParseSeq(Cells[2]);
+		const auto Dt = ToNum(Cells[3]);
+		if(!Y || !Lam || !K || !Dt || Y->empty())
+			return std::nullopt;
+		return FormatSeqList(MathSciSolves::OdeCrankNicolsonFromReal(*Y, *Dt, *Lam, *K));
+	}
+	case ScalarSqlFn::OdeRk3: {
+		if(Cells.size() != 5)
+			return std::nullopt;
+		const auto Y = ParseSeq(Cells[0]);
+		const auto K1 = ParseSeq(Cells[1]);
+		const auto K2 = ParseSeq(Cells[2]);
+		const auto K3 = ParseSeq(Cells[3]);
+		const auto Dt = ToNum(Cells[4]);
+		if(!Y || !K1 || !K2 || !K3 || !Dt || Y->empty())
+			return std::nullopt;
+		return FormatSeqList(MathSciSolves::OdeRk3FromReal(*Y, *Dt, *K1, *K2, *K3));
+	}
+	case ScalarSqlFn::OdeAdamsBashforth2: {
+		if(Cells.size() != 4)
+			return std::nullopt;
+		const auto Y = ParseSeq(Cells[0]);
+		const auto Kc = ParseSeq(Cells[1]);
+		const auto Kp = ParseSeq(Cells[2]);
+		const auto Dt = ToNum(Cells[3]);
+		if(!Y || !Kc || !Kp || !Dt || Y->empty())
+			return std::nullopt;
+		return FormatSeqList(MathSciSolves::OdeAdamsBashforth2FromReal(*Y, *Dt, *Kc, *Kp));
+	}
+	case ScalarSqlFn::OdeMarch: {
+		if(Cells.size() != 8)
+			return std::nullopt;
+		const std::string Method = Cells[0];
+		const auto Y = ParseSeq(Cells[1]);
+		const auto A = ParseSeq(Cells[2]);
+		const auto B = ParseSeq(Cells[3]);
+		const auto C = ParseSeq(Cells[4]);
+		const auto D = ParseSeq(Cells[5]);
+		const auto Dt = ToNum(Cells[6]);
+		const auto Steps = ToNum(Cells[7]);
+		if(!Y || !A || !B || !C || !D || !Dt || !Steps || Y->empty() || *Steps < 0)
+			return std::nullopt;
+		return FormatSeqList(MathSciSolves::OdeMarchFromReal(Method, *Y, *Dt, *A, *B, *C, *D,
+		                                                   static_cast<size_t>(*Steps)));
+	}
+	case ScalarSqlFn::SdeMarch: {
+		if(Cells.size() != 6)
+			return std::nullopt;
+		const auto Y = ParseSeq(Cells[0]);
+		const auto Dr = ParseSeq(Cells[1]);
+		const auto Di = ParseSeq(Cells[2]);
+		const auto Z = ParseSeq(Cells[3]);
+		const auto Dt = ToNum(Cells[4]);
+		const auto Steps = ToNum(Cells[5]);
+		if(!Y || !Dr || !Di || !Z || !Dt || !Steps || Y->empty() || *Steps < 0)
+			return std::nullopt;
+		return FormatSeqList(
+		    MathSciSolves::SdeMarchFromReal(*Y, *Dt, *Dr, *Di, *Z, static_cast<size_t>(*Steps)));
+	}
+	case ScalarSqlFn::LinearJacobiStep: {
+		if(Cells.size() != 3)
+			return std::nullopt;
+		const auto X = ParseSeq(Cells[1]);
+		const auto B = ParseSeq(Cells[2]);
+		if(!X || !B || X->empty())
+			return std::nullopt;
+		return FormatSeqList(MathSciSolves::LinearJacobiStepFromMat(Cells[0], *X, *B));
+	}
+	case ScalarSqlFn::LinearGaussSeidelStep: {
+		if(Cells.size() != 3)
+			return std::nullopt;
+		const auto X = ParseSeq(Cells[1]);
+		const auto B = ParseSeq(Cells[2]);
+		if(!X || !B || X->empty())
+			return std::nullopt;
+		return FormatSeqList(MathSciSolves::LinearGaussSeidelStepFromMat(Cells[0], *X, *B));
+	}
+	case ScalarSqlFn::LinearSorStep: {
+		if(Cells.size() != 4)
+			return std::nullopt;
+		const auto X = ParseSeq(Cells[1]);
+		const auto B = ParseSeq(Cells[2]);
+		const auto Omega = ToNum(Cells[3]);
+		if(!X || !B || !Omega || X->empty())
+			return std::nullopt;
+		return FormatSeqList(MathSciSolves::LinearSorStepFromMat(Cells[0], *X, *B, *Omega));
+	}
+	case ScalarSqlFn::LinearRichardsonStep: {
+		if(Cells.size() != 4)
+			return std::nullopt;
+		const auto X = ParseSeq(Cells[1]);
+		const auto B = ParseSeq(Cells[2]);
+		const auto Alpha = ToNum(Cells[3]);
+		if(!X || !B || !Alpha || X->empty())
+			return std::nullopt;
+		return FormatSeqList(MathSciSolves::LinearRichardsonStepFromMat(Cells[0], *X, *B, *Alpha));
+	}
+	case ScalarSqlFn::LinearCgSolve: {
+		if(Cells.size() != 5)
+			return std::nullopt;
+		const auto X0 = ParseSeq(Cells[1]);
+		const auto B = ParseSeq(Cells[2]);
+		const auto MaxIt = ToNum(Cells[3]);
+		const auto Tol = ToNum(Cells[4]);
+		if(!X0 || !B || !MaxIt || !Tol || X0->empty() || *MaxIt < 0)
+			return std::nullopt;
+		return FormatSeqList(MathSciSolves::LinearCgSolveFromMat(Cells[0], *X0, *B, static_cast<size_t>(*MaxIt), *Tol));
+	}
+	case ScalarSqlFn::SolveLinear: {
+		if(Cells.size() != 7)
+			return std::nullopt;
+		const std::string Method = Cells[0];
+		const auto X = ParseSeq(Cells[2]);
+		const auto B = ParseSeq(Cells[3]);
+		const auto MaxIt = ToNum(Cells[4]);
+		const auto Tol = ToNum(Cells[5]);
+		const auto Param = ToNum(Cells[6]);
+		if(!X || !B || !MaxIt || !Tol || !Param || X->empty() || *MaxIt < 0)
+			return std::nullopt;
+		return FormatSeqList(MathSciSolves::LinearSolveFromReal(Method, Cells[1], *X, *B,
+		                                                      static_cast<size_t>(*MaxIt), *Tol, *Param));
+	}
+	case ScalarSqlFn::PdePoissonGsStep: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		const auto U = ParseSeq(Cells[0]);
+		const auto F = ParseSeq(Cells[1]);
+		if(!U || !F || U->empty())
+			return std::nullopt;
+		return FormatSeqList(MathSciSolves::PdePoissonGsStepFromReal(*U, *F));
+	}
+	case ScalarSqlFn::PdePoissonSorStep: {
+		if(Cells.size() != 3)
+			return std::nullopt;
+		const auto U = ParseSeq(Cells[0]);
+		const auto F = ParseSeq(Cells[1]);
+		const auto Omega = ToNum(Cells[2]);
+		if(!U || !F || !Omega || U->empty())
+			return std::nullopt;
+		return FormatSeqList(MathSciSolves::PdePoissonSorStepFromReal(*U, *F, *Omega));
+	}
+	case ScalarSqlFn::PdePoissonSolve: {
+		if(Cells.size() != 5)
+			return std::nullopt;
+		const auto U = ParseSeq(Cells[0]);
+		const auto F = ParseSeq(Cells[1]);
+		const auto Omega = ToNum(Cells[2]);
+		const auto MaxIt = ToNum(Cells[3]);
+		const auto Tol = ToNum(Cells[4]);
+		if(!U || !F || !Omega || !MaxIt || !Tol || U->empty() || *MaxIt < 0)
+			return std::nullopt;
+		return FormatSeqList(MathSciSolves::PdePoissonSolveFromReal(*U, *F, *Omega, static_cast<size_t>(*MaxIt), *Tol,
+		                                                            "JACOBI"));
+	}
+	case ScalarSqlFn::PdeHeatMarch: {
+		if(Cells.size() != 5)
+			return std::nullopt;
+		const auto U = ParseSeq(Cells[0]);
+		const auto Alpha = ToNum(Cells[1]);
+		const auto Dt = ToNum(Cells[2]);
+		const auto Dx = ToNum(Cells[3]);
+		const auto Steps = ToNum(Cells[4]);
+		if(!U || !Alpha || !Dt || !Dx || !Steps || U->empty() || *Steps < 0)
+			return std::nullopt;
+		return FormatSeqList(
+		    MathSciSolves::PdeHeatMarchFromReal(*U, *Alpha, *Dt, *Dx, static_cast<size_t>(*Steps)));
+	}
+	case ScalarSqlFn::SolvePde: {
+		if(Cells.size() != 9)
+			return std::nullopt;
+		const std::string Method = Cells[0];
+		const auto U = ParseSeq(Cells[1]);
+		const auto F = ParseSeq(Cells[2]);
+		const auto Omega = ToNum(Cells[3]);
+		const auto MaxIt = ToNum(Cells[4]);
+		const auto Tol = ToNum(Cells[5]);
+		const auto Alpha = ToNum(Cells[6]);
+		const auto Dt = ToNum(Cells[7]);
+		const auto Dx = ToNum(Cells[8]);
+		if(!U || !F || !Omega || !MaxIt || !Tol || !Alpha || !Dt || !Dx || U->empty() || *MaxIt < 0)
+			return std::nullopt;
+		return FormatSeqList(MathSciSolves::PdeSolveFromReal(Method, *U, *F, *Omega, static_cast<size_t>(*MaxIt), *Tol,
+		                                                   *Alpha, *Dt, *Dx, static_cast<size_t>(*MaxIt)));
+	}
+	case ScalarSqlFn::RootNewtonStep: {
+		if(Cells.size() != 3)
+			return std::nullopt;
+		const auto X = ToNum(Cells[0]);
+		const auto Fx = ToNum(Cells[1]);
+		const auto Dfx = ToNum(Cells[2]);
+		if(!X || !Fx || !Dfx)
+			return std::nullopt;
+		return FmtNum(MathSciSolves::RootNewtonStepFromReal(*X, *Fx, *Dfx));
+	}
+	case ScalarSqlFn::RootSecantStep: {
+		if(Cells.size() != 4)
+			return std::nullopt;
+		const auto X0 = ToNum(Cells[0]);
+		const auto X1 = ToNum(Cells[1]);
+		const auto F0 = ToNum(Cells[2]);
+		const auto F1 = ToNum(Cells[3]);
+		if(!X0 || !X1 || !F0 || !F1)
+			return std::nullopt;
+		return FmtNum(MathSciSolves::RootSecantStepFromReal(*X0, *X1, *F0, *F1));
+	}
+	case ScalarSqlFn::RootBisectStep: {
+		if(Cells.size() != 4)
+			return std::nullopt;
+		const auto Lo = ToNum(Cells[0]);
+		const auto Hi = ToNum(Cells[1]);
+		const auto Flo = ToNum(Cells[2]);
+		const auto Fhi = ToNum(Cells[3]);
+		if(!Lo || !Hi || !Flo || !Fhi)
+			return std::nullopt;
+		return FmtNum(MathSciSolves::RootBisectStepFromReal(*Lo, *Hi, *Flo, *Fhi));
+	}
+	case ScalarSqlFn::RootHalleyStep: {
+		if(Cells.size() != 4)
+			return std::nullopt;
+		const auto X = ToNum(Cells[0]);
+		const auto Fx = ToNum(Cells[1]);
+		const auto Dfx = ToNum(Cells[2]);
+		const auto D2fx = ToNum(Cells[3]);
+		if(!X || !Fx || !Dfx || !D2fx)
+			return std::nullopt;
+		return FmtNum(MathSciSolves::RootHalleyStepFromReal(*X, *Fx, *Dfx, *D2fx));
+	}
+	case ScalarSqlFn::SolveRoot: {
+		if(Cells.size() != 5)
+			return std::nullopt;
+		const std::string Method = Cells[0];
+		const auto A = ToNum(Cells[1]);
+		const auto B = ToNum(Cells[2]);
+		const auto C = ToNum(Cells[3]);
+		const auto D = ToNum(Cells[4]);
+		if(!A || !B || !C || !D)
+			return std::nullopt;
+		return FmtNum(MathSciSolves::RootSolveStepFromReal(Method, *A, *B, *C, *D));
+	}
+	case ScalarSqlFn::ClassifyLinear: {
+		if(Cells.size() != 3)
+			return std::nullopt;
+		const auto W = ParseSeq(Cells[0]);
+		const auto X = ParseSeq(Cells[1]);
+		const auto B = ToNum(Cells[2]);
+		if(!W || !X || !B)
+			return std::nullopt;
+		return MathSciClassify::LinearLabelFromReal(*W, *X, *B);
+	}
+	case ScalarSqlFn::ClassifyLogistic: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		const auto W = ParseSeq(Cells[0]);
+		const auto X = ParseSeq(Cells[1]);
+		if(!W || !X)
+			return std::nullopt;
+		return MathSciClassify::LogisticProbFromReal(*W, *X);
+	}
+	case ScalarSqlFn::ClassifyArgmax: {
+		if(Cells.size() != 1)
+			return std::nullopt;
+		const auto V = ParseSeq(Cells[0]);
+		if(!V || V->empty())
+			return std::nullopt;
+		return MathSciClassify::ArgmaxFromReal(*V);
+	}
+	case ScalarSqlFn::ClassifyOneVsRest: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		const auto X = ParseSeq(Cells[0]);
+		const auto L = AdvancedTypes::ParseListCell(Cells[1]);
+		if(!X || !L || L->empty())
+			return std::nullopt;
+		std::vector<std::vector<double>> WeightRows;
+		WeightRows.reserve(L->size());
+		for(const auto &Cell : *L) {
+			const auto Row = ParseSeq(Cell);
+			if(!Row)
+				return std::nullopt;
+			WeightRows.push_back(*Row);
+		}
+		return MathSciClassify::OneVsRestFromReal(*X, WeightRows);
+	}
+	case ScalarSqlFn::NlpTokenize:
+		return Cells.size() == 1 ? MathSciNlp::TokenizeCellFromReal(Cells[0]) : std::nullopt;
+	case ScalarSqlFn::NlpNgrams:
+		return Cells.size() == 2 && ToNum(Cells[1]) ? MathSciNlp::NgramsCellFromReal(Cells[0], *ToNum(Cells[1]))
+		                                            : std::nullopt;
+	case ScalarSqlFn::NlpJaccard:
+		return Cells.size() == 2 ? MathSciNlp::JaccardFromReal(Cells[0], Cells[1]) : std::nullopt;
+	case ScalarSqlFn::NlpEditDist:
+		return Cells.size() == 2 ? MathSciNlp::EditDistFromReal(Cells[0], Cells[1]) : std::nullopt;
+	case ScalarSqlFn::NlpStem:
+		return Cells.size() == 1 ? MathSciNlp::StemCellFromReal(Cells[0]) : std::nullopt;
+	case ScalarSqlFn::NlpEmbedBuild:
+		return Cells.size() == 2 ? MathSciEmbeddings::BuildCellFromReal(Cells[0], Cells[1]) : std::nullopt;
+	case ScalarSqlFn::NlpEmbedLookup:
+		return Cells.size() == 2 ? MathSciEmbeddings::LookupCellFromReal(Cells[0], Cells[1], Db) : std::nullopt;
+	case ScalarSqlFn::NlpEmbedBatch:
+		return Cells.size() == 2 ? MathSciEmbeddings::BatchCellFromReal(Cells[0], Cells[1], Db) : std::nullopt;
+	case ScalarSqlFn::NlpEmbedSerialize:
+		return Cells.size() == 1 ? MathSciEmbeddings::SerializeCellFromReal(Cells[0]) : std::nullopt;
+	case ScalarSqlFn::NlpEmbedLoad:
+		return Cells.size() == 1 ? MathSciEmbeddings::LoadCellFromReal(Cells[0]) : std::nullopt;
+	case ScalarSqlFn::NlpEmbedFingerprint:
+		return Cells.size() == 1 ? MathSciEmbeddings::FingerprintCellFromReal(Cells[0]) : std::nullopt;
+	case ScalarSqlFn::NlpEmbedMean:
+		return Cells.size() == 2 ? MathSciEmbeddings::MeanCellFromReal(Cells[0], Cells[1], Db) : std::nullopt;
 	default:
 		return std::nullopt;
 	}

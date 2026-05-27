@@ -13,18 +13,18 @@
 | **Release `astraldb.exe`** | **~1.5 MB** (Windows Release; CMake target `astraldb` ~2.0 MB) |
 | **Core sources** | ~27k lines across ~85 source files |
 | **Contract tests** | **103+** doctest cases |
-| **Example SQL harness** | **31+** `examples/*.sql` scripts (parse → compile → run in CI) |
+| **Example SQL harness** | **35+** `examples/*.sql` scripts (parse → compile → run in CI) |
 
 No server process, no JVM, no opaque planner DLLs. One CLI, one database file (or ephemeral `-m` session). Inside that footprint is:
 
 - **SQL-92/99/2003 analytics:** joins, OLAP (`ROLLUP`/`CUBE`/`GROUPING SETS`), CTEs (`WITH RECURSIVE`), windows, `EXISTS`, `MERGE`/upsert, transactions
 - **Advanced types:** `STRUCT`, `MAP`, `VECTOR`, `MATRIX`, `COMPLEX`, `LIST`, **`POINT`**, **`VARIANT`**, **`TERRAIN`**
-- **Geospatial:** `ST_POINT`, `ST_POINTZ`, `ST_ELEVATION`, `ST_DEM_SAMPLE`, `ST_TERRAIN_SLOPE`, distances, WKT interop
+- **Geospatial:** 2D `POINT`/`POLYGON`, 3D `MESH` (glTF, CSG), terrain DEM — see [`docs/Geospatial.md`](docs/Geospatial.md)
 - **Maintenance:** `VACUUM` / `VACUUM TABLE`, `REPACK TABLE … CONCURRENTLY`
 - **Time series:** `TIME_BUCKET`, `DATE_TRUNC`, **`TS_COMPRESS` / `TS_DECOMPRESS`** delta codecs
-- **MathSci:** SIMD signal/FFT, autograd, **configurable ODE/SDE/PDE solvers** (`SOLVE_ODE`, Heun, implicit Euler, Milstein, advection, wave)!
+- **MathSci:** SIMD signal/FFT, autograd, **ODE/SDE/PDE solvers**, **classifiers**, **NLP**, **embeddings**, **tiny LM training**, and **PINN demos** in SQL — see [`docs/MathSciLmTrain.md`](docs/MathSciLmTrain.md), [`docs/MathSciPinn.md`](docs/MathSciPinn.md)
 - **Datasets:** `CREATE DATASET … AS TABLE|BULK`, versioned snapshots, `LOAD DATASET … VERSION n INTO`
-- **Bytecode tooling:** `.abc` compile/inspect/debug, stored procedures
+- **Bytecode tooling:** `.abc` compile/inspect/debug, **stored procedures**, **triggers**
 - **Durability & security:** encrypted WAL, RBAC, row/column grants, hybrid row/columnar storage, FTS & vector indexes
 
 See [`docs/Overview.md`](docs/Overview.md) for the full contract.
@@ -94,6 +94,7 @@ Native **`INSERT_BULK`** (one VM opcode, one storage pass) powers CI and off-CI 
 | [`torture_test.sql`](examples/torture_test.sql) | 6k bulk + DML/WAL | **15.5 ms** |
 | [`torture_advanced.sql`](examples/torture_advanced.sql) | geo + MathSci + datasets | **16.8 ms** |
 | [`torture_unhinged.sql`](examples/torture_unhinged.sql) | 16k bulk + `VACUUM` / `REPACK` | **15.6 ms** |
+| [`torture_omnibus.sql`](examples/torture_omnibus.sql) | SQL + GQL + geo + MathSci + procs/triggers | (perf tier) |
 | [`stress_traffic.sql`](examples/stress_traffic.sql) | 16k rows, multi-commit | **21.1 ms** |
 | [`benchmark_torture.sql`](examples/benchmark_torture.sql) | joins + aggregates | **17.9 ms** |
 | [`stress_bulk_load.sql`](examples/benchmarks/stress_bulk_load.sql) | **150k** bulk | **17.5 ms** |
