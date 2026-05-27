@@ -20,14 +20,26 @@ KernelConfig DefaultKernelConfig() {
 }
 
 size_t ParseEnvSizeT(const char *Name, size_t Fallback) {
-	const char *Raw = std::getenv(Name);
-	if(!Raw || !*Raw)
+	auto ParseDigits = [Fallback](const char *Raw) -> size_t {
+		if(!Raw || !*Raw)
+			return Fallback;
+		char *End = nullptr;
+		const unsigned long long Parsed = std::strtoull(Raw, &End, 10);
+		if(End == Raw)
+			return Fallback;
+		return static_cast<size_t>(Parsed);
+	};
+#if defined(_MSC_VER)
+	char *Buf = nullptr;
+	size_t Len = 0;
+	if(_dupenv_s(&Buf, &Len, Name) != 0 || !Buf)
 		return Fallback;
-	char *End = nullptr;
-	const unsigned long long Parsed = std::strtoull(Raw, &End, 10);
-	if(End == Raw)
-		return Fallback;
-	return static_cast<size_t>(Parsed);
+	const size_t Out = ParseDigits(Buf);
+	free(Buf);
+	return Out;
+#else
+	return ParseDigits(std::getenv(Name));
+#endif
 }
 
 #if defined(__AVX2__)

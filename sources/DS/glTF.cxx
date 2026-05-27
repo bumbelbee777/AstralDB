@@ -73,6 +73,7 @@ bool BboxContains(const MeshBounds &Outer, const MeshBounds &Inner) {
 }
 
 void TriVertex(const Mesh &M, std::uint32_t Idx, double &X, double &Y, double &Z) {
+	X = Y = Z = 0.0;
 	const size_t B = static_cast<size_t>(Idx) * 3;
 	if(B + 2 < M.Vertices.size()) {
 		X = M.Vertices[B];
@@ -120,7 +121,7 @@ bool RayTriHit(const double Ox, const double Oy, const double Oz, const double D
 int RayHits(const Mesh &M, double Px, double Py, double Pz, double Dx, double Dy, double Dz) {
 	int Hits = 0;
 	for(size_t I = 0; I + 2 < M.Indices.size(); I += 3) {
-		double X0, Y0, Z0, X1, Y1, Z1, X2, Y2, Z2;
+		double X0 = 0.0, Y0 = 0.0, Z0 = 0.0, X1 = 0.0, Y1 = 0.0, Z1 = 0.0, X2 = 0.0, Y2 = 0.0, Z2 = 0.0;
 		TriVertex(M, M.Indices[I], X0, Y0, Z0);
 		TriVertex(M, M.Indices[I + 1], X1, Y1, Z1);
 		TriVertex(M, M.Indices[I + 2], X2, Y2, Z2);
@@ -151,7 +152,7 @@ double WindingNumber(const Mesh &M, double Px, double Py, double Pz) {
 		return 0.0;
 	double W = 0.0;
 	for(size_t I = 0; I + 2 < M.Indices.size(); I += 3) {
-		double X0, Y0, Z0, X1, Y1, Z1, X2, Y2, Z2;
+		double X0 = 0.0, Y0 = 0.0, Z0 = 0.0, X1 = 0.0, Y1 = 0.0, Z1 = 0.0, X2 = 0.0, Y2 = 0.0, Z2 = 0.0;
 		TriVertex(M, M.Indices[I], X0, Y0, Z0);
 		TriVertex(M, M.Indices[I + 1], X1, Y1, Z1);
 		TriVertex(M, M.Indices[I + 2], X2, Y2, Z2);
@@ -196,7 +197,7 @@ TriInside ClassifyTriangle(const Mesh &Ref, double X0, double Y0, double Z0, dou
 Mesh FilterTrianglesByInside(const Mesh &Src, const Mesh &Ref, bool KeepInside) {
 	Mesh Out;
 	for(size_t I = 0; I + 2 < Src.Indices.size(); I += 3) {
-		double X0, Y0, Z0, X1, Y1, Z1, X2, Y2, Z2;
+		double X0 = 0.0, Y0 = 0.0, Z0 = 0.0, X1 = 0.0, Y1 = 0.0, Z1 = 0.0, X2 = 0.0, Y2 = 0.0, Z2 = 0.0;
 		TriVertex(Src, Src.Indices[I], X0, Y0, Z0);
 		TriVertex(Src, Src.Indices[I + 1], X1, Y1, Z1);
 		TriVertex(Src, Src.Indices[I + 2], X2, Y2, Z2);
@@ -298,7 +299,7 @@ Mesh RemoveDegenerateTriangles(const Mesh &M) {
 	if(!MeshShapeValid(M) || !IndicesInRange(M))
 		return Out;
 	for(size_t I = 0; I + 2 < M.Indices.size(); I += 3) {
-		double X0, Y0, Z0, X1, Y1, Z1, X2, Y2, Z2;
+		double X0 = 0.0, Y0 = 0.0, Z0 = 0.0, X1 = 0.0, Y1 = 0.0, Z1 = 0.0, X2 = 0.0, Y2 = 0.0, Z2 = 0.0;
 		TriVertex(M, M.Indices[I], X0, Y0, Z0);
 		TriVertex(M, M.Indices[I + 1], X1, Y1, Z1);
 		TriVertex(M, M.Indices[I + 2], X2, Y2, Z2);
@@ -462,7 +463,7 @@ double SurfaceArea(const Mesh &M) {
 		return 0.0;
 	double A = 0.0;
 	for(size_t I = 0; I + 2 < M.Indices.size(); I += 3) {
-		double X0, Y0, Z0, X1, Y1, Z1, X2, Y2, Z2;
+		double X0 = 0.0, Y0 = 0.0, Z0 = 0.0, X1 = 0.0, Y1 = 0.0, Z1 = 0.0, X2 = 0.0, Y2 = 0.0, Z2 = 0.0;
 		TriVertex(M, M.Indices[I], X0, Y0, Z0);
 		TriVertex(M, M.Indices[I + 1], X1, Y1, Z1);
 		TriVertex(M, M.Indices[I + 2], X2, Y2, Z2);
@@ -476,7 +477,7 @@ double Volume(const Mesh &M) {
 		return 0.0;
 	double Vol = 0.0;
 	for(size_t I = 0; I + 2 < M.Indices.size(); I += 3) {
-		double X0, Y0, Z0, X1, Y1, Z1, X2, Y2, Z2;
+		double X0 = 0.0, Y0 = 0.0, Z0 = 0.0, X1 = 0.0, Y1 = 0.0, Z1 = 0.0, X2 = 0.0, Y2 = 0.0, Z2 = 0.0;
 		TriVertex(M, M.Indices[I], X0, Y0, Z0);
 		TriVertex(M, M.Indices[I + 1], X1, Y1, Z1);
 		TriVertex(M, M.Indices[I + 2], X2, Y2, Z2);
@@ -491,7 +492,7 @@ void Centroid(const Mesh &M, double &OutX, double &OutY, double &OutZ) {
 		return;
 	double Total = 0.0;
 	for(size_t I = 0; I + 2 < M.Indices.size(); I += 3) {
-		double X0, Y0, Z0, X1, Y1, Z1, X2, Y2, Z2;
+		double X0 = 0.0, Y0 = 0.0, Z0 = 0.0, X1 = 0.0, Y1 = 0.0, Z1 = 0.0, X2 = 0.0, Y2 = 0.0, Z2 = 0.0;
 		TriVertex(M, M.Indices[I], X0, Y0, Z0);
 		TriVertex(M, M.Indices[I + 1], X1, Y1, Z1);
 		TriVertex(M, M.Indices[I + 2], X2, Y2, Z2);
