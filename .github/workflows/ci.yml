@@ -117,7 +117,7 @@ jobs:
         run: |
           set -euo pipefail
           CLI="${{ matrix.cli }}"
-          sha256sum "$CLI" | awk -v f="$(basename "$CLI")" '{print $1 "  " f}' > "${CLI}.sha256"
+          bash .github/scripts/sha256-file.sh "$CLI" > "${CLI}.sha256"
           cat "${CLI}.sha256"
 
       - name: Upload astraldb binary
