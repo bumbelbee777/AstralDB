@@ -1,7 +1,7 @@
 project: AstralDB
 authors: ["bumblebee777"]
 license: MIT
-version: 1.0
+version: 2.0
 language: cpp
 standard: c++23
 compiler: clang++

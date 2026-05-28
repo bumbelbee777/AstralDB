@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(AstralDB VERSION 1.0 LANGUAGES CXX)
+project(AstralDB VERSION 2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,6 +20,9 @@ add_library(astraldb_core STATIC
     sources/Database/MathSciClassify.cxx
     sources/Database/MathSciNlp.cxx
     sources/Database/MathSciEmbeddings.cxx
+    sources/Database/MathSciModel.cxx
+    sources/Database/MathSciInference.cxx
+    sources/Database/MathSciFokkerPlanck.cxx
     sources/Database/MathSciComplex.cxx
     sources/Database/ColumnarStorage.cxx
     sources/Database/HybridStorageScheduler.cxx
@@ -85,7 +88,7 @@ endif()
 astraldb_apply_target_options(astraldb_core)
 
 add_library(astraldb_c STATIC
-    sources/API/astraldb_c.cxx
+    sources/API/AstralDbC.cxx
 )
 target_link_libraries(astraldb_c PUBLIC astraldb_core)
 target_include_directories(astraldb_c
@@ -125,7 +128,7 @@ install(TARGETS astraldb_core astraldb_c astraldb astraldb_tests
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION bin
 )
-install(FILES include/astraldb/astraldb.h DESTINATION include/astraldb)
+install(FILES include/astraldb/AstralDB.h DESTINATION include/astraldb)
 
 install(EXPORT AstralDBTargets
     FILE AstralDBTargets.cmake

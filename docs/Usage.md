@@ -1,6 +1,6 @@
 # AstralDB CLI usage
 
-Product release **v1.0**. Compiled bytecode containers (`.abc`) use on-disk layout version **1**.
+Product release **v2.0** (`astraldb --version`). Compiled bytecode containers (`.abc`) use on-disk layout version **1** (independent of the product version).
 
 Invoke `astraldb --help` for the same option list the binary prints.
 

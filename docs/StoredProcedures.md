@@ -26,7 +26,22 @@ EXECUTE PROCEDURE seed;
 DROP PROCEDURE seed;
 ```
 
-**PL/pgSQL** (`LANGUAGE plpgsql`, dollar-quoted body) and **PL/SQL** (`IS` / `AS` … `BEGIN` … `END`) are parsed, tagged in the catalog, and **lowered** to sequential SQL before compilation. `CREATE OR REPLACE` overwrites an existing entry. Control-flow blocks (`IF`, loops) are recognized but not lowered yet—keep bodies linear.
+**PL/pgSQL** (`LANGUAGE plpgsql`, dollar-quoted body) and **PL/SQL** (`IS` / `AS` … `BEGIN` … `END`) are parsed, tagged in the catalog, and **lowered** to sequential SQL before compilation. `CREATE OR REPLACE` overwrites an existing entry.
+
+Control-flow lowering (PL/SQL and PL/pgSQL bodies):
+- **Constant** `IF` / `ELSIF` / `ELSE` / `END IF` — folded at lower time when every branch condition is a compile-time constant (`TRUE`, `FALSE`, `1=1`, `2<>3`, `NOT FALSE`, …).
+- **Runtime** `IF` / `ELSIF` / `ELSE` / `END IF` and searched `CASE` / `CASE … END CASE` — preserved as structured control segments, serialized in procedure metadata, and compiled to bytecode branches (`PROC_JUMP_IF_TABLE_EMPTY` after a probe `SELECT` per condition). Use predicates the SQL engine can codegen (for example `EXISTS (SELECT 1 FROM t WHERE …)` or column comparisons), not arbitrary expressions wrapped only in parentheses on `DUAL`.
+- `WHILE` loops when the condition is constant (`WHILE TRUE` unwraps the body; `WHILE FALSE` removes it).
+- `FOR i IN 1..N LOOP` when `N` is a literal and the iteration count is at most 32 (body is unrolled).
+- `EXCEPTION WHEN … THEN` handlers are split for bytecode exception stitching (see catalog `source_dialect`).
+- Non-constant `WHILE` / `FOR` loops are still rejected with a clear lowering error.
+
+Identifier names such as `if_probe` are not treated as the `IF` keyword (word boundaries include `_`).
+
+## C API (`include/astraldb/AstralDB.h`)
+
+- `AstralDbVersion`, `AstralDbCall`, `AstralDbExecQuery` (row callback per cell).
+- Prepared statements: `AstralDbPrepare` validates SQL; the first `AstralDbStmtStep` runs it with any `AstralDbBindInt64` / `AstralDbBindText` bindings (`?` is 1-based). `AstralDbStmtReset` clears the loaded result so you can re-bind and step again.
 
 `CREATE PROCEDURE` compiles the body, writes cache files, updates the catalog, and logs **`PR|`** WAL rows. `CALL` runs cached bytecode in a nested VM slice. `DROP PROCEDURE` removes catalog entries, cache files, and logs **`PD|`**.
 

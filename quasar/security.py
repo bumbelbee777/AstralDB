@@ -41,6 +41,8 @@ class SecurityPolicy:
     max_gateway_body_bytes: int = 1024 * 1024
     gateway_rate_per_minute: int = 1200
     require_gateway_auth: bool = False
+    gateway_allow_query_api_key: bool = False
+    gateway_keys_file: Optional[str] = None
     redact_secrets_in_errors: bool = True
     allow_path_outside_config_root: bool = False
 
@@ -175,6 +177,15 @@ def clamp_pool_config(raw: Dict[str, Any]) -> Dict[str, Any]:
         out["per_db_max_inflight"] = max(1, min(int(out["per_db_max_inflight"]), 64))
     if "keepalive_interval_sec" in out:
         out["keepalive_interval_sec"] = max(0.0, min(float(out["keepalive_interval_sec"]), 3600.0))
+    if "overload_soft_limit_ratio" in out:
+        out["overload_soft_limit_ratio"] = max(0.5, min(float(out["overload_soft_limit_ratio"]), 0.99))
+    if "overload_hard_limit_ratio" in out:
+        out["overload_hard_limit_ratio"] = max(0.6, min(float(out["overload_hard_limit_ratio"]), 1.0))
+    if out.get("overload_hard_limit_ratio", 0.95) < out.get("overload_soft_limit_ratio", 0.75):
+        out["overload_hard_limit_ratio"] = out["overload_soft_limit_ratio"]
+    if "overload_mode" in out:
+        mode = str(out["overload_mode"]).strip().lower()
+        out["overload_mode"] = mode if mode in ("fail_fast", "degrade") else "fail_fast"
     return out
 
 

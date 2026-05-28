@@ -1,6 +1,6 @@
-# Quasar (v1.0)
+# Quasar (v2.0)
 
-**Quasar** is AstralDB’s Python orchestration layer: a small toolkit (~2 MB with optional Flask) that wraps the **`astraldb` executable** so you can run sharded clusters, replicas, backups, and migrations without building a custom server.
+**Quasar** is AstralDB’s Python orchestration layer (release **2.0.0**, aligned with AstralDB **v2.0**): a small toolkit (~2 MB with optional Flask) that wraps the **`astraldb` executable** so you can run sharded clusters, replicas, backups, and migrations without building a custom server.
 
 AstralDB itself stays a **single static binary** with no network listener. Quasar does not change the engine; it **spawns the CLI** with `--database`, `-q`, `-s`, and bundle export/import flags, then coordinates multiple database files on disk.
 
@@ -70,6 +70,15 @@ python -m quasar health ./my-cluster/cluster.json
 | `ClusterConsensus` | Raft-style quorum for rebalance / commit decisions |
 | `QuasarRebalanceAutomator` | Automatic plan/apply when the hash ring changes |
 | Gateway (optional) | Flask `/query`, `/transfer`, `/recover`, `/cross-query`, `/autoscale`, `/consensus`, … |
+| `FdwManager` | Foreign data wrappers with predicate/projection pushdown, auth, retries, circuits |
+| `GlobalSecondaryIndexManager` | Cluster-wide GSI DDL orchestration per shard |
+| `MaterializedViewManager` | Materialized views with interval / on-mutation / manual refresh |
+| `QuasarCdcPublisher` | Commit-token CDC envelopes, checkpoints, batched/binary sinks |
+| `QuasarDistributedJoinExecutor` | Cost-aware cross-shard join (broadcast / repartition) + streaming |
+| `QuasarSplitMergeController` | Resumable shard split/merge journal (JSON + binary batches) |
+| `QuasarServerlessController` | Worker lease / heartbeat / scale-to-zero metadata |
+| `EdgeRegistry` | Edge node registration and CDC-ordered sync |
+| `QuasarUpgradeController` | Zero-downtime upgrade state machine with health gates |
 
 ## Cluster configuration
 
@@ -127,8 +136,12 @@ Global flags: `--astraldb PATH`, `-U`, `-P`, `-O2` (optimization level).
 | `backup-list BACKUP_DIR [--json]` | List versions |
 | `backup-prune BACKUP_DIR [--keep-last N] [--keep-days D] [--dry-run]` | Retention |
 | `restore BACKUP_DIR VERSION TARGET_DB [--overwrite] [--force]` | Restore files (blocks if WAL recently touched unless `--force`) |
-| `migrate SOURCE TARGET [--copy] [--work-dir DIR]` | Bundle or file copy |
-| `gateway CONFIG [--host H] [--port P] [--api-key K]` | HTTP front door |
+| `migrate SOURCE TARGET` | Auto-detect: SQLite, AstralDB, `.sql`, bundle, or **database URI** |
+| `migrate --source URI --target PATH [--schema S] [--no-procedures] [--no-triggers]` | Postgres, MySQL, Oracle, DuckDB, Redshift, Athena, … |
+| `migrate … --dry-run` | Print migration plan JSON without writing |
+| `migrate … --tables t1,t2` | Limit table import |
+| `gateway-key create\|list\|revoke` | Hashed API keys (`qk_<id>.<secret>`) for the gateway |
+| `gateway CONFIG [--host H] [--port P] [--keys-file F]` | HTTP front door (Bearer or `X-Quasar-Key`) |
 | `status CONFIG [--hash]` | Health + disk inventory JSON |
 | `drift CONFIG [--probe-sql SQL] [--no-hash] [--replicas]` | Shard (+ optional replica) consistency (`exit 1` if drift) |
 | `ring CONFIG KEY [KEY...]` | Show which shard owns each key |
@@ -158,6 +171,14 @@ Global flags: `--astraldb PATH`, `-U`, `-P`, `-O2` (optimization level).
 | `autoscale CONFIG [--apply] [--metrics]` | Evaluate or apply shard autoscaling |
 | `consensus CONFIG [--elect]` | Consensus leader / quorum status |
 | `rebalance-auto CONFIG [--apply]` | Automatic rebalance for current shard ring |
+| `pitr-restore CONFIG TARGET [--marker V \| --time ISO] [--archive-marker M]` | Point-in-time restore / WAL archive |
+| `upgrade CONFIG {start\|tick\|status}` | Zero-downtime upgrade state machine |
+| `gsi CONFIG {create\|drop\|list}` | Global secondary index orchestration |
+| `matview CONFIG {create\|refresh\|drop\|list\|tick}` | Materialized views + autorefresh tick |
+| `cdc CONFIG {poll\|publish\|publish-batched}` | Change data capture controls |
+| `distributed-join CONFIG spec.json` | Cost-aware cross-shard join |
+| `distributed-join-stream CONFIG spec.json` | Streaming join output |
+| `split-merge …` / `serverless …` / `edge …` | Shard movement, leases, edge sync |
 
 Examples:
 
@@ -399,7 +420,7 @@ Enable/disable via `"cross_query": { "enabled": true }` in `cluster.json`.
 
 ## Autoscaling
 
-Quasar **v1.0** can recommend or apply **horizontal shard scaling** from in-process metrics (pool rejections, monitor latency/error rate, open circuits, per-shard disk size). It does not provision VMs or Kubernetes pods—it adds new `data/shardN.db` files and updates `cluster.json`, then you **rebalance** row data onto the new ring.
+Quasar **v2.0** can recommend or apply **horizontal shard scaling** from in-process metrics (pool rejections, monitor latency/error rate, open circuits, per-shard disk size). It does not provision VMs or Kubernetes pods—it adds new `data/shardN.db` files and updates `cluster.json`, then you **rebalance** row data onto the new ring.
 
 ```json
 "autoscaling": {
@@ -443,7 +464,7 @@ State and cooldown: `.quasar/autoscale.json`. Example profile: `quasar/examples/
 
 ## Financial and banking workloads
 
-Quasar can orchestrate **ledger-style transfers**, **idempotent payments**, and **compensating sagas** across shards. This is an **example profile** for banking/fintech patterns—not a certified payment switch. AstralDB remains experimental; use external settlement and compliance review for production money movement.
+Quasar can orchestrate **ledger-style transfers**, **idempotent payments**, and **compensating sagas** across shards. This is an **example profile** for banking/fintech patterns—not a certified payment switch. The engine is still evolving (see [`Overview.md`](Overview.md)); use external settlement and compliance review for production money movement.
 
 Enable in `cluster.json` (see `quasar/examples/banking.cluster.example.json`):
 
@@ -752,18 +773,47 @@ Incremental backup copies **WAL only** (for point-in-time style recovery between
 
 ## Migration
 
-Two paths:
+`quasar migrate` moves data from common sources into an AstralDB `.db` file with **auto-detection** (or an explicit `--mode`). By default it also exports **stored procedures** and **triggers** when the source supports catalog introspection (AstralDB lowers PL/pgSQL and PL/SQL where possible — see [`StoredProcedures.md`](StoredProcedures.md) and [`Triggers.md`](Triggers.md)).
 
-| Method | When to use |
-|--------|-------------|
-| `migrate_via_bundle` (default) | Logical export/import via AstralDB’s bundle format |
-| `migrate_via_checkpoint_copy` (`--copy`) | Same host, cold copy after `BEGIN; COMMIT;` checkpoint |
+| Source | Detection | What happens |
+|--------|-----------|--------------|
+| **SQLite** (`.sqlite`, `.db` with SQLite header) | `sqlite` | Tables + triggers → bundle → `import-bundle` → apply triggers |
+| **AstralDB** (native `.db`) | `astral` | `export-bundle` → `import-bundle`, or `--copy` for same-host file copy |
+| **SQL script** (`.sql`) | `script` | DDL/DML via `astraldb -q`; `CREATE PROCEDURE` / `CREATE TRIGGER` applied after tables |
+| **Bundle JSON** (`.json`) | `bundle` | `import-bundle` + optional `procedures` / `triggers` sections |
+| **External DB** (`postgresql://`, `mysql://`, `oracle+oracledb://`, `duckdb://`, Redshift, Athena, …) | `external` | SQLAlchemy export → bundle → import → apply procs/triggers (best-effort) |
 
-Bundle migration is safer across versions if bundle format is stable; file copy is faster for large local files.
+Install drivers for your engine: `pip install 'quasar[postgres]'`, `quasar[mysql]`, `quasar[oracle]`, `quasar[duckdb]`, or `quasar[all-migrate]`.
 
-## v1.0 operations reference
+```bash
+python -m quasar migrate legacy/chat.sqlite data/shard0.db
+python -m quasar migrate "postgresql://user:pass@localhost/legacy" data/shard0.db --schema public
+python -m quasar migrate "mysql+pymysql://root@127.0.0.1/shop" data/shard0.db --dry-run
+python -m quasar migrate "duckdb:///tmp/warehouse.duckdb" data/shard0.db
+python -m quasar migrate data/old.db data/new.db --mode copy
+python -m quasar migrate schema/init.sql data/shard0.db --mode script
+```
 
-Single-page map of production-oriented features (all **v1.0.0**—no separate “enhanced” release).
+```python
+from quasar import QuasarMigrate, QuasarProcTrigger
+
+mig = QuasarMigrate()
+mig.run("legacy.sqlite", "data/shard0.db")
+QuasarProcTrigger().apply_bundle_section("data/shard0.db", bundle_dict)
+```
+
+Integration tests use the `astraldb_client` fixture (`bin/astraldb.exe` when present). The default `mock_client` fixture keeps the fast stub for the rest of the suite.
+
+```powershell
+.\scripts\run_quasar_integration_tests.ps1
+# or
+$env:QUASAR_ASTRALDB = "bin/astraldb.exe"
+python -m pytest quasar/tests/test_migrate_util.py -q
+```
+
+## v2.0 operations reference
+
+Single-page map of production-oriented features (release **2.0.0**).
 
 | Area | Config key | CLI | Gateway |
 |------|------------|-----|---------|
@@ -780,7 +830,19 @@ Single-page map of production-oriented features (all **v1.0.0**—no separate �
 | **Autoscale** | `autoscaling` | `autoscale`, `watch --autoscale` | `GET/POST /autoscale` |
 | **Drift / locks** | `locks` | `drift`, (locks internal) | `GET /drift` |
 | **Financial** | `financial` | `transfer`, `saga`, `reconcile` | `/transfer`, `/saga` |
-| **Watch loop** | — | `watch` | — |
+| **FDW** | `fdw` | (SQL + metrics) | (via `/query`) |
+| **HTAP lanes** | `htap` | (routed queries) | `/query` |
+| **PITR** | `pitr`, `backup_dir` | `pitr-restore` | `POST /pitr/restore`, `/pitr/archive` |
+| **Upgrades** | `upgrades` | `upgrade start/tick/status` | `/upgrade/*` |
+| **GSI** | `gsi` | `gsi create/drop/list` | `/gsi/*` |
+| **Materialized views** | `matview` | `matview …` | `/matview/*` |
+| **CDC** | `cdc` | `cdc poll/publish` | `/cdc/*` |
+| **Distributed join** | `distributed_join` | `distributed-join` | `/join/distributed/stream` |
+| **Split / merge** | `split_merge` | `split-merge …` | `/split-merge/*` |
+| **Serverless** | `serverless` | `serverless …` | `/serverless/*` |
+| **Edge** | `edge` | `edge register/sync` | `/edge/*` |
+| **Async queries** | — | — | `POST /async/query`, `GET /async/result/<id>` |
+| **Watch loop** | — | `watch` (`--matview-tick` via API) | — |
 
 Typical cron / sidecar stack:
 
@@ -791,9 +853,9 @@ python -m quasar watch ./cluster/cluster.json \
 
 Tune `autoscaling.auto_apply` only when rebalance playbooks are automated; otherwise evaluate with `autoscale` and apply scale-out manually before `rebalance --apply`.
 
-## Production & security (v1.0)
+## Production & security (v2.0)
 
-Quasar **v1.0** is the production-hardened release: input validation, path containment, bounded pools, and safe HTTP defaults.
+Quasar **v2.0** adds **hardened orchestration** (not a hardened storage engine): input validation, path containment, bounded pools, overload shedding, and safe HTTP defaults for the gateway and CLI wrappers.
 
 ### `cluster.json` → `security`
 
@@ -806,14 +868,31 @@ Quasar **v1.0** is the production-hardened release: input validation, path conta
 | `max_gateway_body_bytes` | 1048576 | Flask `MAX_CONTENT_LENGTH` |
 | `gateway_rate_per_minute` | 1200 | Per-IP rate limit on gateway |
 | `require_gateway_auth` | false | Fail gateway startup without API key |
+| `gateway_allow_query_api_key` | false | Allow `?api_key=` (discouraged; prefer `Authorization: Bearer`) |
+| `gateway_keys_file` | `.quasar/gateway_keys.json` | PBKDF2-hashed key registry |
 | `redact_secrets_in_errors` | true | Hide `-P` passwords in error messages |
 | `allow_path_outside_config_root` | false | Block `../` path traversal in config |
 
-Env overrides: `QUASAR_MAX_SQL_BYTES`, `QUASAR_REQUIRE_GATEWAY_AUTH`.
+Env overrides: `QUASAR_MAX_SQL_BYTES`, `QUASAR_REQUIRE_GATEWAY_AUTH`, `QUASAR_GATEWAY_KEYS_FILE`.
+
+### Gateway API keys
+
+Create rotatable keys (shown once) instead of a single shared secret:
+
+```bash
+python -m quasar gateway-key create --keys-file .quasar/gateway_keys.json
+# Use: Authorization: Bearer qk_<id>.<secret>
+#  or: X-Quasar-Key: qk_<id>.<secret>
+python -m quasar gateway-key list
+python -m quasar gateway-key revoke <key_id>
+python -m quasar gateway --require-auth --keys-file .quasar/gateway_keys.json cluster.json
+```
+
+Legacy `QUASAR_API_KEY` / `--api-key` still works for single-tenant setups; verification uses **constant-time** comparison. Hashed keys use PBKDF2-SHA256 (600k iterations).
 
 ### Hardening checklist
 
-1. **Gateway** — Set `QUASAR_API_KEY` (or `--api-key`) and `--require-auth` / `require_gateway_auth: true` before exposing beyond localhost. API keys are compared with **constant-time** equality.
+1. **Gateway** — Prefer `gateway-key create` + `require_gateway_auth: true`. Disable `gateway_allow_query_api_key` in production. Send credentials via `Authorization: Bearer`, not query strings.
 2. **Paths** — Keep `cluster.json`, shards, backups, and cross-join specs under one config directory; leave `allow_path_outside_config_root` false unless you operate absolute paths deliberately.
 3. **SQL** — Quasar validates size and rejects null bytes; it does **not** parse SQL — untrusted SQL is still dangerous. Use app-layer parameterization and least-privilege schemas.
 4. **Pool** — Tune `pool.max_queue` and `max_workers`; full queue returns **503 overloaded** instead of unbounded memory growth.
@@ -832,19 +911,91 @@ Env overrides: `QUASAR_MAX_SQL_BYTES`, `QUASAR_REQUIRE_GATEWAY_AUTH`.
 
 ## Operational caveats (read this!!!)
 
-1. **Experimental stack** — AstralDB is under active development; Quasar adds another moving part. Audit before production.
+1. **Evolving stack** — AstralDB 2.0 broadens the contract but is not a certified database product; Quasar adds orchestration on top. Audit before production.
 2. **Batched subprocesses** — Pooling dramatically cuts process spawn overhead; cross-shard transactions and `immediate=True` still use one process per call. Extreme QPS may require a single shard or external pooler.
 3. **Consensus scope** — File-quorum consensus coordinates **orchestration** (rebalance, commit decisions), not AstralDB storage engine replication. Split-brain across DB files still requires failover/replica playbooks.
 4. **File locking** — Only one AstralDB process should write a given database path at a time.
-5. **Security** — Passwords via `-P` or env; gateway API key is a simple shared secret, not OAuth.
+5. **Security** — Passwords via `-P` or env; prefer **`gateway-key create`** (PBKDF2-hashed registry). Legacy `QUASAR_API_KEY` / `--api-key` is a single shared secret, not OAuth.
 6. **Windows paths** — Prefer `python -m quasar init` (writes `data/shard0.db` style paths). Hand-edited `cluster.json` may use forward slashes; Quasar normalizes them on load. Avoid raw backslashes in JSON unless escaped (`\\`). `QUASAR_ASTRALDB` should point at `astraldb.exe` (see README).
 7. **CI** — `pytest quasar/tests` runs on every CI matrix job (mock CLI + real backup I/O).
+
+## SLO metrics contract
+
+Baseline metrics and acceptance gates for Quasar hardening (formerly `docs/QuasarSLO.md`).
+
+### Core SLO metrics (Prometheus)
+
+- `quasar_queries_total` — queries observed (via monitor snapshot: `queries`)
+- `quasar_errors_total` — failed queries (`errors`)
+- `quasar_latency_ms` — mean latency (`mean_latency_ms`)
+- `quasar_latency_p95_ms` / `quasar_latency_p99_ms` — tail latency
+- `quasar_timeouts_total` — timeout-class failures
+- `quasar_retry_events_total` — retry attempts consumed
+- `quasar_circuit_rejections_total` — circuit-open rejections
+- `quasar_shard_up{shard=…}` — per-shard health
+- `quasar_healthy` — whole-cluster health gauge
+- `quasar_fdw_*`, `quasar_matview_*`, `quasar_cdc_events_total` — platform extensions
+
+### Pool throughput / backpressure
+
+- `queue_depth`, `queue_wait_ms_mean`, `queue_wait_ms_max`
+- `batch_elapsed_ms_mean`, `batch_elapsed_ms_max`
+- `shed_soft_limit`, `shed_hard_limit`, `rejected_queue_full`
+
+### Failure gates (production targets)
+
+| Gate | Target |
+|------|--------|
+| Overload rejection rate | ≤ 2% under normal load |
+| Timeout ratio | ≤ 0.5% sustained |
+| Retry storm | `retry_events / queries` ≤ 0.2 |
+| Circuit-open ratio | ≤ 1% when dependencies healthy |
+| Tail latency | p99 within budget; ≤ 20% regression vs baseline |
+
+### Platform gates (v2)
+
+- **FDW** — DDL + pushdown SELECT; classified transport errors; per-source stats
+- **HTAP** — lane counters (`oltp_submitted`, `olap_submitted`, `lane_rejections`)
+- **PITR** — manifests include timeline/markers; restore by marker or timestamp
+- **Upgrades** — stage progress, applied shards, rollback reasons persisted
+- **GSI / matview / CDC** — catalog persistence; refresh/publish counters observable
+
+## Unified E2E torture test
+
+`quasar/tests/test_quasar_e2e_torture.py` runs a **single end-to-end profile** that mixes:
+
+| Scenario | What it exercises |
+|----------|-------------------|
+| **Messaging** | Sharded inserts + merged broadcast reads (chat-room style keys) |
+| **Throughput burst** | Concurrent writers (24 threads) against the pooled client |
+| **Financial** | Ledger bootstrap, cross-shard transfers, idempotency, reconcile |
+| **Security** | Oversized SQL, null bytes, invalid shard keys (must reject cleanly) |
+| **Platform** | FDW, materialized views, GSI, CDC publish, PITR archive, rolling upgrade |
+
+```bash
+pip install -e ".[dev]"
+python -m pytest quasar/tests/test_quasar_e2e_torture.py -m torture -q
+# or
+python scripts/quasar_e2e_torture.py
+```
+
+The test prints a JSON summary (`qps`, `p95`/`p99`, per-scenario results, SLO gate pass/fail). CI uses the **mock AstralDB CLI** with relaxed throughput floors; for real throughput numbers, point `QUASAR_ASTRALDB` at a Release build and tune `evaluate_slo_gates(..., mock_mode=False)`.
+
+**Watch integration** — interval materialized-view refresh can run in the same loop as backups:
+
+```bash
+python -m quasar watch ./cluster/cluster.json --interval 60 --backup --recover
+# matview tick: cluster.matview_tick() or POST /matview/tick
+```
 
 ## Tests
 
 ```bash
 pip install -e ".[dev]"
+# Uses bin/astraldb.exe when present (override with QUASAR_TEST_MOCK=1 for stub CLI)
 python -m pytest quasar/tests -q
+python -m pytest quasar/tests/test_quasar_e2e_torture.py -m torture -q
+python -m pytest quasar/tests/test_migrate_util.py -q
 ```
 
 ## See also

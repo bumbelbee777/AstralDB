@@ -56,6 +56,8 @@ class QuasarWatch:
         autoscale_apply: bool = False,
         rebalance_auto: bool = False,
         rebalance_apply: bool = False,
+        matview_tick: bool = False,
+        matview_force: bool = False,
     ) -> Dict[str, Any]:
         report = self.cluster.health()
         backup_result = None
@@ -103,6 +105,8 @@ class QuasarWatch:
         autoscale_apply: bool = False,
         rebalance_auto: bool = False,
         rebalance_apply: bool = False,
+        matview_tick: bool = False,
+        matview_force: bool = False,
         on_tick: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         count = 0
@@ -119,6 +123,8 @@ class QuasarWatch:
                 autoscale_apply=autoscale_apply,
                 rebalance_auto=rebalance_auto,
                 rebalance_apply=rebalance_apply,
+                matview_tick=matview_tick,
+                matview_force=matview_force,
             )
             if on_tick:
                 on_tick(snapshot)
@@ -149,3 +155,115 @@ def repair_replica_set(rep: QuasarReplica) -> List[Path]:
             shutil.copy2(src_wal, dst_wal)
         repaired.append(replica_path)
     return repaired
+
+
+class QuasarUpgradeController:
+    """Rolling zero-downtime upgrade state machine for shard fleets."""
+
+    STAGES = ("idle", "preflight", "canary", "progressive", "verify", "completed", "rolled_back")
+
+    def __init__(self, cluster: QuasarCluster, config: Optional[Dict[str, Any]] = None) -> None:
+        self.cluster = cluster
+        self.config = config or {}
+        self._canary_shards = max(1, int(self.config.get("canary_shards", 1)))
+        self._max_unhealthy_shards = max(0, int(self.config.get("max_unhealthy_shards", 0)))
+        self._max_error_rate = float(self.config.get("max_error_rate", 0.20))
+        self._state_file = Path(self.config.get("state_file", ".quasar/upgrades/state.json"))
+        self._state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state: Dict[str, Any] = {
+            "stage": "idle",
+            "target_version": None,
+            "applied_shards": [],
+            "errors": [],
+        }
+        self._load_state()
+
+    def _load_state(self) -> None:
+        if not self._state_file.exists():
+            return
+        try:
+            import json
+
+            self.state.update(json.loads(self._state_file.read_text(encoding="utf-8")))
+        except Exception:
+            return
+
+    def _persist_state(self) -> None:
+        import json
+
+        self._state_file.write_text(json.dumps(self.state, indent=2), encoding="utf-8")
+
+    def _violates_gate(self) -> Optional[str]:
+        health = self.cluster.health()
+        if not health.get("healthy"):
+            return "cluster unhealthy"
+        shards = health.get("shards", {}) or {}
+        unhealthy = sum(1 for _, ok in shards.items() if not ok)
+        if unhealthy > self._max_unhealthy_shards:
+            return f"unhealthy shards {unhealthy} > allowed {self._max_unhealthy_shards}"
+        mon = self.cluster.monitor.snapshot()
+        if float(mon.get("error_rate", 0.0)) > self._max_error_rate:
+            return "error rate gate violated"
+        return None
+
+    def start(self, target_version: str) -> Dict[str, Any]:
+        self.state = {
+            "stage": "preflight",
+            "target_version": str(target_version),
+            "applied_shards": [],
+            "errors": [],
+            "started_at": time.time(),
+        }
+        self._persist_state()
+        return dict(self.state)
+
+    def run_step(self) -> Dict[str, Any]:
+        stage = self.state.get("stage", "idle")
+        if stage == "idle":
+            return dict(self.state)
+        if stage == "preflight":
+            err = self._violates_gate()
+            if err:
+                self.state["errors"].append(f"preflight failed: {err}")
+                self.state["stage"] = "rolled_back"
+                self._persist_state()
+                return dict(self.state)
+            self.state["stage"] = "canary"
+            self._persist_state()
+            return dict(self.state)
+        if stage == "canary":
+            pending = [n.name for n in self.cluster.shard.nodes if n.name not in self.state["applied_shards"]]
+            for node_name in pending[: self._canary_shards]:
+                self.state["applied_shards"].append(node_name)
+            err = self._violates_gate()
+            if err:
+                self.state["errors"].append(f"canary failed: {err}")
+                self.state["stage"] = "rolled_back"
+                self._persist_state()
+                return dict(self.state)
+            self.state["stage"] = "progressive"
+            self._persist_state()
+            return dict(self.state)
+        if stage == "progressive":
+            remaining = [n.name for n in self.cluster.shard.nodes if n.name not in self.state["applied_shards"]]
+            if remaining:
+                self.state["applied_shards"].append(remaining[0])
+                err = self._violates_gate()
+                if err:
+                    self.state["errors"].append(f"progressive failed: {err}")
+                    self.state["stage"] = "rolled_back"
+                self._persist_state()
+                return dict(self.state)
+            self.state["stage"] = "verify"
+            self._persist_state()
+            return dict(self.state)
+        if stage == "verify":
+            err = self._violates_gate()
+            if err:
+                self.state["errors"].append(f"post-upgrade verification failed: {err}")
+                self.state["stage"] = "rolled_back"
+            else:
+                self.state["stage"] = "completed"
+            self._persist_state()
+            return dict(self.state)
+        return dict(self.state)

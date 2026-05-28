@@ -26,6 +26,7 @@ std::vector<float> AdHessianDiagF32(const float *SecondDeriv, const float *Upstr
 std::vector<float> AdHessianReluDiagF32(const float *X, const float *Upstream, size_t N);
 std::vector<float> AdHessianSigmoidDiagF32(const float *Y, const float *Upstream, size_t N);
 std::vector<float> AdHessianSquareDiagF32(const float *X, const float *Upstream, size_t N);
+std::vector<float> AdHessianTanhDiagF32(const float *Y, const float *Upstream, size_t N);
 
 /** Wirtinger ∂L/∂z and ∂L/∂z̄ from Cartesian (∂L/∂x, ∂L/∂y) interleaved upstream. */
 ComplexSeq WirtingerDzFromCartesianF32(const ComplexSeq &CartesianGrad);
@@ -45,6 +46,7 @@ std::vector<double> AdHessianDiagFromReal(const std::vector<double> &SecondDeriv
 std::vector<double> AdHessianReluFromReal(const std::vector<double> &X, const std::vector<double> &Upstream);
 std::vector<double> AdHessianSigmoidFromReal(const std::vector<double> &Y, const std::vector<double> &Upstream);
 std::vector<double> AdHessianSquareFromReal(const std::vector<double> &X, const std::vector<double> &Upstream);
+std::vector<double> AdHessianTanhFromReal(const std::vector<double> &Y, const std::vector<double> &Upstream);
 
 std::optional<std::vector<double>> AdWirtingerMulLhsFromCells(std::string_view A, std::string_view B,
                                                               std::string_view Upstream);

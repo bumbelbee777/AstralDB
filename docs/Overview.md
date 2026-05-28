@@ -4,7 +4,7 @@ AstralDB is a compact relational engine in modern C++ built around **modern SQL*
 
 SQL text is tokenized and parsed into an AST, lowered to **bytecode**, and executed by a small virtual machine that drives tables, indexes, a **write-ahead log**, and optional encryption at rest. The **`astraldb`** CLI runs scripts, ad hoc queries, a simple REPL, and can **compile** queries to **`.abc`** bytecode for later execution or inspection.
 
-> **Experimental:** development is active. Treat AstralDB as **research-grade** until you have audited the code and run your own workloads. **`examples/*.sql`** and **`tests/AstralDB.Tests.cxx`** are the living contract; this document summarizes them and calls out gaps honestly.
+> **AstralDB 2.0** is a major milestone with broad test and example coverage, but the engine is still evolving. Run your own audits and workloads before mission-critical use. **`examples/*.sql`** and **`tests/AstralDB.Tests.cxx`** are the living contract; this document summarizes them and calls out gaps honestly.
 
 ---
 
@@ -62,7 +62,7 @@ Runnable scripts for each band live under **`examples/`** (for example **`sql92_
 
 **JSON, XML, search.** `JSON_EXTRACT`, `JSON_CONTAINS`, `JSON_MERGE`, and related scalars; XML extract/serialize/validate; **`WHERE col MATCH '…'`** with optional FTS indexes; **`CREATE INDEX … USING VECTOR`** and **`VECTOR_TOPK`**.
 
-**Advanced cells and MathSci.** DuckDB-style **`STRUCT`**, **`MAP`**, **`LIST`**, **`VECTOR`**, **`MATRIX`**, **`COMPLEX`**; **2D/3D geospatial** (`POINT`, `POLYGON`, `MESH`, terrain DEM)—[`Geospatial.md`](Geospatial.md); dataset opcodes; SIMD signal/FFT, autograd, differential-equation solvers, **classifiers**, **NLP**, **embedding** catalogs, **tiny LM training**, and **PINN-style** PDE demos in SQL—see **`examples/sql_math_sci.sql`**, **`examples/math_sci_lm_tiny.sql`**, **`examples/math_sci_pinn_tdse_1d.sql`**, **`examples/math_sci_pinn_navier_stokes_3d.sql`**, and **`docs/MathSci*.md`**.
+**Advanced cells and MathSci.** DuckDB-style **`STRUCT`**, **`MAP`**, **`LIST`**, **`VECTOR`**, **`MATRIX`**, **`COMPLEX`**; **2D/3D geospatial** (`POINT`, `POLYGON`, `MESH`, terrain DEM)—[`Geospatial.md`](Geospatial.md); dataset opcodes; SIMD signal/FFT, autograd, differential-equation solvers, **MCTS / Bayesian inference / macro Fokker–Planck**, **classifiers**, **NLP**, **embedding** catalogs, **tiny LM training**, and **PINN-style** PDE demos in SQL—see **`examples/sql_math_sci.sql`**, **`examples/math_sci_inference_nfp.sql`**, **`examples/math_sci_lm_tiny.sql`**, **`examples/math_sci_pinn_tdse_1d.sql`**, **`examples/math_sci_pinn_navier_stokes_3d.sql`**, and **`docs/MathSci*.md`**.
 
 ---
 
@@ -95,7 +95,7 @@ These limits are intentional guardrails until the grammar and VM catch up. If yo
 3. **Optimizer pipeline** (`RunOptimizerPipeline` in `Optimizer.cxx`), selected by **`-O0` (none)** through **`-O4` (maximum)** on the CLI.
 4. **BytecodeInterpreter** executes opcodes against **`Database`** (tables, WAL, indexes, optional hybrid columnar paths).
 
-**Bytecode tooling (v1.0 `.abc`).** Compile with **`-cc`**, inspect/disassemble/validate with **`-ib` / `-db` / `-vb`**, debug with **`-dbg` / `-tb` / `-bp`**. Stored procedures and triggers use on-disk catalogs and bytecode caches—see [`Usage.md`](Usage.md) (CLI flags only), [`StoredProcedures.md`](StoredProcedures.md), [`Triggers.md`](Triggers.md).
+**Bytecode tooling (`.abc` container layout v1).** Product release is **2.0**; the on-disk bytecode format version is **1**. Compile with **`-cc`**, inspect/disassemble/validate with **`-ib` / `-db` / `-vb`**, debug with **`-dbg` / `-tb` / `-bp`**. Stored procedures and triggers use on-disk catalogs and bytecode caches—see [`Usage.md`](Usage.md) (CLI flags only), [`StoredProcedures.md`](StoredProcedures.md), [`Triggers.md`](Triggers.md).
 
 **Build quality.** **`ASTRALDB_WARNINGS_AS_ERRORS`** defaults to **ON**; shared **`SafeDiv()`** in **`sources/IO/MathUtil.hxx`** guards analytics kernels.
 
@@ -144,6 +144,9 @@ Near-term work: widen SQL coverage, harden semantics (especially `NULL` and opti
 | Triggers | [`Triggers.md`](Triggers.md) |
 | Tiny LM training | [`MathSciLmTrain.md`](MathSciLmTrain.md) |
 | PINN demos | [`MathSciPinn.md`](MathSciPinn.md) |
+| MCTS / Bayesian / NFP | [`MathSciInference.md`](MathSciInference.md), [`MathSciFokkerPlanck.md`](MathSciFokkerPlanck.md) |
+| Model cells (`MATHSCI_MODEL_*`) | [`MathSciModel.md`](MathSciModel.md) |
+| ODE/SDE/PDE solvers | [`MathSciDiffEq.md`](MathSciDiffEq.md), [`MathSciSolves.md`](MathSciSolves.md) |
 | C++ conventions | [`CodingStyle.md`](CodingStyle.md) |
 | Cluster orchestration | [`Quasar.md`](Quasar.md) |
 | Runnable contract | `examples/`, `tests/` |

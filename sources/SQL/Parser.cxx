@@ -3,6 +3,7 @@
 #include <SQL/SQL.hxx>
 #include <SQL/DialectCompat.hxx>
 #include <SQL/ProcedureParser.hxx>
+#include <SQL/BytecodeProcedures.hxx>
 #include <SQL/BytecodeTriggers.hxx>
 #include <Database/HybridStorageScheduler.hxx>
 #include <Database/User.hxx>
@@ -324,8 +325,10 @@ bool Parser::IsKeyword(const std::string &TokenValue) {
         "TEXT_RANK", "VECTOR_TOPK", "NULLIF", "GREATEST",
         "LEAST", "FFT", "IFFT", "DCT", "IDCT", "CONV_FULL", "CONV1D", "CONV_SAME", "CONV1D_SAME", "LAPLACIAN",
         "LAPLACIAN1D", "AD_GRAD_ADD",
-        "AD_GRAD_MUL_LHS", "AD_GRAD_MUL_RHS", "AD_GRAD_RELU", "AD_GRAD_SIGMOID", "AD_GRAD_CONV1D_IN",
+        "AD_GRAD_MUL_LHS", "AD_GRAD_MUL_RHS", "AD_GRAD_RELU", "AD_GRAD_SIGMOID", "AD_GRAD_TANH",
+        "AD_GRAD_MATVEC_IN", "AD_GRAD_MATVEC_W", "AD_GRAD_MSE_PRED", "AD_GRAD_CONV1D_IN",
         "AD_GRAD_CONV1D_K", "AD_CHAIN", "AD_HESSIAN", "AD_HESSIAN_RELU", "AD_HESSIAN_SIGMOID", "AD_HESSIAN_SQUARE",
+        "AD_HESSIAN_TANH", "PINN_FD_CENTRAL",
         "AD_WIRTINGER_MUL_LHS", "AD_WIRTINGER_MUL_RHS", "AD_WIRTINGER_ABS2", "AD_WIRTINGER_CHAIN", "AD_WIRTINGER_DZ",
         "AD_WIRTINGER_DZBAR", "ODE_EULER", "ODE_RK4", "ODE_HEUN", "ODE_MIDPOINT", "ODE_IMPLICIT_EULER",
         "SOLVE_ODE", "SDE_EULER", "SDE_GBM", "SDE_OU", "SDE_MILSTEIN", "PDE_HEAT_STEP", "PDE_POISSON_STEP",
@@ -338,6 +341,10 @@ bool Parser::IsKeyword(const std::string &TokenValue) {
         "NLP_TOKENIZE", "NLP_NGRAMS", "NLP_JACCARD", "NLP_EDIT_DIST", "NLP_STEM",
         "NLP_EMBED_BUILD", "NLP_EMBED_LOOKUP", "NLP_EMBED_BATCH", "NLP_EMBED_SERIALIZE", "NLP_EMBED_LOAD",
         "NLP_EMBED_FINGERPRINT", "NLP_EMBED_MEAN",
+        "MATHSCI_MODEL_BUILD", "MATHSCI_MODEL_SERIALIZE", "MATHSCI_MODEL_IMPORT", "MATHSCI_MODEL_LOAD",
+        "MATHSCI_MODEL_FINGERPRINT", "PREDICT", "DEQ_INTEGRATE", "DEQ_ADAPT", "DEQ_LINSPACE",
+        "MCTS_SEARCH", "MCTS_UCT_PICK", "BAYES_BETA_POST", "BAYES_NORMAL_POST", "BAYES_GRID_POST", "BAYES_LOG_EVIDENCE",
+        "NFP_MACRO_STEP", "NFP_MACRO_MARCH", "NFP_MACRO_MOMENTS",
         "ST_POINT", "ST_X", "ST_Y", "ST_AS_TEXT", "ST_DISTANCE",
         "ST_DISTANCE_SPHERICAL", "ST_WITHIN_BBOX", "ST_POINTZ", "ST_ELEVATION", "ST_DEM_SAMPLE", "ST_TERRAIN_SLOPE",
         "ST_MESH", "ST_MESH_IMPORT_GLTF", "ST_MESH_EXPORT_GLTF", "ST_MESH_SEW", "ST_MESH_UNION",
@@ -1625,9 +1632,10 @@ ASTNode Parser::ParseCreateStatement() {
 			ProcedureParseResult R = ProcedureParser(Slice).ParseDialectCreate();
 			R.OrReplace = R.OrReplace || OrReplace;
 			AdvanceThroughStatementSemicolon(StmtStart);
-			return std::make_unique<CreateProcedureAST>(std::move(R.ProcedureName), std::move(R.LoweredBodySql),
-			                                            R.IfNotExists, R.OrReplace, std::move(R.DialectTag),
-			                                            std::move(R.Body_.ExceptionHandlers));
+			return std::make_unique<CreateProcedureAST>(
+			    std::move(R.ProcedureName), std::move(R.LoweredBodySql), R.IfNotExists, R.OrReplace,
+			    std::move(R.DialectTag), std::move(R.Body_.ExceptionHandlers),
+			    EncodeProcedureControlJson(R.Body_));
 		}
 		if(IsFunction)
 			ParseFail("CREATE FUNCTION requires PL/pgSQL dialect syntax (LANGUAGE plpgsql AS $$ … $$).");

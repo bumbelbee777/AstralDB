@@ -519,15 +519,7 @@ std::vector<double> OdeAdamsBashforth2FromReal(const std::vector<double> &Y, dou
 std::vector<double> OdeMarchFromReal(std::string_view Method, const std::vector<double> &Y, double Dt,
                                      const std::vector<double> &A, const std::vector<double> &B,
                                      const std::vector<double> &C, const std::vector<double> &D, size_t Steps) {
-	if(Y.empty() || Steps == 0 || Steps > MaxSolveLen)
-		return {};
-	std::vector<double> Cur = Y;
-	for(size_t S = 0; S < Steps; ++S) {
-		Cur = OdeSolveFromReal(Method, Cur, Dt, A, B, C, D);
-		if(Cur.empty())
-			return {};
-	}
-	return Cur;
+	return DeqIntegrateFromReal(Method, Y, Dt, Steps, A, B, C, D);
 }
 
 std::vector<double> SdeMarchFromReal(const std::vector<double> &Y, double Dt, const std::vector<double> &Drift,
@@ -727,6 +719,328 @@ double RootSolveStepFromReal(std::string_view Method, double A, double B, double
 	if(M == "HALLEY" || M == "HALLEY_STEP")
 		return RootHalleyStepScalar(A, B, C, D);
 	return A;
+}
+
+OdeMethodTag ParseOdeMethod(std::string_view Method) {
+	std::string M(Method);
+	for(char &Ch : M)
+		Ch = static_cast<char>(std::toupper(static_cast<unsigned char>(Ch)));
+	if(M == "EULER")
+		return OdeMethodTag::Euler;
+	if(M == "HEUN" || M == "RK2")
+		return OdeMethodTag::Heun;
+	if(M == "MIDPOINT")
+		return OdeMethodTag::Midpoint;
+	if(M == "RK3")
+		return OdeMethodTag::Rk3;
+	if(M == "RK4" || M == "DOPRI5" || M == "TSIT5")
+		return OdeMethodTag::Rk4;
+	if(M == "IMPLICIT" || M == "IMPLICIT_EULER")
+		return OdeMethodTag::Implicit;
+	if(M == "TRAPEZOID")
+		return OdeMethodTag::Trapezoid;
+	if(M == "SEMI_IMPLICIT" || M == "SEMI")
+		return OdeMethodTag::SemiImplicit;
+	if(M == "CRANK_NICOLSON" || M == "CN")
+		return OdeMethodTag::CrankNicolson;
+	if(M == "ADAMS_BASHFORTH2" || M == "AB2")
+		return OdeMethodTag::AdamsBashforth2;
+	return OdeMethodTag::Unknown;
+}
+
+namespace {
+
+void Rk4CombineInPlace(float *Y, float *Acc, float *Scratch, const float *K1, const float *K2, const float *K3,
+                       const float *K4, size_t N, float Dt) {
+	Simd::Memcpy(Acc, K1, N * sizeof(float));
+	Simd::ScaleF32(Scratch, K2, 2.f, N);
+	Simd::AddF32(Acc, Acc, Scratch, N);
+	Simd::ScaleF32(Scratch, K3, 2.f, N);
+	Simd::AddF32(Acc, Acc, Scratch, N);
+	Simd::AddF32(Acc, Acc, K4, N);
+	Simd::ScaleF32(Scratch, Acc, Dt / 6.f, N);
+	Simd::AddF32(Y, Y, Scratch, N);
+}
+
+void OdeStepInPlace(OdeMethodTag Tag, float *Y, float *Acc, float *Scratch, const float *K1, const float *K2,
+                    const float *K3, const float *K4, const float *Lam, size_t N, float Dt) {
+	switch(Tag) {
+	case OdeMethodTag::Euler:
+		Simd::ScaleF32(Scratch, K1, Dt, N);
+		Simd::AddF32(Y, Y, Scratch, N);
+		break;
+	case OdeMethodTag::Heun: {
+		const auto Out = OdeHeunVecF32(Y, K1, K2, N, Dt);
+		Simd::Memcpy(Y, Out.data(), N * sizeof(float));
+		break;
+	}
+	case OdeMethodTag::Midpoint: {
+		auto Out = OdeMidpointVecF32(Y, K1, N, Dt);
+		Simd::Memcpy(Y, Out.data(), N * sizeof(float));
+		break;
+	}
+	case OdeMethodTag::Rk3: {
+		auto Out = OdeRk3VecF32(Y, K1, K2, K3, N, Dt);
+		Simd::Memcpy(Y, Out.data(), N * sizeof(float));
+		break;
+	}
+	case OdeMethodTag::Rk4:
+		Rk4CombineInPlace(Y, Acc, Scratch, K1, K2, K3, K4, N, Dt);
+		break;
+	case OdeMethodTag::Implicit: {
+		auto Out = OdeImplicitEulerVecF32(Y, Lam, N, Dt);
+		Simd::Memcpy(Y, Out.data(), N * sizeof(float));
+		break;
+	}
+	case OdeMethodTag::Trapezoid: {
+		auto Out = OdeTrapezoidVecF32(Y, K1, K2, N, Dt);
+		Simd::Memcpy(Y, Out.data(), N * sizeof(float));
+		break;
+	}
+	case OdeMethodTag::SemiImplicit: {
+		auto Out = OdeSemiImplicitVecF32(Y, K1, K2, N, Dt);
+		Simd::Memcpy(Y, Out.data(), N * sizeof(float));
+		break;
+	}
+	case OdeMethodTag::CrankNicolson: {
+		auto Out = OdeCrankNicolsonVecF32(Y, Lam, K1, N, Dt);
+		Simd::Memcpy(Y, Out.data(), N * sizeof(float));
+		break;
+	}
+	case OdeMethodTag::AdamsBashforth2: {
+		auto Out = OdeAdamsBashforth2VecF32(Y, K1, K2, N, Dt);
+		Simd::Memcpy(Y, Out.data(), N * sizeof(float));
+		break;
+	}
+	default:
+		break;
+	}
+}
+
+} // namespace
+
+std::vector<double> DeqIntegrateFromReal(std::string_view Method, const std::vector<double> &Y, double Dt, size_t Steps,
+                                          const std::vector<double> &K1, const std::vector<double> &K2,
+                                          const std::vector<double> &K3, const std::vector<double> &K4) {
+	if(Y.empty() || Steps == 0 || Steps > MaxOdeIntegrateSteps || Y.size() > MaxSolveLen)
+		return {};
+	const OdeMethodTag Tag = ParseOdeMethod(Method);
+	if(Tag == OdeMethodTag::Unknown)
+		return {};
+	const size_t N = Y.size();
+	auto Pad = [&](const std::vector<double> &V) {
+		if(V.size() == N)
+			return MathSciSimdUtil::SeqToF32(V);
+		if(V.empty())
+			return std::vector<float>(N, 0.f);
+		return std::vector<float>{};
+	};
+	std::vector<float> K1f = Pad(K1);
+	std::vector<float> K2f = Pad(K2);
+	std::vector<float> K3f = Pad(K3);
+	std::vector<float> K4f = Pad(K4);
+	std::vector<float> Lamf = Pad(K1);
+	if(K1f.empty() || (Tag == OdeMethodTag::Heun && K2f.empty()) || (Tag == OdeMethodTag::Rk4 && (K2f.empty() || K3f.empty() || K4f.empty())))
+		return {};
+	std::vector<float> State = MathSciSimdUtil::SeqToF32(Y);
+	std::vector<float> Acc(N, 0.f);
+	std::vector<float> Scratch(N, 0.f);
+	const float H = static_cast<float>(Dt);
+	for(size_t S = 0; S < Steps; ++S)
+		OdeStepInPlace(Tag, State.data(), Acc.data(), Scratch.data(), K1f.data(), K2f.data(), K3f.data(), K4f.data(),
+		               Lamf.data(), N, H);
+	return MathSciSimdUtil::ToF64(State);
+}
+
+std::vector<double> DeqAdaptFromReal(std::string_view Method, const std::vector<double> &Y, double T0, double T1,
+                                     double HInit, double Rtol, double Atol, const std::vector<double> &K1,
+                                     const std::vector<double> &K2, const std::vector<double> &K3,
+                                     const std::vector<double> &K4) {
+	if(Y.empty() || T1 <= T0 || Y.size() > MaxSolveLen)
+		return {};
+	const OdeMethodTag Tag = ParseOdeMethod(Method);
+	if(Tag != OdeMethodTag::Rk4 && Tag != OdeMethodTag::Euler && Tag != OdeMethodTag::Heun)
+		return DeqIntegrateFromReal(Method, Y, HInit, static_cast<size_t>((T1 - T0) / std::max(HInit, 1e-12) + 0.5), K1,
+		                            K2, K3, K4);
+	std::vector<double> Cur = Y;
+	double T = T0;
+	double H = std::max(HInit, 1e-9);
+	const double Dir = T1 > T0 ? 1.0 : -1.0;
+	H *= Dir;
+	const double RtolEff = std::max(Rtol, 1e-12);
+	const double AtolEff = std::max(Atol, 1e-12);
+	size_t Steps = 0;
+	while((Dir > 0 && T < T1) || (Dir < 0 && T > T1)) {
+		if(++Steps > MaxOdeIntegrateSteps)
+			break;
+		const double HStep = (Dir > 0) ? std::min(H, T1 - T) : std::max(H, T1 - T);
+		const auto Y1 = DeqIntegrateFromReal("RK4", Cur, std::abs(HStep), 1, K1, K2, K3, K4);
+		const auto Y2 = DeqIntegrateFromReal("RK4", Cur, std::abs(HStep) * 0.5, 2, K1, K2, K3, K4);
+		if(Y1.empty() || Y2.empty())
+			break;
+		double Err = 0.0;
+		for(size_t I = 0; I < Y1.size(); ++I) {
+			const double Sc = AtolEff + RtolEff * std::max(std::abs(Cur[I]), std::abs(Y1[I]));
+			Err = std::max(Err, std::abs(Y1[I] - Y2[I]) / Sc);
+		}
+		if(Err <= 1.0) {
+			T += HStep;
+			Cur = std::move(Y1);
+			H = std::abs(H) * (Err > 0 ? std::min(2.0, std::max(0.5, 0.9 * std::pow(1.0 / Err, 0.2))) : 2.0) * Dir;
+		} else {
+			H *= 0.5 * Dir;
+		}
+	}
+	return Cur;
+}
+
+std::optional<std::vector<double>> DeqLinspaceFromReal(double T0, double T1, size_t N) {
+	if(N == 0 || N > MaxSolveLen)
+		return std::nullopt;
+	if(N == 1)
+		return std::vector<double>{T0};
+	std::vector<double> Out(N);
+	const double Span = T1 - T0;
+	const double Den = static_cast<double>(N - 1);
+	for(size_t I = 0; I < N; ++I)
+		Out[I] = T0 + Span * (static_cast<double>(I) / Den);
+	return Out;
+}
+
+std::optional<std::string> DeqIntegrateCellFromReal(const std::string &Method, const std::string &Y, const std::string &Dt,
+                                                    const std::string &Steps, const std::string &K1,
+                                                    const std::string &K2, const std::string &K3,
+                                                    const std::string &K4) {
+	auto ToNum = [](const std::string &S) -> std::optional<double> {
+		try {
+			return std::stod(S);
+		} catch(...) {
+			return std::nullopt;
+		}
+	};
+	auto ParseSeq = [](std::string_view Cell) -> std::optional<std::vector<double>> {
+		if(const auto L = AdvancedTypes::ParseListCell(Cell)) {
+			std::vector<double> Out;
+			Out.reserve(L->size());
+			for(const auto &S : *L) {
+				try {
+					Out.push_back(std::stod(S));
+				} catch(...) {
+					return std::nullopt;
+				}
+			}
+			return Out;
+		}
+		if(const auto V = AdvancedTypes::ParseVectorCell(Cell))
+			return *V;
+		return std::nullopt;
+	};
+	const auto Yv = ParseSeq(Y);
+	const auto Dtv = ToNum(Dt);
+	const auto Stv = ToNum(Steps);
+	const auto K1v = ParseSeq(K1);
+	if(!Yv || !Dtv || !Stv || !K1v)
+		return std::nullopt;
+	std::vector<double> K2v, K3v, K4v;
+	if(!K2.empty()) {
+		const auto P = ParseSeq(K2);
+		if(!P)
+			return std::nullopt;
+		K2v = *P;
+	}
+	if(!K3.empty()) {
+		const auto P = ParseSeq(K3);
+		if(!P)
+			return std::nullopt;
+		K3v = *P;
+	}
+	if(!K4.empty()) {
+		const auto P = ParseSeq(K4);
+		if(!P)
+			return std::nullopt;
+		K4v = *P;
+	}
+	const auto Out = DeqIntegrateFromReal(Method, *Yv, *Dtv, static_cast<size_t>(*Stv), *K1v, K2v, K3v, K4v);
+	if(Out.empty())
+		return std::nullopt;
+	return MathSciSimdUtil::FormatListCellFromDoubles(Out);
+}
+
+std::optional<std::string> DeqAdaptCellFromReal(const std::string &Method, const std::string &Y, const std::string &T0,
+                                                const std::string &T1, const std::string &HInit,
+                                                const std::string &Rtol, const std::string &Atol,
+                                                const std::string &K1, const std::string &K2, const std::string &K3,
+                                                const std::string &K4) {
+	auto ToNum = [](const std::string &S) -> std::optional<double> {
+		try {
+			return std::stod(S);
+		} catch(...) {
+			return std::nullopt;
+		}
+	};
+	auto ParseSeq = [](std::string_view Cell) -> std::optional<std::vector<double>> {
+		if(const auto L = AdvancedTypes::ParseListCell(Cell)) {
+			std::vector<double> Out;
+			Out.reserve(L->size());
+			for(const auto &S : *L) {
+				try {
+					Out.push_back(std::stod(S));
+				} catch(...) {
+					return std::nullopt;
+				}
+			}
+			return Out;
+		}
+		if(const auto V = AdvancedTypes::ParseVectorCell(Cell))
+			return *V;
+		return std::nullopt;
+	};
+	const auto Yv = ParseSeq(Y);
+	const auto T0v = ToNum(T0);
+	const auto T1v = ToNum(T1);
+	const auto Hv = ToNum(HInit);
+	const auto Rv = ToNum(Rtol);
+	const auto Av = ToNum(Atol);
+	const auto K1v = ParseSeq(K1);
+	if(!Yv || !T0v || !T1v || !Hv || !Rv || !Av || !K1v)
+		return std::nullopt;
+	std::vector<double> K2v, K3v, K4v;
+	if(!K2.empty()) {
+		const auto P = ParseSeq(K2);
+		if(!P)
+			return std::nullopt;
+		K2v = *P;
+	}
+	if(!K3.empty()) {
+		const auto P = ParseSeq(K3);
+		if(!P)
+			return std::nullopt;
+		K3v = *P;
+	}
+	if(!K4.empty()) {
+		const auto P = ParseSeq(K4);
+		if(!P)
+			return std::nullopt;
+		K4v = *P;
+	}
+	const auto Out = DeqAdaptFromReal(Method, *Yv, *T0v, *T1v, *Hv, *Rv, *Av, *K1v, K2v, K3v, K4v);
+	if(Out.empty())
+		return std::nullopt;
+	return MathSciSimdUtil::FormatListCellFromDoubles(Out);
+}
+
+std::optional<std::string> DeqLinspaceCellFromReal(const std::string &T0, const std::string &T1, const std::string &N) {
+	try {
+		const double A = std::stod(T0);
+		const double B = std::stod(T1);
+		const size_t Count = static_cast<size_t>(std::stod(N));
+		const auto Grid = DeqLinspaceFromReal(A, B, Count);
+		if(!Grid)
+			return std::nullopt;
+		return MathSciSimdUtil::FormatListCellFromDoubles(*Grid);
+	} catch(...) {
+		return std::nullopt;
+	}
 }
 
 } // namespace MathSciSolves

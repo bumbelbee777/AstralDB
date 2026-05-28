@@ -31,6 +31,15 @@ astraldb_procs.json
 astraldb_triggers.json
 astraldb_procs_cache/
 astraldb_triggers_cache/
+_*.db
+_*.db.wal
+_*.json
+/_*.sql
+/_*.abc
+/_*.cpp
+/benchmark_*.png
+/data/
+build-release/
 
 # Logs and local scratch
 *.log

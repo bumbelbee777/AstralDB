@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quasar"
-version = "1.0.0"
+version = "2.0.0"
 description = "Orchestration layer for AstralDB production deployments"
 readme = "docs/Quasar.md"
 requires-python = ">=3.10"
@@ -12,7 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "AstralDB contributors" }]
 keywords = ["astraldb", "database", "orchestration", "sharding"]
 classifiers = [
-    "Development Status :: 5 - Stable",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -29,6 +29,29 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+migrate = [
+    "sqlalchemy>=2.0",
+]
+postgres = [
+    "sqlalchemy>=2.0",
+    "psycopg2-binary>=2.9",
+]
+mysql = [
+    "sqlalchemy>=2.0",
+    "pymysql>=1.1",
+]
+oracle = [
+    "sqlalchemy>=2.0",
+    "oracledb>=2.0",
+]
+duckdb = [
+    "sqlalchemy>=2.0",
+    "duckdb>=1.0",
+    "duckdb-engine>=0.13",
+]
+all-migrate = [
+    "quasar[migrate,postgres,mysql,oracle,duckdb]",
+]
 
 [project.scripts]
 quasar = "quasar.quasar:main"
@@ -40,3 +63,6 @@ include = ["quasar*"]
 [tool.pytest.ini_options]
 testpaths = ["quasar/tests"]
 pythonpath = ["."]
+markers = [
+    "torture: unified E2E stress, security edge cases, and SLO gates",
+]

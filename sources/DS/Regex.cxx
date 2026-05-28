@@ -142,17 +142,17 @@ struct Parser {
 		case '0':
 			return '\0';
 		case 'd':
-			return 128; // sentinel: class
+			return static_cast<unsigned char>(128); // sentinel: class
 		case 'D':
-			return 129;
+			return static_cast<unsigned char>(129);
 		case 'w':
-			return 130;
+			return static_cast<unsigned char>(130);
 		case 'W':
-			return 131;
+			return static_cast<unsigned char>(131);
 		case 's':
-			return 132;
+			return static_cast<unsigned char>(132);
 		case 'S':
-			return 133;
+			return static_cast<unsigned char>(133);
 		default:
 			return static_cast<unsigned char>(C);
 		}

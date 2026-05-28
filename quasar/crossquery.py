@@ -174,3 +174,13 @@ class QuasarCrossQuery:
             except ValueError:
                 pass
         return CrossQueryResult(merged=merged, routed=routed, rows=rows, all_ok=all_ok)
+
+    def stream_fanout(self, sql: str, *, chunk_size: int = 250) -> List[Dict[str, Any]]:
+        """Return read rows in bounded chunks for large cross-shard scans."""
+        results = self._execute_fanout(sql, parallel=True)
+        out: List[Dict[str, Any]] = []
+        for r in results:
+            rows = parse_stdout_rows(r.result.stdout)
+            for i in range(0, len(rows), chunk_size):
+                out.append({"shard": r.node, "rows": rows[i : i + chunk_size]})
+        return out

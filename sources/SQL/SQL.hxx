@@ -456,6 +456,30 @@ enum class ScalarSqlFn : int16_t {
 	RootBisectStep = 254,
 	RootHalleyStep = 255,
 	SolveRoot = 256,
+	AdGradTanh = 257,
+	AdGradMatVecIn = 258,
+	AdGradMatVecW = 259,
+	AdGradMsePred = 260,
+	MathSciModelBuild = 261,
+	MathSciModelSerialize = 262,
+	MathSciModelImport = 263,
+	MathSciModelLoad = 264,
+	MathSciModelFingerprint = 265,
+	Predict = 266,
+	AdHessianTanh = 267,
+	PinnFdCentral = 268,
+	DeqIntegrate = 269,
+	DeqAdapt = 270,
+	DeqLinspace = 271,
+	MctsSearch = 272,
+	MctsUctPick = 273,
+	BayesBetaPost = 274,
+	BayesNormalPost = 275,
+	BayesGridPost = 276,
+	BayesLogEvidence = 277,
+	NfpMacroStep = 278,
+	NfpMacroMarch = 279,
+	NfpMacroMoments = 280,
 	CurrentTimestamp = 1003,
 	AtTimeZone = 1004,
 	ConvertTimezone = 1005,
@@ -1020,16 +1044,19 @@ struct CreateProcedureAST : public StatementAST {
 	/** \c plsql, \c plpgsql, or empty for AstralDB parenthesized syntax. */
 	std::string SourceDialect_;
 	std::vector<ProcedureExceptionWhen> ExceptionHandlers_;
+	std::string ControlFlowJson_;
 
 	CreateProcedureAST(std::string Name_, std::string BodySql_, bool IfNotExists_ = false, bool OrReplace_ = false,
 	                    std::string SourceDialect_ = {},
-	                    std::vector<ProcedureExceptionWhen> ExceptionHandlers_ = {})
+	                    std::vector<ProcedureExceptionWhen> ExceptionHandlers_ = {},
+	                    std::string ControlFlowJson_ = {})
 	    : ProcedureName(std::move(Name_)),
 	      BodySql_(std::move(BodySql_)),
 	      IfNotExists(IfNotExists_),
 	      OrReplace(OrReplace_),
 	      SourceDialect_(std::move(SourceDialect_)),
-	      ExceptionHandlers_(std::move(ExceptionHandlers_)) {}
+	      ExceptionHandlers_(std::move(ExceptionHandlers_)),
+	      ControlFlowJson_(std::move(ControlFlowJson_)) {}
 
 	void EmitBytecode(BytecodeScratch &Instructions) const override;
 };

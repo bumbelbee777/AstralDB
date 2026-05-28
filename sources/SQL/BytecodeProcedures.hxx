@@ -69,8 +69,15 @@ std::vector<std::string> ScanProcedureCallsInSql(std::string_view BodySql);
 ProcedureBytecodeMeta AnalyzeProcedureBytecode(const Bytecode &Code);
 
 CompiledBytecode CompileProcedureBody(Logger *Logger, OptimizationLevel OptLevel, const Database *CatalogDb,
+                                      const LoweredProcedureBody &Body);
+
+CompiledBytecode CompileProcedureBody(Logger *Logger, OptimizationLevel OptLevel, const Database *CatalogDb,
                                       std::string_view BodySql,
                                       const std::vector<ProcedureExceptionWhen> &ExceptionHandlers = {});
+
+std::string EncodeProcedureControlJson(const LoweredProcedureBody &Body);
+
+LoweredProcedureBody DecodeProcedureControlJson(std::string_view Json, std::string_view FallbackLinearSql = {});
 
 std::string EncodeExceptionHandlersJson(const std::vector<ProcedureExceptionWhen> &Handlers);
 
@@ -83,7 +90,8 @@ StoredProcedureEntry CacheProcedureFromSql(ProcedureCatalog &Catalog, const std:
                                            std::string Name, std::string BodySql, Logger *Logger,
                                            OptimizationLevel OptLevel, const Database *CatalogDb, bool IfNotExists,
                                            bool OrReplace = false, std::string SourceDialect = {},
-                                           const std::vector<ProcedureExceptionWhen> &ExceptionHandlers = {});
+                                           const std::vector<ProcedureExceptionWhen> &ExceptionHandlers = {},
+                                           std::string_view ControlFlowJson = {});
 
 void DropProcedureCacheFiles(const StoredProcedureEntry &Entry);
 

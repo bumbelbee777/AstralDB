@@ -78,14 +78,30 @@ def test_incremental_backup_copies_wal(tmp_path: Path):
     assert (dest / wal.name).exists()
 
 
-def test_migration_bundle(mock_client: AstralDBClient, tmp_path: Path):
+def test_migration_bundle(mock_only_client: AstralDBClient, tmp_path: Path):
     source = tmp_path / "src.db"
     source.write_text("old", encoding="utf-8")
     target = tmp_path / "dst.db"
-    mig = QuasarMigration(source, target, client=mock_client)
+    mig = QuasarMigration(source, target, client=mock_only_client)
     bundle = mig.migrate_via_bundle(work_dir=tmp_path / "work")
     assert bundle.exists()
     assert target.read_text(encoding="utf-8") == "imported"
+
+
+def test_migration_bundle_integration(astraldb_client: AstralDBClient, tmp_path: Path):
+    source = tmp_path / "src.db"
+    target = tmp_path / "dst.db"
+    astraldb_client.query(
+        "CREATE TABLE mig_t (id INT); INSERT INTO mig_t VALUES (1);",
+        database=source,
+        immediate=True,
+    )
+    mig = QuasarMigration(source, target, client=astraldb_client)
+    bundle = mig.migrate_via_bundle(work_dir=tmp_path / "work")
+    assert bundle.exists()
+    assert target.is_file()
+    out = astraldb_client.query("SELECT id FROM mig_t LIMIT 1;", database=target, immediate=True)
+    assert out.ok
 
 
 def test_monitor_percentiles():

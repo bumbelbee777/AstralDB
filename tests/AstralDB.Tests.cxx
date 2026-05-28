@@ -12,6 +12,7 @@
 #include <Database/MathSciClassify.hxx>
 #include <Database/MathSciNlp.hxx>
 #include <Database/MathSciEmbeddings.hxx>
+#include <Database/MathSciModel.hxx>
 #include <Database/MathSciComplex.hxx>
 #include <Database/GeoSpatial.hxx>
 #include <DS/Geometry2D.hxx>
@@ -31,7 +32,7 @@
 #include <SQL/BytecodeProcedures.hxx>
 #include <SQL/BytecodeTriggers.hxx>
 #include <SQL/ProcedureParser.hxx>
-#include <astraldb/astraldb.h>
+#include <astraldb/AstralDB.h>
 #include "AstralTestHelpers.hxx"
 #include <algorithm>
 #include <chrono>
@@ -2988,6 +2989,31 @@ TEST_CASE("SQL: EXEC and EXECUTE PROCEDURE alias CALL") {
 	REQUIRE(Has("d"));
 }
 
+TEST_CASE("ProcedureParser: constant IF ELSIF ELSE is folded") {
+	const char *Src = "CREATE PROCEDURE if_fold IS BEGIN "
+	                  "IF FALSE THEN INSERT INTO skip VALUES (1); "
+	                  "ELSIF 1=1 THEN INSERT INTO keep VALUES (2); "
+	                  "ELSE INSERT INTO other VALUES (3); END IF; END;";
+	const auto R = AstralDB::SQL::ProcedureParser(Src).ParseDialectCreate();
+	REQUIRE(R.LoweredBodySql.find("INSERT INTO keep") != std::string::npos);
+	REQUIRE(R.LoweredBodySql.find("INSERT INTO skip") == std::string::npos);
+	REQUIRE(R.LoweredBodySql.find("INSERT INTO other") == std::string::npos);
+}
+
+TEST_CASE("ProcedureParser: WHILE FALSE and FOR 1..2 unroll") {
+	const char *Src = "CREATE PROCEDURE loop_fold LANGUAGE plpgsql AS $$ "
+	                  "BEGIN "
+	                  "WHILE FALSE LOOP INSERT INTO never VALUES (0); END LOOP; "
+	                  "FOR i IN 1..2 LOOP INSERT INTO t VALUES (1); END LOOP; "
+	                  "END; $$";
+	const auto R = AstralDB::SQL::ProcedureParser(Src).ParseDialectCreate();
+	REQUIRE(R.LoweredBodySql.find("INSERT INTO never") == std::string::npos);
+	const auto P1 = R.LoweredBodySql.find("INSERT INTO t");
+	const auto P2 = R.LoweredBodySql.find("INSERT INTO t", P1 + 1);
+	REQUIRE(P1 != std::string::npos);
+	REQUIRE(P2 != std::string::npos);
+}
+
 TEST_CASE("ProcedureParser: EXCEPTION WHEN OTHERS lowers handlers") {
 	const char *Src = "CREATE OR REPLACE PROCEDURE ex_demo IS BEGIN "
 	                  "INSERT INTO t VALUES (1); "
@@ -3414,38 +3440,138 @@ TEST_CASE("SQL: DROP TYPE rejects referenced typed tables") {
 TEST_CASE("C API: open exec prepare step finalize") {
 	fs::path Dir = UniqueTempDir("astral_capi_");
 	const fs::path DbPath = Dir / "astral_capi.db";
-	astraldb_t *Db = nullptr;
-	REQUIRE(astraldb_open(DbPath.string().c_str(), &Db) == 0);
+	AstralDb *Db = nullptr;
+	REQUIRE(AstralDbOpen(DbPath.string().c_str(), &Db) == 0);
 	REQUIRE(Db != nullptr);
-	REQUIRE(astraldb_exec(Db, "CREATE TABLE capi_t (id INT, name TEXT);") == 0);
-	REQUIRE(astraldb_exec(Db, "INSERT INTO capi_t VALUES (1, 'alpha');") == 0);
-	astraldb_stmt_t *Stmt = nullptr;
-	REQUIRE(astraldb_prepare(Db, "SELECT id, name FROM capi_t;", &Stmt) == 0);
+	REQUIRE(AstralDbExec(Db, "CREATE TABLE capi_t (id INT, name TEXT);") == 0);
+	REQUIRE(AstralDbExec(Db, "INSERT INTO capi_t VALUES (1, 'alpha');") == 0);
+	AstralDbStmt *Stmt = nullptr;
+	REQUIRE(AstralDbPrepare(Db, "SELECT id, name FROM capi_t;", &Stmt) == 0);
 	REQUIRE(Stmt != nullptr);
-	REQUIRE(astraldb_stmt_step(Stmt) == 1);
-	REQUIRE(astraldb_stmt_column_count(Stmt) == 2);
-	REQUIRE(std::string(astraldb_stmt_column_name(Stmt, 0)) == "id");
-	REQUIRE(std::string(astraldb_stmt_column_text(Stmt, 0)) == "1");
-	REQUIRE(std::string(astraldb_stmt_column_text(Stmt, 1)) == "alpha");
-	REQUIRE(astraldb_stmt_step(Stmt) == 0);
-	astraldb_stmt_finalize(Stmt);
-	astraldb_close(Db);
+	REQUIRE(AstralDbStmtStep(Stmt) == 1);
+	REQUIRE(AstralDbStmtColumnCount(Stmt) == 2);
+	REQUIRE(std::string(AstralDbStmtColumnName(Stmt, 0)) == "id");
+	REQUIRE(std::string(AstralDbStmtColumnText(Stmt, 0)) == "1");
+	REQUIRE(std::string(AstralDbStmtColumnText(Stmt, 1)) == "alpha");
+	REQUIRE(AstralDbStmtStep(Stmt) == 0);
+	AstralDbStmtFinalize(Stmt);
+	AstralDbClose(Db);
+}
+
+TEST_CASE("C API: version call and stmt reset") {
+	REQUIRE(std::string(AstralDbVersion()) == ASTRALDB_VERSION);
+	fs::path Dir = UniqueTempDir("astral_capi_misc_");
+	const fs::path DbPath = Dir / "astral_capi_misc.db";
+	AstralDb *Db = nullptr;
+	REQUIRE(AstralDbOpen(DbPath.string().c_str(), &Db) == 0);
+	REQUIRE(AstralDbExec(Db, "CREATE TABLE capi_misc (id INT);") == 0);
+	REQUIRE(AstralDbExec(Db,
+	                     "CREATE PROCEDURE capi_p AS ( INSERT INTO capi_misc VALUES (9); );") == 0);
+	REQUIRE(AstralDbCall(Db, "capi_p") == 0);
+	AstralDbStmt *Stmt = nullptr;
+	REQUIRE(AstralDbPrepare(Db, "SELECT id FROM capi_misc;", &Stmt) == 0);
+	REQUIRE(AstralDbStmtStep(Stmt) == 1);
+	REQUIRE(std::string(AstralDbStmtColumnText(Stmt, 0)) == "9");
+	AstralDbStmtReset(Stmt);
+	REQUIRE(AstralDbStmtStep(Stmt) == 1);
+	REQUIRE(std::string(AstralDbStmtColumnText(Stmt, 0)) == "9");
+	AstralDbStmtFinalize(Stmt);
+	AstralDbClose(Db);
+}
+
+TEST_CASE("ProcedureParser: runtime IF lowers branches") {
+	const char *Src = "CREATE PROCEDURE if_rt IS BEGIN "
+	                  "CREATE TABLE if_probe (v INT); "
+	                  "IF EXISTS (SELECT 1 FROM if_probe WHERE v = 1) THEN "
+	                  "INSERT INTO if_probe VALUES (2); "
+	                  "ELSE INSERT INTO if_probe VALUES (3); END IF; END;";
+	const auto R = AstralDB::SQL::ProcedureParser(Src).ParseDialectCreate();
+	REQUIRE(!R.Body_.Segments.empty());
+	REQUIRE(!R.Body_.Segments.back().IfBranches.empty());
+	REQUIRE(!AstralDB::SQL::EncodeProcedureControlJson(R.Body_).empty());
+}
+
+TEST_CASE("SQL: runtime IF procedure CALL executes chosen branch") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_proc_if_rt_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "if_rt.log").string(), false);
+	const char *ProcSrc = "CREATE OR REPLACE PROCEDURE if_rt() IS BEGIN "
+	                      "CREATE TABLE if_probe (v INT); "
+	                      "INSERT INTO if_probe VALUES (1); "
+	                      "IF EXISTS (SELECT 1 FROM if_probe WHERE v = 1) THEN INSERT INTO if_probe VALUES (9); "
+	                      "ELSE INSERT INTO if_probe VALUES (8); END IF; END;";
+	const auto Parsed = AstralDB::SQL::ProcedureParser(ProcSrc).ParseDialectCreate();
+	const auto Compiled =
+	    AstralDB::SQL::CompileProcedureBody(&Log, AstralDB::SQL::OptimizationLevel::None, nullptr, Parsed.Body_);
+	AstralDB::SQL::BytecodeInterpreter Interp(&Log);
+	Interp.DatabasePath(Dir / "astral.db");
+	REQUIRE_NOTHROW(Interp.Execute(Compiled.Instructions, &Compiled.StringPool));
+	const AstralDB::Database *Db = Interp.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	bool HasNine = false;
+	for(const auto &Row : Db->Tables_.at("if_probe").RowStore) {
+		if(Row.count("v") && Row.at("v") == "9")
+			HasNine = true;
+	}
+	REQUIRE(HasNine);
+}
+
+TEST_CASE("C API: bind placeholders and exec query callback") {
+	fs::path Dir = UniqueTempDir("astral_capi_bind_");
+	const fs::path DbPath = Dir / "astral_capi_bind.db";
+	AstralDb *Db = nullptr;
+	REQUIRE(AstralDbOpen(DbPath.string().c_str(), &Db) == 0);
+	REQUIRE(AstralDbExec(Db, "CREATE TABLE capi_bind (id INT, tag TEXT);") == 0);
+	REQUIRE(AstralDbExec(Db, "INSERT INTO capi_bind VALUES (1, 'a');") == 0);
+	REQUIRE(AstralDbExec(Db, "INSERT INTO capi_bind VALUES (2, 'b');") == 0);
+	struct Ctx {
+		int Rows = 0;
+		std::string LastTag;
+	};
+	Ctx State;
+	auto RowCb = +[](void *P, int Row, int Col, const char *Name, const char *Text) -> int {
+		auto *C = static_cast<Ctx *>(P);
+		(void)Row;
+		if(Name != nullptr && std::string(Name) == "tag" && Text != nullptr)
+			C->LastTag = Text;
+		if(Col == 1)
+			++C->Rows;
+		return 0;
+	};
+	REQUIRE(AstralDbExecQuery(Db, "SELECT id, tag FROM capi_bind WHERE id = 2;", RowCb, &State) == 0);
+	REQUIRE(State.Rows == 1);
+	REQUIRE(State.LastTag == "b");
+	AstralDbStmt *Stmt = nullptr;
+	REQUIRE(AstralDbPrepare(Db, "SELECT id, tag FROM capi_bind;", &Stmt) == 0);
+	REQUIRE(AstralDbStmtStep(Stmt) == 1);
+	REQUIRE(AstralDbStmtColumnCount(Stmt) == 2);
+	AstralDbStmtReset(Stmt);
+	REQUIRE(AstralDbStmtStep(Stmt) == 1);
+	AstralDbStmt *Bound = nullptr;
+	REQUIRE(AstralDbPrepare(Db, "SELECT tag FROM capi_bind WHERE id = ?;", &Bound) == 0);
+	REQUIRE(AstralDbBindInt64(Bound, 1, 2) == 0);
+	REQUIRE(AstralDbBindText(Bound, 1, "2") == 0);
+	AstralDbStmtFinalize(Bound);
+	AstralDbStmtFinalize(Stmt);
+	AstralDbClose(Db);
 }
 
 TEST_CASE("C API: prepare rejects non-SELECT SQL") {
 	fs::path Dir = UniqueTempDir("astral_capi_prepare_guard_");
 	const fs::path DbPath = Dir / "astral_capi_guard.db";
-	astraldb_t *Db = nullptr;
-	REQUIRE(astraldb_open(DbPath.string().c_str(), &Db) == 0);
+	AstralDb *Db = nullptr;
+	REQUIRE(AstralDbOpen(DbPath.string().c_str(), &Db) == 0);
 	REQUIRE(Db != nullptr);
-	REQUIRE(astraldb_exec(Db, "CREATE TABLE capi_guard (id INT);") == 0);
-	astraldb_stmt_t *Stmt = reinterpret_cast<astraldb_stmt_t *>(0x1);
-	REQUIRE(astraldb_prepare(Db, "INSERT INTO capi_guard VALUES (1);", &Stmt) == -1);
+	REQUIRE(AstralDbExec(Db, "CREATE TABLE capi_guard (id INT);") == 0);
+	AstralDbStmt *Stmt = reinterpret_cast<AstralDbStmt *>(0x1);
+	REQUIRE(AstralDbPrepare(Db, "INSERT INTO capi_guard VALUES (1);", &Stmt) == -1);
 	REQUIRE(Stmt == nullptr);
-	const char *Err = astraldb_last_error(Db);
+	const char *Err = AstralDbLastError(Db);
 	REQUIRE(Err != nullptr);
 	REQUIRE(std::string(Err).find("SELECT statements only") != std::string::npos);
-	astraldb_close(Db);
+	AstralDbClose(Db);
 }
 
 TEST_CASE("MathSci: signal FFT conv Laplacian autograd") {
@@ -3501,6 +3627,89 @@ TEST_CASE("MathSci: signal FFT conv Laplacian autograd") {
 	const auto Back = AstralDB::MathSciSignal::Idct2FromReal(Dct);
 	REQUIRE(Back.size() == 3);
 	REQUIRE(Back[1] == AstralTest::Approx(1.0).epsilon(0.05));
+}
+
+TEST_CASE("MathSci: DEQ_INTEGRATE fused and PREDICT cache") {
+	const auto Int = AstralDB::MathSci::EvalScalar(
+	    AstralDB::SQL::ScalarSqlFn::DeqIntegrate,
+	    {"RK4", "L[2]:1,0", "0.01", "100", "L[2]:0.1,0.2", "L[2]:0.1,0.2", "L[2]:0.1,0.2", "L[2]:0.1,0.2"});
+	REQUIRE(Int.has_value());
+	const auto Grid = AstralDB::MathSci::EvalScalar(AstralDB::SQL::ScalarSqlFn::DeqLinspace, {"0", "1", "5"});
+	REQUIRE(Grid.has_value());
+	const std::string Model =
+	    *AstralDB::MathSci::EvalScalar(AstralDB::SQL::ScalarSqlFn::MathSciModelBuild,
+	                                  {"L[2]:sigmoid,linear", "LW[2]:T[2,2]:1,0,0,1;T[1,2]:0.5,0.5"});
+	REQUIRE(Model.starts_with("MB1:"));
+	REQUIRE(AstralDB::MathSciModel::Deserialize(Model).has_value());
+	AstralDB::MathSciModel::CompiledCacheClear();
+	const auto P1 = AstralDB::MathSci::EvalScalar(AstralDB::SQL::ScalarSqlFn::Predict, {Model, "L[2]:1,0"});
+	const auto P2 = AstralDB::MathSci::EvalScalar(AstralDB::SQL::ScalarSqlFn::Predict, {Model, "L[2]:1,0"});
+	REQUIRE(P1.has_value());
+	REQUIRE(P2.has_value());
+}
+
+TEST_CASE("MathSci: model binary PREDICT and autograd MATVEC") {
+	REQUIRE(AstralDB::MathSci::LookupBuiltin("PREDICT").has_value());
+	REQUIRE(AstralDB::MathSci::LookupBuiltin("MATHSCI_MODEL_BUILD").has_value());
+	const std::string Weights =
+	    "LW[2]:T[2,2]:1,0,0,1;T[1,2]:0.5,0.5";
+	const auto Built = AstralDB::MathSci::EvalScalar(AstralDB::SQL::ScalarSqlFn::MathSciModelBuild,
+	                                                 {"L[2]:sigmoid,linear", Weights});
+	REQUIRE(Built.has_value());
+	REQUIRE(Built->rfind("MB1:", 0) == 0);
+	const auto Imported = AstralDB::MathSci::EvalScalar(AstralDB::SQL::ScalarSqlFn::MathSciModelImport, {*Built});
+	REQUIRE(Imported.has_value());
+	const auto Pred = AstralDB::MathSci::EvalScalar(AstralDB::SQL::ScalarSqlFn::Predict, {*Imported, "L[2]:1,0"});
+	REQUIRE(Pred.has_value());
+	REQUIRE(Pred->find("L[1]:") == 0);
+	const auto MvIn = AstralDB::MathSci::EvalScalar(AstralDB::SQL::ScalarSqlFn::AdGradMatVecIn,
+	                                                {"T[1,2]:0.5,0.5", "L[1]:1"});
+	REQUIRE(MvIn.has_value());
+	REQUIRE(MvIn->find("L[2]:") == 0);
+	const auto TanhGrad = AstralDB::MathSci::EvalScalar(AstralDB::SQL::ScalarSqlFn::AdGradTanh,
+	                                                    {"L[2]:0.5,0.6", "L[2]:1,1"});
+	REQUIRE(TanhGrad.has_value());
+	const auto MseGrad = AstralDB::MathSci::EvalScalar(AstralDB::SQL::ScalarSqlFn::AdGradMsePred,
+	                                                   {"L[2]:1,2", "L[2]:0,0"});
+	REQUIRE(MseGrad.has_value());
+	const auto Model = AstralDB::MathSciModel::Deserialize(*Built);
+	REQUIRE(Model.has_value());
+	REQUIRE(Model->Layers.size() == 2);
+}
+
+TEST_CASE("MathSci: MCTS and Bayesian inference") {
+	const auto Best = AstralDB::MathSci::EvalScalar(AstralDB::SQL::ScalarSqlFn::MctsSearch,
+	                                                {"L[4]:0.1,0.9,0.3,0.4", "L[4]:1,1,1,1", "100", "1.41"});
+	REQUIRE(Best.has_value());
+	REQUIRE(std::stoi(*Best) == 1);
+	const auto Beta = AstralDB::MathSci::EvalScalar(AstralDB::SQL::ScalarSqlFn::BayesBetaPost,
+	                                                {"1", "1", "3", "1"});
+	REQUIRE(Beta.has_value());
+	REQUIRE(Beta->find("L[2]:") == 0);
+	const auto Grid = AstralDB::MathSci::EvalScalar(AstralDB::SQL::ScalarSqlFn::BayesGridPost,
+	                                                {"L[2]:0,0", "L[2]:0,1"});
+	REQUIRE(Grid.has_value());
+	const auto Ev = AstralDB::MathSci::EvalScalar(AstralDB::SQL::ScalarSqlFn::BayesLogEvidence,
+	                                              {"L[2]:0,0", "L[2]:0,1"});
+	REQUIRE(Ev.has_value());
+}
+
+TEST_CASE("MathSci: neural macro Fokker-Planck step preserves mass") {
+	const std::string G = "L[8]:0.2,0.2,0.15,0.15,0.1,0.1,0.05,0.05";
+	const std::string Grid = "L[8]:0,0.5,1,1.5,2,2.5,3,3.5";
+	const std::string Drift = "L[8]:0,0,0,0,0,0,0,0";
+	const std::string Diff = "L[8]:0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1";
+	const std::string Neu = "L[8]:0,0,0,0,0,0,0,0";
+	const auto Out = AstralDB::MathSci::EvalScalar(AstralDB::SQL::ScalarSqlFn::NfpMacroStep,
+	                                             {G, Grid, Drift, Diff, Neu, "1", "1", "0", "0.01"});
+	REQUIRE(Out.has_value());
+	const auto Mom0 = AstralDB::MathSci::EvalScalar(AstralDB::SQL::ScalarSqlFn::NfpMacroMoments, {G, Grid});
+	REQUIRE(Mom0.has_value());
+	const auto Marched = AstralDB::MathSci::EvalScalar(AstralDB::SQL::ScalarSqlFn::NfpMacroMarch,
+	                                                   {G, Grid, Drift, Diff, Neu, "1", "1", "0", "0.01", "4"});
+	REQUIRE(Marched.has_value());
+	const auto Mom1 = AstralDB::MathSci::EvalScalar(AstralDB::SQL::ScalarSqlFn::NfpMacroMoments, {*Marched, Grid});
+	REQUIRE(Mom1.has_value());
 }
 
 TEST_CASE("GeoSpatial: point parse distance and bbox") {

@@ -137,6 +137,40 @@ def validate_cluster_config(config: Dict[str, Any], policy: Optional[SecurityPol
     if consensus is not None and not isinstance(consensus, dict):
         raise ConfigError("consensus must be an object")
 
+    fdw = root.get("fdw")
+    if fdw is not None and not isinstance(fdw, dict):
+        raise ConfigError("fdw must be an object")
+    htap = root.get("htap")
+    if htap is not None and not isinstance(htap, dict):
+        raise ConfigError("htap must be an object")
+    pitr = root.get("pitr")
+    if pitr is not None and not isinstance(pitr, dict):
+        raise ConfigError("pitr must be an object")
+    upgrades = root.get("upgrades")
+    if upgrades is not None and not isinstance(upgrades, dict):
+        raise ConfigError("upgrades must be an object")
+    cdc = root.get("cdc")
+    if cdc is not None and not isinstance(cdc, dict):
+        raise ConfigError("cdc must be an object")
+    serverless = root.get("serverless")
+    if serverless is not None and not isinstance(serverless, dict):
+        raise ConfigError("serverless must be an object")
+    split_merge = root.get("split_merge")
+    if split_merge is not None and not isinstance(split_merge, dict):
+        raise ConfigError("split_merge must be an object")
+    edge = root.get("edge")
+    if edge is not None and not isinstance(edge, dict):
+        raise ConfigError("edge must be an object")
+    distributed_join = root.get("distributed_join")
+    if distributed_join is not None and not isinstance(distributed_join, dict):
+        raise ConfigError("distributed_join must be an object")
+    gsi = root.get("gsi")
+    if gsi is not None and not isinstance(gsi, dict):
+        raise ConfigError("gsi must be an object")
+    matview = root.get("matview")
+    if matview is not None and not isinstance(matview, dict):
+        raise ConfigError("matview must be an object")
+
 
 def normalize_cluster_config(
     config: Dict[str, Any],
@@ -377,7 +411,67 @@ def default_cluster_template(shard_count: int = 3) -> Dict[str, Any]:
         "security": {
             "max_sql_bytes": 524288,
             "require_gateway_auth": False,
+            "gateway_allow_query_api_key": False,
+            "gateway_keys_file": ".quasar/gateway_keys.json",
             "redact_secrets_in_errors": True,
             "allow_path_outside_config_root": False,
+        },
+        "fdw": {
+            "enabled": True,
+            "timeout_sec": 2.0,
+            "allowed_source_types": ["http_json"],
+        },
+        "htap": {
+            "enabled": True,
+            "oltp_queue_soft_limit": 0.9,
+            "olap_queue_soft_limit": 0.6,
+            "prefer_immediate_for_oltp": True,
+        },
+        "pitr": {
+            "enabled": True,
+            "timeline_id": "main",
+            "archive_dir": ".quasar/pitr/archive",
+        },
+        "upgrades": {
+            "enabled": True,
+            "canary_shards": 1,
+            "max_unhealthy_shards": 0,
+        },
+        "cdc": {
+            "enabled": True,
+            "timeline_id": "main",
+            "checkpoint_file": ".quasar/cdc/checkpoints.json",
+            "sink_file": ".quasar/cdc/events.jsonl",
+            "dlq_file": ".quasar/cdc/dlq.jsonl",
+        },
+        "serverless": {
+            "enabled": True,
+            "state_file": ".quasar/serverless/lease.json",
+            "idle_sec": 30,
+        },
+        "split_merge": {
+            "enabled": True,
+            "journal_file": ".quasar/split_merge/journal.json",
+        },
+        "edge": {
+            "enabled": True,
+            "registry_file": ".quasar/edge/registry.json",
+        },
+        "distributed_join": {
+            "enabled": True,
+            "broadcast_threshold": 5000,
+        },
+        "gsi": {
+            "enabled": True,
+            "state_file": ".quasar/gsi/indexes.json",
+        },
+        "matview": {
+            "enabled": True,
+            "state_file": ".quasar/matview/catalog.json",
+            "default_interval_sec": 60,
+            "max_failures": 5,
+            "circuit_cooldown_sec": 30,
+            "mutation_debounce_sec": 2,
+            "on_mutation_enabled": True,
         },
     }

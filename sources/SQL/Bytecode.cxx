@@ -108,6 +108,22 @@ static size_t ResolveRowsFrameLocalIndex(WindowFrameBoundKind Kind, int64_t Off,
 	return LocalIdx < PartSize ? LocalIdx : PartSize - 1;
 }
 
+static void ApplyDefaultWindowFrame(int OrdKind, WindowFrameBound &FrameStart, WindowFrameBound &FrameEnd) {
+	FrameStart = {WindowFrameBoundKind::UnboundedPreceding, 0};
+	FrameEnd = {WindowFrameBoundKind::CurrentRow, 0};
+	if(OrdKind == static_cast<int>(WindowFnKind::LastValue)) {
+		FrameStart = {WindowFrameBoundKind::CurrentRow, 0};
+		FrameEnd = {WindowFrameBoundKind::UnboundedFollowing, 0};
+	}
+}
+
+static std::string FormatUtcTimestamp(int64_t Epoch) {
+	std::string Out = TimeSeries::FormatEpochSeconds(Epoch);
+	if(!Out.empty())
+		Out.push_back('Z');
+	return Out;
+}
+
 static std::optional<double> TryParseWindowNumeric(const std::string &Cell) {
 	if(Cell.empty())
 		return std::nullopt;
@@ -119,6 +135,23 @@ static std::optional<double> TryParseWindowNumeric(const std::string &Cell) {
 	} catch(...) {
 	}
 	return std::nullopt;
+}
+
+static int CompareWindowOrderCells(const std::string &A, const std::string &B, bool Ascending) {
+	if(const auto Na = TryParseWindowNumeric(A)) {
+		if(const auto Nb = TryParseWindowNumeric(B)) {
+			if(*Na < *Nb)
+				return Ascending ? -1 : 1;
+			if(*Na > *Nb)
+				return Ascending ? 1 : -1;
+			return 0;
+		}
+	}
+	if(A < B)
+		return Ascending ? -1 : 1;
+	if(A > B)
+		return Ascending ? 1 : -1;
+	return 0;
 }
 
 static std::optional<int64_t> ParseTimezoneOffsetMinutes(const std::string &S) {
@@ -1178,7 +1211,7 @@ static std::optional<std::string> EvalScalarSqlFn(ScalarSqlFn Fn, const std::vec
 		const auto OffMin = ParseTimezoneOffsetMinutes(Cells[1]);
 		if(!Ep || !OffMin)
 			return std::nullopt;
-		return TimeSeries::FormatEpochSeconds(*Ep + (*OffMin * 60));
+		return FormatUtcTimestamp(*Ep + (*OffMin * 60));
 	}
 	case ScalarSqlFn::ConvertTimezone: {
 		if(Cells.size() != 3)
@@ -1189,7 +1222,7 @@ static std::optional<std::string> EvalScalarSqlFn(ScalarSqlFn Fn, const std::vec
 		if(!Ep || !FromMin || !ToMin)
 			return std::nullopt;
 		const int64_t Shift = (*ToMin - *FromMin) * 60;
-		return TimeSeries::FormatEpochSeconds(*Ep + Shift);
+		return FormatUtcTimestamp(*Ep + Shift);
 	}
 	case ScalarSqlFn::Grouping: {
 		if(Cells.size() != 1 || Cells[0].empty())
@@ -2824,16 +2857,20 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
 					OrReplace = *F;
 			std::string SourceDialect;
 			std::string ExceptionHandlersJson;
+			std::string ControlFlowJson;
 			if(inst.Operands.size() > 4)
 				if(const auto *D = std::get_if<std::string>(&inst.Operands[4]))
 					SourceDialect = *D;
 			if(inst.Operands.size() > 5)
 				if(const auto *J = std::get_if<std::string>(&inst.Operands[5]))
 					ExceptionHandlersJson = *J;
+			if(inst.Operands.size() > 6)
+				if(const auto *C = std::get_if<std::string>(&inst.Operands[6]))
+					ControlFlowJson = *C;
 			if(Databases_.empty())
 				Databases_.push_back(std::make_unique<Database>(DatabasePath_, Logger_));
 			Databases_[0]->DefineProcedure(*Pn, *Body, IfNotExists != 0, OrReplace != 0, std::move(SourceDialect),
-			                               std::move(ExceptionHandlersJson));
+			                               std::move(ExceptionHandlersJson), std::move(ControlFlowJson));
 			++Ic;
 			break;
 		}
@@ -4494,7 +4531,8 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                     FrameStart.Offset = *So;
                     FrameEnd.Kind = static_cast<WindowFrameBoundKind>(*Ek);
                     FrameEnd.Offset = *Eo;
-                }
+                } else
+                    ApplyDefaultWindowFrame(OrdKind, FrameStart, FrameEnd);
             } else if(inst.Operands.size() == NP + size_t{5}) {
                 const auto *Ok = std::get_if<int64_t>(&inst.Operands[NP + 4]);
                 if(!Ok || *Ok < 0 || *Ok > 2)
@@ -4552,7 +4590,7 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                     return Ascending;
                 if(Ib == B.end())
                     return !Ascending;
-                return Ascending ? Ia->second < Ib->second : Ia->second > Ib->second;
+                return CompareWindowOrderCells(Ia->second, Ib->second, Ascending) < 0;
             };
             const auto PartTripleCmp = [&](const Database::Item &A, const Database::Item &B) -> int {
                 for(const auto &Cn : PartCols) {
@@ -4560,8 +4598,9 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                     const auto Ib = B.find(Cn);
                     const std::string Va = Ia == A.end() ? "" : Ia->second;
                     const std::string Vb = Ib == B.end() ? "" : Ib->second;
-                    if(Va != Vb)
-                        return Va < Vb ? -1 : 1;
+                    const int C = CompareWindowOrderCells(Va, Vb, true);
+                    if(C != 0)
+                        return C;
                 }
                 return 0;
             };
@@ -4819,7 +4858,8 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                     HavePrevOrd = true;
                 }
             }
-            (void)FrameMode;
+            WinSlot.RecordWrite();
+            WinSlot.SyncColumnarAfterRowMutation();
             });
             PushOwningStringHeap(new std::string(WinTable));
             ++Ic;
@@ -6458,6 +6498,30 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
 			if(!ProcTryStack_.empty() && ProcTryStack_.back().Savepoint == *SavepointName)
 				ProcTryStack_.pop_back();
 			Ic = static_cast<uintptr_t>(*EndIp);
+			break;
+		}
+		case Opcode::PROC_JUMP_IF_TABLE_EMPTY: {
+			if(inst.Operands.size() < 2)
+				FailVm("PROC_JUMP_IF_TABLE_EMPTY requires table name and jump IP");
+			const auto *TableName = std::get_if<std::string>(&inst.Operands[0]);
+			const auto *Target = std::get_if<int64_t>(&inst.Operands[1]);
+			if(!TableName || !Target)
+				FailVm("PROC_JUMP_IF_TABLE_EMPTY expects string table and int64 IP");
+			if(*Target < 0 || static_cast<std::size_t>(*Target) >= Code.size())
+				FailVm("PROC_JUMP_IF_TABLE_EMPTY target out of range");
+			bool Empty = true;
+			if(Databases_.empty())
+				Databases_.push_back(std::make_unique<Database>(DatabasePath_, Logger_));
+			Databases_[0]->WithExclusiveBytecodeLock([&]() {
+				const auto It = Databases_[0]->Tables_.find(*TableName);
+				Empty = It == Databases_[0]->Tables_.end() || It->second.RowStore.empty();
+				if(It != Databases_[0]->Tables_.end())
+					Databases_[0]->Tables_.erase(It);
+			});
+			if(Empty)
+				Ic = static_cast<uintptr_t>(*Target);
+			else
+				++Ic;
 			break;
 		}
         case Opcode::SAVEPOINT: {

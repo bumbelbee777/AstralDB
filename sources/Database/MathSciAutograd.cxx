@@ -100,6 +100,16 @@ std::vector<float> AdHessianSquareDiagF32(const float *X, const float *Upstream,
 	return Out;
 }
 
+std::vector<float> AdHessianTanhDiagF32(const float *Y, const float *Upstream, size_t N) {
+	std::vector<float> Out(N);
+	for(size_t I = 0; I < N; ++I) {
+		const float Yi = Y[I];
+		const float Dp = 1.f - Yi * Yi;
+		Out[I] = Upstream[I] * (-2.f * Yi * Dp);
+	}
+	return Out;
+}
+
 ComplexSeq WirtingerDzFromCartesianF32(const ComplexSeq &CartesianGrad) {
 	const size_t N = CartesianGrad.Slots();
 	ComplexSeq Out;
@@ -219,6 +229,12 @@ std::vector<double> AdHessianSquareFromReal(const std::vector<double> &X, const 
 	if(X.size() != Upstream.size() || X.empty() || X.size() > MaxAutogradLen)
 		return {};
 	return ToF64(AdHessianSquareDiagF32(ToF32(X).data(), ToF32(Upstream).data(), X.size()));
+}
+
+std::vector<double> AdHessianTanhFromReal(const std::vector<double> &Y, const std::vector<double> &Upstream) {
+	if(Y.size() != Upstream.size() || Y.empty() || Y.size() > MaxAutogradLen)
+		return {};
+	return ToF64(AdHessianTanhDiagF32(ToF32(Y).data(), ToF32(Upstream).data(), Y.size()));
 }
 
 std::optional<std::vector<double>> AdWirtingerMulLhsFromCells(std::string_view A, std::string_view B,

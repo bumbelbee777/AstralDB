@@ -41,7 +41,19 @@ SELECT
 	FFT('L[4]:1,0,1,0') AS spectrum,
 	CONV_FULL('L[3]:1,2,3', 'L[2]:1,1') AS conv_full,
 	LAPLACIAN('L[4]:0,1,2,3') AS lap,
-	AD_CHAIN('L[2]:0.5,0.5', 'L[2]:2,4') AS chain_grad
+	AD_CHAIN('L[2]:0.5,0.5', 'L[2]:2,4') AS chain_grad,
+	AD_GRAD_MATVEC_IN('T[2,2]:1,0,0,1', 'L[2]:1,1') AS matvec_grad_in,
+	AD_GRAD_MSE_PRED('L[2]:1,2', 'L[2]:0,0') AS mse_grad_pred,
+	PINN_FD_CENTRAL('0.6', '0.4', '0.1') AS fd_central
+FROM lab;
+
+-- MLP model binary + PREDICT (see docs/MathSciModel.md).
+SELECT
+	MATHSCI_MODEL_BUILD('L[2]:sigmoid,linear', 'LW[2]:T[2,2]:1,0,0,1;T[1,2]:1,1') AS mlp_blob,
+	PREDICT(
+		MATHSCI_MODEL_BUILD('L[2]:sigmoid,linear', 'LW[2]:T[2,2]:1,0,0,1;T[1,2]:1,1'),
+		'L[2]:0.5,0.5'
+	) AS mlp_out
 FROM lab;
 
 -- Hessian, Wirtinger AD, and ODE/SDE/PDE steppers (see docs/MathSciAutograd.md, docs/MathSciSolves.md).

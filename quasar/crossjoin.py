@@ -127,12 +127,10 @@ class QuasarCrossShardJoin:
                 all_rows.append(tagged)
         return all_rows
 
-    def execute(self, spec: CrossJoinSpec) -> List[Dict[str, Any]]:
-        work = Path(tempfile.mkdtemp(prefix="quasar_xjoin_"))
-        datasets: Dict[str, List[Dict[str, Any]]] = {}
-        for table in spec.tables:
-            datasets[table.alias] = self._fetch_table_rows(table, work_dir=work)
+    def _work_dir(self) -> Path:
+        return Path(tempfile.mkdtemp(prefix="quasar_xjoin_"))
 
+    def _join_datasets(self, datasets: Dict[str, List[Dict[str, Any]]], spec: CrossJoinSpec) -> List[Dict[str, Any]]:
         if not spec.joins:
             out = datasets[spec.tables[0].alias]
             if spec.limit:
@@ -162,6 +160,13 @@ class QuasarCrossShardJoin:
         if spec.limit:
             result = result[: spec.limit]
         return result
+
+    def execute(self, spec: CrossJoinSpec) -> List[Dict[str, Any]]:
+        work = self._work_dir()
+        datasets: Dict[str, List[Dict[str, Any]]] = {}
+        for table in spec.tables:
+            datasets[table.alias] = self._fetch_table_rows(table, work_dir=work)
+        return self._join_datasets(datasets, spec)
 
 
 def _infer_table_from_sql(sql: str) -> Optional[str]:

@@ -97,6 +97,8 @@ enum class Opcode : uint8_t {
 	PROC_TRY,
 	/** End try: savepoint name, end IP (release savepoint and jump past handlers). */
 	PROC_END_TRY,
+	/** Procedure branch: table name, jump IP if the table is missing or has zero rows. */
+	PROC_JUMP_IF_TABLE_EMPTY,
 
 	/** Operands: name, table, timing, event, for_each_row, action_kind, procedure, body_sql, if_not_exists, or_replace. */
 	CREATE_TRIGGER,
@@ -243,6 +245,7 @@ struct Instruction {
 			case Opcode::CALL_PROCEDURE:
 			case Opcode::PROC_TRY:
 			case Opcode::PROC_END_TRY:
+			case Opcode::PROC_JUMP_IF_TABLE_EMPTY:
             case Opcode::INSERT:
 			case Opcode::INSERT_BULK:
 			case Opcode::REGISTER_DATASET:

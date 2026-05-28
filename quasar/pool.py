@@ -33,6 +33,9 @@ class PoolConfig:
     read_lane_immediate: bool = True
     per_db_max_inflight: int = 2
     keepalive_interval_sec: float = 0.0
+    overload_soft_limit_ratio: float = 0.75
+    overload_hard_limit_ratio: float = 0.95
+    overload_mode: str = "fail_fast"
 
     @classmethod
     def from_dict(cls, raw: Dict) -> "PoolConfig":
@@ -94,6 +97,15 @@ class PooledAstralDBClient(AstralDBClient):
             "rejected_queue_full": 0,
             "batch_rollbacks": 0,
             "keepalive_pings": 0,
+            "shed_soft_limit": 0,
+            "shed_hard_limit": 0,
+        }
+        self._timings: Dict[str, float] = {
+            "queue_wait_ms_total": 0.0,
+            "queue_wait_ms_max": 0.0,
+            "queue_wait_samples": 0.0,
+            "batch_elapsed_ms_total": 0.0,
+            "batch_elapsed_ms_max": 0.0,
         }
 
     def _db_semaphore(self, database: Path) -> threading.Semaphore:
@@ -196,6 +208,7 @@ class PooledAstralDBClient(AstralDBClient):
             database = items[0].database
             statements = [it.sql for it in items]
             with self._with_db_slot(database):
+                batch_start = time.perf_counter()
 
                 def _run_once() -> QueryResult:
                     if self.pool_config.combine_transactions and len(statements) > 1:
@@ -218,6 +231,11 @@ class PooledAstralDBClient(AstralDBClient):
                     result = execute_with_retry(_run_once, self.retry_policy, stats=self.retry_stats)
                 else:
                     result = _run_once()
+                batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
+                self._timings["batch_elapsed_ms_total"] += batch_elapsed_ms
+                self._timings["batch_elapsed_ms_max"] = max(
+                    self._timings["batch_elapsed_ms_max"], batch_elapsed_ms
+                )
 
             self.stats["batches_executed"] += 1
             self.stats["statements_batched"] += len(items)
@@ -228,6 +246,10 @@ class PooledAstralDBClient(AstralDBClient):
                 self.stats["batch_rollbacks"] += 1
 
             for it in items:
+                queue_wait_ms = max(0.0, (time.perf_counter() - it.submitted_at) * 1000.0)
+                self._timings["queue_wait_ms_total"] += queue_wait_ms
+                self._timings["queue_wait_ms_max"] = max(self._timings["queue_wait_ms_max"], queue_wait_ms)
+                self._timings["queue_wait_samples"] += 1.0
                 individual = QueryResult(
                     stdout=result.stdout,
                     stderr=result.stderr,
@@ -320,6 +342,19 @@ class PooledAstralDBClient(AstralDBClient):
             submitted_at=time.perf_counter(),
             is_write=True,
         )
+        queue_depth = self._pending.qsize()
+        hard_limit = int(self.pool_config.max_queue * self.pool_config.overload_hard_limit_ratio)
+        soft_limit = int(self.pool_config.max_queue * self.pool_config.overload_soft_limit_ratio)
+        if queue_depth >= hard_limit:
+            self.stats["shed_hard_limit"] += 1
+            raise QuasarOverloadError("hard overload limit reached; shedding requests")
+        if (
+            queue_depth >= soft_limit
+            and self.pool_config.overload_mode == "fail_fast"
+            and not pending.is_write
+        ):
+            self.stats["shed_soft_limit"] += 1
+            raise QuasarOverloadError("soft overload limit reached; read request shed")
 
         def _enqueue() -> None:
             self._pending.put_nowait(pending)
@@ -361,6 +396,14 @@ class PooledAstralDBClient(AstralDBClient):
 
     def pool_stats(self) -> Dict[str, float]:
         out = {k: float(v) for k, v in self.stats.items()}
+        samples = max(1.0, self._timings["queue_wait_samples"])
+        out["queue_wait_ms_mean"] = self._timings["queue_wait_ms_total"] / samples
+        out["queue_wait_ms_max"] = self._timings["queue_wait_ms_max"]
+        out["batch_elapsed_ms_mean"] = self._timings["batch_elapsed_ms_total"] / max(
+            1.0, out.get("batches_executed", 0.0)
+        )
+        out["batch_elapsed_ms_max"] = self._timings["batch_elapsed_ms_max"]
+        out["queue_depth"] = float(self._pending.qsize())
         out.update({f"retry_{k}": v for k, v in self.retry_stats.to_dict().items()})
         return out
 

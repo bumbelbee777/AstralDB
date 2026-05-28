@@ -467,7 +467,7 @@ public:
 	std::unordered_map<std::string, std::string> ProcedureDefinitionsSnapshot() const;
 	void DefineProcedure(const std::string &ProcedureName, std::string SqlBody, bool IfNotExists = false,
 	                    bool OrReplace = false, std::string SourceDialect = {},
-	                    std::string ExceptionHandlersJson = {});
+	                    std::string ExceptionHandlersJson = {}, std::string ControlFlowJson = {});
 	void DropProcedureDefinition(const std::string &ProcedureName, bool IfExists = false);
 	void ReplayWalDefineProcedure(const std::string &ProcedureName, std::string SqlBody);
 	void ReplayWalDropProcedure(const std::string &ProcedureName);

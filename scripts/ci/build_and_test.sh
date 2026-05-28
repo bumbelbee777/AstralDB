@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local or CI helper: CMake Release build + ctest (same layout as .github/workflows/ci.yml).
+# Local helper: CMake Release build + full ctest (CI uses `ctest -L fast`; see docs/RELEASING.md).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

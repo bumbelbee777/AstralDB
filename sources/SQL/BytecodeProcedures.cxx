@@ -8,6 +8,7 @@
 #include <cctype>
 #include <fstream>
 #include <functional>
+#include <functional>
 #include <sstream>
 #include <stdexcept>
 
@@ -149,11 +150,216 @@ void AppendBytecodeSansHalt(Bytecode &Dest, const Bytecode &Src) {
 	}
 }
 
+void AppendCompiledBytecode(Bytecode &Dest, std::vector<std::string> &DestPool, const CompiledBytecode &Chunk) {
+	const std::size_t PoolBase = DestPool.size();
+	DestPool.insert(DestPool.end(), Chunk.StringPool.begin(), Chunk.StringPool.end());
+	for(const Instruction &Inst : Chunk.Instructions) {
+		if(Inst.Opcode_ == Opcode::HALT)
+			continue;
+		Instruction Copy = Inst;
+		if(Copy.Opcode_ == Opcode::PUSH_POOL && !Copy.Operands.empty()) {
+			if(auto *Idx = std::get_if<int64_t>(&Copy.Operands[0]))
+				*Idx += static_cast<int64_t>(PoolBase);
+		}
+		Dest.push_back(std::move(Copy));
+	}
+}
+
 CompiledBytecode CompileSqlChunk(Logger *Logger, OptimizationLevel OptLevel, const Database *CatalogDb,
                                 std::string_view Sql) {
 	Parser P(Sql);
 	(void)P;
 	return BuildCompiledBytecode(Logger, OptLevel, CatalogDb);
+}
+
+std::string FindProbeTableName(const Bytecode &Bc) {
+	std::string Last;
+	for(const Instruction &Inst : Bc) {
+		if(Inst.Opcode_ == Opcode::CLONE_TABLE && !Inst.Operands.empty())
+			if(const auto *Dest = std::get_if<std::string>(&Inst.Operands[0]))
+				Last = *Dest;
+	}
+	return Last;
+}
+
+std::size_t CountSansHalt(const Bytecode &Bc) {
+	std::size_t N = 0;
+	for(const Instruction &Inst : Bc)
+		if(Inst.Opcode_ != Opcode::HALT)
+			++N;
+	return N;
+}
+
+CompiledBytecode CompileLoweredSegments(Logger *Logger, OptimizationLevel OptLevel, const Database *CatalogDb,
+                                        const std::vector<ProcedureControlSegment> &Segments, std::size_t &ProbeSeq);
+
+CompiledBytecode CompileIfBranchChain(Logger *Logger, OptimizationLevel OptLevel, const Database *CatalogDb,
+                                      const std::vector<ProcedureIfBranch> &Branches, std::size_t &ProbeSeq,
+                                      std::size_t CodeBaseIp) {
+	if(Branches.empty())
+		return {};
+	std::vector<CompiledBytecode> CondCompiled;
+	std::vector<CompiledBytecode> BodyCompiled;
+	std::vector<std::string> ProbeTables;
+	CondCompiled.reserve(Branches.size());
+	BodyCompiled.reserve(Branches.size());
+	ProbeTables.reserve(Branches.size());
+	for(const ProcedureIfBranch &Br : Branches) {
+		if(Br.ConditionSql.empty()) {
+			CondCompiled.push_back({});
+			ProbeTables.emplace_back();
+		} else {
+			std::string Fold = Br.ConditionSql;
+			for(char &Ch : Fold)
+				Ch = static_cast<char>(std::toupper(static_cast<unsigned char>(Ch)));
+			std::string Sql;
+			if(Fold == "TRUE" || Fold == "1" || Fold == "1=1")
+				Sql = "SELECT 1 AS __proc_if_hit FROM DUAL;";
+			else {
+				Sql = "SELECT 1 AS __proc_if_hit FROM DUAL WHERE (";
+				Sql += Br.ConditionSql;
+				Sql += ");";
+			}
+			CondCompiled.push_back(CompileSqlChunk(Logger, OptLevel, CatalogDb, Sql));
+			ProbeTables.push_back(FindProbeTableName(CondCompiled.back().Instructions));
+		}
+		BodyCompiled.push_back(CompileLoweredSegments(Logger, OptLevel, CatalogDb, Br.Segments, ProbeSeq));
+	}
+	std::vector<std::size_t> CondSizes;
+	std::vector<std::size_t> BodySizes;
+	CondSizes.reserve(Branches.size());
+	BodySizes.reserve(Branches.size());
+	for(std::size_t I = 0; I < Branches.size(); ++I) {
+		CondSizes.push_back(Branches[I].ConditionSql.empty() ? 0 : CountSansHalt(CondCompiled[I].Instructions));
+		BodySizes.push_back(CountSansHalt(BodyCompiled[I].Instructions));
+	}
+	auto BlockSize = [&](std::size_t I) -> std::size_t {
+		std::size_t S = BodySizes[I];
+		if(!Branches[I].ConditionSql.empty()) {
+			S += CondSizes[I];
+			if(!ProbeTables[I].empty())
+				++S;
+		}
+		if(I + 1 < Branches.size())
+			++S;
+		return S;
+	};
+	std::vector<std::size_t> BlockStart(Branches.size());
+	std::size_t Cursor = 0;
+	for(std::size_t I = 0; I < Branches.size(); ++I) {
+		BlockStart[I] = Cursor;
+		Cursor += BlockSize(I);
+	}
+	const std::size_t EndIp = CodeBaseIp + Cursor;
+	std::vector<std::size_t> FalseJumpIps(Branches.size(), EndIp);
+	for(std::size_t I = 0; I < Branches.size(); ++I) {
+		if(Branches[I].ConditionSql.empty())
+			continue;
+		for(std::size_t J = I + 1; J < Branches.size(); ++J) {
+			FalseJumpIps[I] = CodeBaseIp + BlockStart[J];
+			if(!Branches[J].ConditionSql.empty() || J + 1 == Branches.size())
+				break;
+		}
+	}
+	Bytecode Out;
+	std::vector<std::string> Pool;
+	for(std::size_t I = 0; I < Branches.size(); ++I) {
+		if(!Branches[I].ConditionSql.empty()) {
+			AppendCompiledBytecode(Out, Pool, CondCompiled[I]);
+			if(!ProbeTables[I].empty()) {
+				Instruction Jump;
+				Jump.Opcode_ = Opcode::PROC_JUMP_IF_TABLE_EMPTY;
+				Jump.Operands.push_back(ProbeTables[I]);
+				Jump.Operands.push_back(static_cast<int64_t>(FalseJumpIps[I]));
+				Out.push_back(Jump);
+			}
+		}
+		AppendCompiledBytecode(Out, Pool, BodyCompiled[I]);
+		if(I + 1 < Branches.size()) {
+			Instruction Jmp;
+			Jmp.Opcode_ = Opcode::JMP;
+			Jmp.Operands.push_back(static_cast<int64_t>(EndIp));
+			Out.push_back(Jmp);
+		}
+	}
+	CompiledBytecode Result;
+	Result.Instructions = std::move(Out);
+	Result.StringPool = std::move(Pool);
+	return Result;
+}
+
+CompiledBytecode CompileLoweredSegments(Logger *Logger, OptimizationLevel OptLevel, const Database *CatalogDb,
+                                        const std::vector<ProcedureControlSegment> &Segments, std::size_t &ProbeSeq) {
+	(void)ProbeSeq;
+	Bytecode Out;
+	std::vector<std::string> Pool;
+	for(const ProcedureControlSegment &Seg : Segments) {
+		if(!Seg.LinearSql.empty())
+			AppendCompiledBytecode(Out, Pool, CompileSqlChunk(Logger, OptLevel, CatalogDb, Seg.LinearSql));
+		if(!Seg.IfBranches.empty())
+			AppendCompiledBytecode(Out, Pool,
+			                       CompileIfBranchChain(Logger, OptLevel, CatalogDb, Seg.IfBranches, ProbeSeq, Out.size()));
+	}
+	CompiledBytecode Result;
+	Result.Instructions = std::move(Out);
+	Result.StringPool = std::move(Pool);
+	return Result;
+}
+
+CompiledBytecode WrapProcedureExceptions(Logger *Logger, OptimizationLevel OptLevel, const Database *CatalogDb,
+                                         const CompiledBytecode &Core,
+                                         const std::vector<ProcedureExceptionWhen> &ExceptionHandlers) {
+	std::vector<CompiledBytecode> HandlerCompiled;
+	HandlerCompiled.reserve(ExceptionHandlers.size());
+	for(const auto &H : ExceptionHandlers)
+		HandlerCompiled.push_back(CompileSqlChunk(Logger, OptLevel, CatalogDb, H.HandlerSql));
+	const std::size_t TryCount = CountSansHalt(Core.Instructions);
+	std::vector<std::size_t> HandlerSizes;
+	HandlerSizes.reserve(HandlerCompiled.size());
+	for(const auto &Hc : HandlerCompiled)
+		HandlerSizes.push_back(CountSansHalt(Hc.Instructions));
+	const std::size_t Handler0Ip = 1 + TryCount + 1;
+	std::size_t ExCursor = Handler0Ip;
+	std::vector<std::size_t> HandlerIps;
+	for(std::size_t Hi = 0; Hi < HandlerSizes.size(); ++Hi) {
+		HandlerIps.push_back(ExCursor);
+		ExCursor += HandlerSizes[Hi];
+		if(Hi + 1 < HandlerSizes.size())
+			++ExCursor;
+	}
+	const std::size_t EndIp = ExCursor + 1;
+	const std::string Savepoint = "__astr_proc_ex";
+	Bytecode Out;
+	Instruction TryOp;
+	TryOp.Opcode_ = Opcode::PROC_TRY;
+	TryOp.Operands.push_back(Savepoint);
+	TryOp.Operands.push_back(static_cast<int64_t>(EndIp));
+	for(std::size_t Hi = 0; Hi < HandlerIps.size(); ++Hi) {
+		TryOp.Operands.push_back(static_cast<int64_t>(HandlerIps[Hi]));
+		TryOp.Operands.push_back(ExceptionHandlers[Hi].Condition);
+	}
+	Out.push_back(TryOp);
+	std::vector<std::string> Pool = Core.StringPool;
+	AppendBytecodeSansHalt(Out, Core.Instructions);
+	Instruction EndTry;
+	EndTry.Opcode_ = Opcode::PROC_END_TRY;
+	EndTry.Operands.push_back(Savepoint);
+	EndTry.Operands.push_back(static_cast<int64_t>(EndIp));
+	Out.push_back(EndTry);
+	for(std::size_t Hi = 0; Hi < HandlerCompiled.size(); ++Hi) {
+		AppendCompiledBytecode(Out, Pool, HandlerCompiled[Hi]);
+		if(Hi + 1 < HandlerCompiled.size()) {
+			Instruction Jmp;
+			Jmp.Opcode_ = Opcode::JMP;
+			Jmp.Operands.push_back(static_cast<int64_t>(EndIp));
+			Out.push_back(Jmp);
+		}
+	}
+	Out.push_back(Instruction{Opcode::HALT, {}});
+	CompiledBytecode Result;
+	Result.Instructions = std::move(Out);
+	Result.StringPool = std::move(Pool);
+	return Result;
 }
 
 } // namespace
@@ -182,68 +388,117 @@ ProcedureBytecodeMeta AnalyzeProcedureBytecode(const Bytecode &Code) {
 }
 
 CompiledBytecode CompileProcedureBody(Logger *Logger, OptimizationLevel OptLevel, const Database *CatalogDb,
+                                      const LoweredProcedureBody &Body) {
+	std::size_t ProbeSeq = 0;
+	CompiledBytecode Core = CompileLoweredSegments(Logger, OptLevel, CatalogDb, Body.Segments, ProbeSeq);
+	if(!Core.Instructions.empty() && Core.Instructions.back().Opcode_ != Opcode::HALT)
+		Core.Instructions.push_back(Instruction{Opcode::HALT, {}});
+	if(Body.ExceptionHandlers.empty())
+		return Core;
+	return WrapProcedureExceptions(Logger, OptLevel, CatalogDb, Core, Body.ExceptionHandlers);
+}
+
+CompiledBytecode CompileProcedureBody(Logger *Logger, OptimizationLevel OptLevel, const Database *CatalogDb,
                                       std::string_view BodySql,
                                       const std::vector<ProcedureExceptionWhen> &ExceptionHandlers) {
-	if(ExceptionHandlers.empty())
-		return CompileSqlChunk(Logger, OptLevel, CatalogDb, BodySql);
-	const CompiledBytecode TryCompiled = CompileSqlChunk(Logger, OptLevel, CatalogDb, BodySql);
-	std::vector<CompiledBytecode> HandlerCompiled;
-	HandlerCompiled.reserve(ExceptionHandlers.size());
-	for(const auto &H : ExceptionHandlers)
-		HandlerCompiled.push_back(CompileSqlChunk(Logger, OptLevel, CatalogDb, H.HandlerSql));
-	auto CountSansHalt = [](const Bytecode &Bc) {
-		std::size_t N = 0;
-		for(const Instruction &Inst : Bc)
-			if(Inst.Opcode_ != Opcode::HALT)
-				++N;
-		return N;
-	};
-	const std::size_t TryCount = CountSansHalt(TryCompiled.Instructions);
-	std::vector<std::size_t> HandlerSizes;
-	HandlerSizes.reserve(HandlerCompiled.size());
-	for(const auto &Hc : HandlerCompiled)
-		HandlerSizes.push_back(CountSansHalt(Hc.Instructions));
-	const std::size_t Handler0Ip = 1 + TryCount + 1;
-	std::size_t Cursor = Handler0Ip;
-	std::vector<std::size_t> HandlerIps;
-	for(std::size_t Hi = 0; Hi < HandlerSizes.size(); ++Hi) {
-		HandlerIps.push_back(Cursor);
-		Cursor += HandlerSizes[Hi];
-		if(Hi + 1 < HandlerSizes.size())
-			++Cursor;
+	LoweredProcedureBody Body = DecodeProcedureControlJson({}, BodySql);
+	if(Body.Segments.empty()) {
+		ProcedureControlSegment Seg;
+		Seg.LinearSql = std::string(BodySql);
+		Body.Segments.push_back(std::move(Seg));
 	}
-	const std::size_t EndIp = Cursor + 1;
-	const std::string Savepoint = "__astr_proc_ex";
-	Bytecode Out;
-	Instruction TryOp;
-	TryOp.Opcode_ = Opcode::PROC_TRY;
-	TryOp.Operands.push_back(Savepoint);
-	TryOp.Operands.push_back(static_cast<int64_t>(EndIp));
-	for(std::size_t Hi = 0; Hi < HandlerIps.size(); ++Hi) {
-		TryOp.Operands.push_back(static_cast<int64_t>(HandlerIps[Hi]));
-		TryOp.Operands.push_back(ExceptionHandlers[Hi].Condition);
-	}
-	Out.push_back(TryOp);
-	AppendBytecodeSansHalt(Out, TryCompiled.Instructions);
-	Instruction EndTry;
-	EndTry.Opcode_ = Opcode::PROC_END_TRY;
-	EndTry.Operands.push_back(Savepoint);
-	EndTry.Operands.push_back(static_cast<int64_t>(EndIp));
-	Out.push_back(EndTry);
-	for(std::size_t Hi = 0; Hi < HandlerCompiled.size(); ++Hi) {
-		AppendBytecodeSansHalt(Out, HandlerCompiled[Hi].Instructions);
-		if(Hi + 1 < HandlerCompiled.size()) {
-			Instruction Jmp;
-			Jmp.Opcode_ = Opcode::JMP;
-			Jmp.Operands.push_back(static_cast<int64_t>(EndIp));
-			Out.push_back(Jmp);
+	Body.ExceptionHandlers = ExceptionHandlers;
+	Body.TryBodySql = std::string(BodySql);
+	return CompileProcedureBody(Logger, OptLevel, CatalogDb, Body);
+}
+
+std::string EncodeProcedureControlJson(const LoweredProcedureBody &Body) {
+	std::function<DS::JSON(const ProcedureIfBranch &)> EncodeBranch;
+	EncodeBranch = [&](const ProcedureIfBranch &Br) -> DS::JSON {
+		DS::JSONObject O;
+		O.emplace("when", DS::JSON(Br.ConditionSql));
+		DS::JSONArray SegArr;
+		for(const auto &Seg : Br.Segments) {
+			DS::JSONObject S;
+			S.emplace("linear", DS::JSON(Seg.LinearSql));
+			DS::JSONArray BrArr;
+			for(const auto &Arm : Seg.IfBranches)
+				BrArr.push_back(EncodeBranch(Arm));
+			if(!BrArr.empty())
+				S.emplace("branches", DS::JSON(std::move(BrArr)));
+			SegArr.push_back(DS::JSON(std::move(S)));
 		}
+		O.emplace("segments", DS::JSON(std::move(SegArr)));
+		return DS::JSON(std::move(O));
+	};
+	if(Body.Segments.empty())
+		return {};
+	DS::JSONArray SegArr;
+	for(const auto &Seg : Body.Segments) {
+		DS::JSONObject S;
+		S.emplace("linear", DS::JSON(Seg.LinearSql));
+		DS::JSONArray BrArr;
+		for(const auto &Arm : Seg.IfBranches)
+			BrArr.push_back(EncodeBranch(Arm));
+		if(!BrArr.empty())
+			S.emplace("branches", DS::JSON(std::move(BrArr)));
+		SegArr.push_back(DS::JSON(std::move(S)));
 	}
-	Out.push_back(Instruction{Opcode::HALT, {}});
-	CompiledBytecode Result;
-	Result.Instructions = std::move(Out);
-	DedupBytecodeStringImmediates(Result.Instructions, Result.StringPool);
-	return Result;
+	return DS::SerializeJSON(DS::JSON(std::move(SegArr)));
+}
+
+LoweredProcedureBody DecodeProcedureControlJson(std::string_view Json, std::string_view FallbackLinearSql) {
+	LoweredProcedureBody Out;
+	if(Json.empty()) {
+		if(!FallbackLinearSql.empty()) {
+			ProcedureControlSegment Seg;
+			Seg.LinearSql = std::string(FallbackLinearSql);
+			Out.Segments.push_back(std::move(Seg));
+			Out.TryBodySql = std::string(FallbackLinearSql);
+		}
+		return Out;
+	}
+	const DS::JSON Root = DS::DecodeJSONStrict(std::string(Json));
+	if(!Root.IsArray())
+		return Out;
+	std::function<ProcedureIfBranch(const DS::JSON &)> DecodeBranch = [&](const DS::JSON &J) {
+		ProcedureIfBranch Br;
+		if(!J.IsObject())
+			return Br;
+		const auto &O = J.AsObject();
+		if(const auto It = O.find("when"); It != O.end() && It->second.IsString())
+			Br.ConditionSql = It->second.AsString();
+		if(const auto It = O.find("segments"); It != O.end() && It->second.IsArray()) {
+			for(const auto &SegJ : It->second.AsArray()) {
+				if(!SegJ.IsObject())
+					continue;
+				const auto &SO = SegJ.AsObject();
+				ProcedureControlSegment Seg;
+				if(const auto Lin = SO.find("linear"); Lin != SO.end() && Lin->second.IsString())
+					Seg.LinearSql = Lin->second.AsString();
+				if(const auto BrIt = SO.find("branches"); BrIt != SO.end() && BrIt->second.IsArray())
+					for(const auto &ArmJ : BrIt->second.AsArray())
+						Seg.IfBranches.push_back(DecodeBranch(ArmJ));
+				Br.Segments.push_back(std::move(Seg));
+			}
+		}
+		return Br;
+	};
+	for(const auto &SegJ : Root.AsArray()) {
+		if(!SegJ.IsObject())
+			continue;
+		const auto &SO = SegJ.AsObject();
+		ProcedureControlSegment Seg;
+		if(const auto Lin = SO.find("linear"); Lin != SO.end() && Lin->second.IsString())
+			Seg.LinearSql = Lin->second.AsString();
+		if(const auto BrIt = SO.find("branches"); BrIt != SO.end() && BrIt->second.IsArray())
+			for(const auto &ArmJ : BrIt->second.AsArray())
+				Seg.IfBranches.push_back(DecodeBranch(ArmJ));
+		Out.Segments.push_back(std::move(Seg));
+	}
+	if(!FallbackLinearSql.empty())
+		Out.TryBodySql = std::string(FallbackLinearSql);
+	return Out;
 }
 
 std::string HashProcedureSource(std::string_view BodySql) {
@@ -467,7 +722,8 @@ StoredProcedureEntry CacheProcedureFromSql(ProcedureCatalog &Catalog, const std:
                                            std::string Name, std::string BodySql, Logger *Logger,
                                            OptimizationLevel OptLevel, const Database *CatalogDb, bool IfNotExists,
                                            bool OrReplace, std::string SourceDialect,
-                                           const std::vector<ProcedureExceptionWhen> &ExceptionHandlers) {
+                                           const std::vector<ProcedureExceptionWhen> &ExceptionHandlers,
+                                           std::string_view ControlFlowJson) {
 	if(auto Existing = FindProcedure(Catalog, Name)) {
 		if(IfNotExists)
 			return *Existing;
@@ -477,7 +733,15 @@ StoredProcedureEntry CacheProcedureFromSql(ProcedureCatalog &Catalog, const std:
 	const std::filesystem::path CacheDir = DefaultProcedureCacheDir(SessionDbPath);
 	std::error_code Ec;
 	std::filesystem::create_directories(CacheDir, Ec);
-	const auto Compiled = CompileProcedureBody(Logger, OptLevel, CatalogDb, BodySql, ExceptionHandlers);
+	LoweredProcedureBody Lowered = DecodeProcedureControlJson(ControlFlowJson, BodySql);
+	if(Lowered.Segments.empty() && !BodySql.empty()) {
+		ProcedureControlSegment Seg;
+		Seg.LinearSql = BodySql;
+		Lowered.Segments.push_back(std::move(Seg));
+	}
+	Lowered.ExceptionHandlers = ExceptionHandlers;
+	Lowered.TryBodySql = BodySql;
+	const auto Compiled = CompileProcedureBody(Logger, OptLevel, CatalogDb, Lowered);
 	const std::filesystem::path AbcPath = CacheDir / (Name + ".abc");
 	const std::filesystem::path SqlPath = CacheDir / (Name + ".sql");
 	SaveAbcFile(AbcPath, Compiled);

@@ -1678,7 +1678,8 @@ std::unordered_map<std::string, std::string> Database::ProcedureDefinitionsSnaps
 }
 
 void Database::DefineProcedure(const std::string &ProcedureName, std::string SqlBody, bool IfNotExists, bool OrReplace,
-                               std::string SourceDialect, std::string ExceptionHandlersJson) {
+                               std::string SourceDialect, std::string ExceptionHandlersJson,
+                               std::string ControlFlowJson) {
 	const auto ExceptionHandlers = SQL::DecodeExceptionHandlersJson(ExceptionHandlersJson);
 	std::string BodyForCache;
 	{
@@ -1705,7 +1706,7 @@ void Database::DefineProcedure(const std::string &ProcedureName, std::string Sql
 	SQL::UnregisterProcedure(Catalog, ProcedureName);
 	SQL::CacheProcedureFromSql(Catalog, DbPath_, ProcedureName, std::move(BodyForCache), Logger_,
 	                           SQL::OptimizationLevel::Advanced, this, true, OrReplace, std::move(SourceDialect),
-	                           ExceptionHandlers);
+	                           ExceptionHandlers, ControlFlowJson);
 	SQL::SaveProcedureCatalog(Catalog);
 }
 

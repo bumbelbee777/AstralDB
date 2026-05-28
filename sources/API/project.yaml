@@ -5,7 +5,7 @@ compiler: clang++
 project_type: library
 project_dirs: []
 supplementary_sources:
-  - astraldb_c.cxx
+  - AstralDbC.cxx
 output: ../../bin/libastraldb_c.a
 compiler_flags:
   global: "-Wall -Wextra -Werror -fstack-protector-strong -fpie -Isources -Ithird_party -Iinclude"

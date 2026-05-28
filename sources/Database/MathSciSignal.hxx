@@ -40,6 +40,18 @@ std::vector<float> AdGradReluF32(const float *X, const float *Upstream, size_t N
 /** ∂L/∂x for y = σ(x) given upstream ∂L/∂y (y may be passed instead of x for stability). */
 std::vector<float> AdGradSigmoidF32(const float *Y, const float *Upstream, size_t N);
 
+/** ∂L/∂x for y = tanh(x) given tanh output \p Y and upstream ∂L/∂y. */
+std::vector<float> AdGradTanhF32(const float *Y, const float *Upstream, size_t N);
+
+/** ∂L/∂x for y = W x; \p Upstream is ∂L/∂y with length \p OutDim. */
+std::vector<float> AdGradMatVecInputF32(const float *W, size_t OutDim, size_t InDim, const float *Upstream);
+
+/** ∂L/∂W flattened row-major for y = W x. */
+std::vector<float> AdGradMatVecWeightF32(const float *X, size_t InDim, const float *Upstream, size_t OutDim);
+
+/** ∂L/∂pred for MSE(pred, target) with \p N elements. */
+std::vector<float> AdGradMsePredF32(const float *Pred, const float *Target, size_t N);
+
 /** ∂L/∂input for valid conv1d; \p Upstream matches full conv output length. */
 std::vector<float> AdGradConv1dInputF32(const float *Input, size_t NIn, const float *Kernel, size_t Nk,
                                         const float *Upstream, size_t NUp);

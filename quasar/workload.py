@@ -84,6 +84,9 @@ class WorkloadStats:
     completed: int = 0
     failed: int = 0
     rejected_circuit: int = 0
+    oltp_submitted: int = 0
+    olap_submitted: int = 0
+    lane_rejections: int = 0
 
     def to_dict(self) -> Dict[str, float]:
         return {
@@ -91,6 +94,9 @@ class WorkloadStats:
             "completed": float(self.completed),
             "failed": float(self.failed),
             "rejected_circuit": float(self.rejected_circuit),
+            "oltp_submitted": float(self.oltp_submitted),
+            "olap_submitted": float(self.olap_submitted),
+            "lane_rejections": float(self.lane_rejections),
         }
 
 
@@ -117,6 +123,17 @@ class WorkloadGuard:
         with self._lock:
             self.stats.submitted += 1
         return True
+
+    def record_lane(self, lane: str) -> None:
+        with self._lock:
+            if lane == "olap":
+                self.stats.olap_submitted += 1
+            else:
+                self.stats.oltp_submitted += 1
+
+    def reject_lane(self) -> None:
+        with self._lock:
+            self.stats.lane_rejections += 1
 
     def run(self, shard_name: str, fn):
         """Execute ``fn()`` with optional transient retries and circuit accounting."""

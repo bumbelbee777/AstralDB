@@ -808,7 +808,7 @@ std::optional<Polygon> ParseWktPolygon(std::string_view Wkt) {
 	if(Rings.empty())
 		return std::nullopt;
 	for(size_t I = 0; I < Rings.size(); ++I) {
-		Ring R;
+		Ring RingOut;
 		std::string S = Rings[I];
 		for(char &C : S) {
 			if(C == ',')
@@ -817,14 +817,14 @@ std::optional<Polygon> ParseWktPolygon(std::string_view Wkt) {
 		std::istringstream Iss(S);
 		double X = 0.0, Y = 0.0;
 		while(Iss >> X >> Y)
-			R.Vertices.push_back({X, Y});
-		CloseRingIfNeeded(R);
-		if(R.Vertices.size() < 3)
+			RingOut.Vertices.push_back({X, Y});
+		CloseRingIfNeeded(RingOut);
+		if(RingOut.Vertices.size() < 3)
 			return std::nullopt;
 		if(I == 0)
-			P.Outer = std::move(R);
+			P.Outer = std::move(RingOut);
 		else
-			P.Holes.push_back(std::move(R));
+			P.Holes.push_back(std::move(RingOut));
 	}
 	return NormalizePolygon(std::move(P));
 }

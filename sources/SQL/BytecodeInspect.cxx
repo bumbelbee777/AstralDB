@@ -75,6 +75,7 @@ bool OpcodeIsDdl(Opcode Op) {
 	case Opcode::CALL_PROCEDURE:
 	case Opcode::PROC_TRY:
 	case Opcode::PROC_END_TRY:
+	case Opcode::PROC_JUMP_IF_TABLE_EMPTY:
 		return true;
 	default:
 		return false;
@@ -480,6 +481,8 @@ case Opcode::PROC_TRY:
 		return "PROC_TRY";
 case Opcode::PROC_END_TRY:
 		return "PROC_END_TRY";
+	case Opcode::PROC_JUMP_IF_TABLE_EMPTY:
+		return "PROC_JUMP_IF_TABLE_EMPTY";
 	case Opcode::CREATE_SCHEMA:
 		return "CREATE_SCHEMA";
 	case Opcode::DROP_SCHEMA:

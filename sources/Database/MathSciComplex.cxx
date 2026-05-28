@@ -90,12 +90,8 @@ std::optional<NumericVec> ParseNumericVec(std::string_view Cell) {
 			Out.Values.push_back(static_cast<float>(X));
 		return Out;
 	}
-	if(const auto Seq = MathSciAutograd::ParseComplexSeq(Cell)) {
-		NumericVec V;
-		V.Kind = NumericKind::Complex;
-		V.Values = Seq->Interleaved;
-		return V;
-	}
+	// Parse L[…] / V[…] lists before autograd interleaved-complex heuristics so even-length
+	// real lists (e.g. L[2]:1,0 for PREDICT) stay real. Complex autograd uses ParseComplexSeq.
 	if(const auto L = AdvancedTypes::ParseListCell(Cell)) {
 		if(L->empty())
 			return NumericVec{};

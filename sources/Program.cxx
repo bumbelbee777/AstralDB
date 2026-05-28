@@ -9,6 +9,7 @@
 #include <IO/Logger.hxx>
 #include <IO/Error.hxx>
 #include <Database/Database.hxx>
+#include <astraldb/AstralDB.h>
 #include <chrono>
 #include <cstdlib>
 #include <iomanip>
@@ -39,8 +40,6 @@ std::string ReadFile(const std::string& Path) {
 		Contents.erase(0, 3);
 	return Contents;
 }
-
-static constexpr const char* AstralDbVersionString = "2.0-rc1";
 
 struct CliBytecodeOptions {
 	bool TraceExecution = false;
@@ -298,7 +297,7 @@ void RunREPL(AstralDB::Logger& Logger, const std::filesystem::path& SessionDbPat
     AstralDB::SQL::OptimizationLevel OptLevel, const std::optional<std::string> &CliUserFlags,
     const std::optional<std::string> &CliPasswordFlags,
     const std::optional<std::filesystem::path> &AuditPath) {
-	std::cout << "AstralDB REPL v" << AstralDbVersionString << "\n";
+	std::cout << "AstralDB REPL v" << ASTRALDB_VERSION << "\n";
 	std::cout << "Type 'exit' or 'quit' to exit\n";
 	std::cout << "Type 'help' for available commands\n\n";
 
@@ -426,7 +425,7 @@ int main(int Argc, char** Argv) {
 				return 0;
 			}
 			if(Arg == "-v" || Arg == "--version") {
-				std::cout << "AstralDB " << AstralDbVersionString << "\n";
+				std::cout << "AstralDB " << ASTRALDB_VERSION << "\n";
 				return 0;
 			}
 			if(Arg == "-V" || Arg == "--verbose" || Arg == "-m" || Arg == "--mmap")

@@ -208,6 +208,45 @@ std::vector<float> AdGradSigmoidF32(const float *Y, const float *Upstream, size_
 	return Out;
 }
 
+std::vector<float> AdGradTanhF32(const float *Y, const float *Upstream, size_t N) {
+	std::vector<float> Out(N);
+	for(size_t I = 0; I < N; ++I) {
+		const float Yi = Y[I];
+		Out[I] = Upstream[I] * (1.f - Yi * Yi);
+	}
+	return Out;
+}
+
+std::vector<float> AdGradMatVecInputF32(const float *W, size_t OutDim, size_t InDim, const float *Upstream) {
+	std::vector<float> Out(InDim, 0.f);
+	for(size_t O = 0; O < OutDim; ++O) {
+		const float G = Upstream[O];
+		for(size_t I = 0; I < InDim; ++I)
+			Out[I] += W[O * InDim + I] * G;
+	}
+	return Out;
+}
+
+std::vector<float> AdGradMatVecWeightF32(const float *X, size_t InDim, const float *Upstream, size_t OutDim) {
+	std::vector<float> Out(OutDim * InDim, 0.f);
+	for(size_t O = 0; O < OutDim; ++O) {
+		const float G = Upstream[O];
+		for(size_t I = 0; I < InDim; ++I)
+			Out[O * InDim + I] = G * X[I];
+	}
+	return Out;
+}
+
+std::vector<float> AdGradMsePredF32(const float *Pred, const float *Target, size_t N) {
+	std::vector<float> Out(N);
+	if(N == 0)
+		return Out;
+	const float Scale = 2.f / static_cast<float>(N);
+	for(size_t I = 0; I < N; ++I)
+		Out[I] = Scale * (Pred[I] - Target[I]);
+	return Out;
+}
+
 std::vector<float> AdGradConv1dInputF32(const float *Input, size_t NIn, const float *Kernel, size_t Nk,
                                         const float *Upstream, size_t NUp) {
 	(void)NUp;

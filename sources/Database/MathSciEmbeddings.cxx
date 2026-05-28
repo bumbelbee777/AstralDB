@@ -399,7 +399,9 @@ std::optional<std::string> MeanCellFromReal(const std::string &TokenListCell, co
 	const auto Pooled = MeanPool(*Table, *Parsed);
 	MathSciComplex::NumericVec Nv;
 	Nv.Kind = Table->IsComplex ? MathSciComplex::NumericKind::Complex : MathSciComplex::NumericKind::Real;
-	Nv.Values.assign(Pooled.begin(), Pooled.end());
+	Nv.Values.reserve(Pooled.size());
+	for(double V : Pooled)
+		Nv.Values.push_back(static_cast<float>(V));
 	return MathSciComplex::FormatNumericVec(Nv);
 }
 

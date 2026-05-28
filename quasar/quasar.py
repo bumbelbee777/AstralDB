@@ -13,6 +13,7 @@ import os
 import shutil
 import sys
 import time
+import uuid
 from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
@@ -21,6 +22,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 from quasar.client import AstralDBClient, QueryResult, find_astraldb
+from quasar.cdc import CdcCheckpointStore, FileCdcSink, QuasarCdcPublisher
+from quasar.edge import EdgeRegistry
+from quasar.fdw import FdwManager
+from quasar.gsi import GlobalSecondaryIndexManager
+from quasar.matview import MaterializedViewManager
+from quasar.serverless import QuasarServerlessController
+from quasar.splitmerge import QuasarSplitMergeController
 from quasar.config import (
     ConfigError,
     default_cluster_template,
@@ -38,14 +46,13 @@ from quasar.errors import (
 from quasar.security import (
     SecurityPolicy,
     RateLimiter,
-    constant_time_equal,
     resolve_path_under_base,
     validate_shard_key,
     validate_sql,
 )
 from quasar.ring import ConsistentHashRing
 
-QUASAR_VERSION = "1.0.0"
+QUASAR_VERSION = "2.0.0"
 
 PathLike = Union[str, Path]
 
@@ -208,6 +215,10 @@ class BackupManifest:
     source_db: str
     incremental: bool = False
     parent_version: Optional[str] = None
+    timeline_id: str = "main"
+    base_snapshot_id: Optional[str] = None
+    wal_start_marker: Optional[str] = None
+    wal_end_marker: Optional[str] = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -216,9 +227,10 @@ class BackupManifest:
 class QuasarBackup:
     """Versioned full and incremental backups of AstralDB files (+ WAL, procedure cache)."""
 
-    def __init__(self, backup_dir: PathLike) -> None:
+    def __init__(self, backup_dir: PathLike, *, timeline_id: str = "main") -> None:
         self.backup_dir = Path(backup_dir)
         self.backup_dir.mkdir(parents=True, exist_ok=True)
+        self.timeline_id = timeline_id
 
     def _wal_path(self, db_path: Path) -> Path:
         return Path(str(db_path) + ".wal")
@@ -258,6 +270,10 @@ class QuasarBackup:
             db_files=copied,
             source_db=str(db_path.resolve()),
             incremental=False,
+            timeline_id=self.timeline_id,
+            base_snapshot_id=version,
+            wal_start_marker=version,
+            wal_end_marker=version,
         )
         (dest / "manifest.json").write_text(manifest.to_json(), encoding="utf-8")
         return dest
@@ -343,6 +359,10 @@ class QuasarBackup:
             db_files=[wal.name],
             source_db=str(db_path.resolve()),
             incremental=True,
+            timeline_id=self.timeline_id,
+            parent_version=self._latest_non_incremental_version(),
+            wal_start_marker=version,
+            wal_end_marker=version,
         )
         (dest / "manifest.json").write_text(manifest.to_json(), encoding="utf-8")
         return dest
@@ -354,12 +374,90 @@ class QuasarBackup:
             p.name for p in self.backup_dir.iterdir() if p.is_dir() and (p / "manifest.json").exists()
         )
 
+    def _latest_non_incremental_version(self) -> Optional[str]:
+        versions = self.list_versions()
+        for version in reversed(versions):
+            try:
+                manifest = self.describe_version(version)
+            except FileNotFoundError:
+                continue
+            if not manifest.incremental:
+                return version
+        return None
+
     def describe_version(self, version: str) -> BackupManifest:
         manifest_path = self.backup_dir / version / "manifest.json"
         if not manifest_path.is_file():
             raise FileNotFoundError(f"backup version not found: {version}")
         data = json.loads(manifest_path.read_text(encoding="utf-8"))
         return BackupManifest(**data)
+
+    def restore_to_marker(self, marker_version: str, target_db: PathLike, *, overwrite: bool = False) -> Path:
+        manifest = self.describe_version(marker_version)
+        if manifest.incremental:
+            base = manifest.parent_version or self._latest_non_incremental_version()
+            if not base:
+                raise FileNotFoundError("incremental marker has no base snapshot")
+            self.restore(base, target_db, overwrite=overwrite, force=True)
+            wal_name = Path(str(target_db)).name + ".wal"
+            src_wal = self.backup_dir / marker_version / wal_name
+            if not src_wal.exists():
+                matches = sorted((self.backup_dir / marker_version).glob("*.wal"))
+                if not matches:
+                    raise FileNotFoundError(f"incremental marker missing wal: {marker_version}")
+                src_wal = matches[0]
+            shutil.copy2(src_wal, self._wal_path(Path(target_db)))
+            return Path(target_db)
+        return self.restore(marker_version, target_db, overwrite=overwrite, force=True)
+
+    def restore_to_time(
+        self,
+        target_iso_time: str,
+        target_db: PathLike,
+        *,
+        overwrite: bool = False,
+    ) -> Path:
+        target_ts = datetime.fromisoformat(target_iso_time.replace("Z", "+00:00")).timestamp()
+        candidate: Optional[str] = None
+        for version in self.list_versions():
+            try:
+                created = datetime.fromisoformat(
+                    self.describe_version(version).created_at.replace("Z", "+00:00")
+                ).timestamp()
+            except (ValueError, FileNotFoundError):
+                continue
+            if created <= target_ts:
+                candidate = version
+            else:
+                break
+        if candidate is None:
+            raise FileNotFoundError("no backup exists at or before requested timestamp")
+        return self.restore(candidate, target_db, overwrite=overwrite, force=True)
+
+    def archive_wal_segment(self, db_path: PathLike, marker: str) -> Optional[Path]:
+        db_path = Path(db_path)
+        wal = self._wal_path(db_path)
+        if not wal.exists():
+            return None
+        version = f"{marker}_wal"
+        dest = self.backup_dir / version
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.mkdir(parents=True, exist_ok=False)
+        shutil.copy2(wal, dest / wal.name)
+        manifest = BackupManifest(
+            version=version,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            db_files=[wal.name],
+            source_db=str(db_path.resolve()),
+            incremental=True,
+            timeline_id=self.timeline_id,
+            parent_version=self._latest_non_incremental_version(),
+            wal_start_marker=marker,
+            wal_end_marker=marker,
+        )
+        (dest / "manifest.json").write_text(manifest.to_json(), encoding="utf-8")
+        return dest
 
     def prune(
         self,
@@ -464,13 +562,27 @@ class QuasarMonitor:
         self.error_count = 0
         self.total_latency_ms = 0.0
         self.latencies_ms: List[float] = []
+        self.error_classes: Dict[str, int] = {}
+        self.timeout_count = 0
+        self.retry_events = 0
+        self.circuit_rejections = 0
 
-    def record(self, result: QueryResult, *, error: bool = False) -> None:
+    def record(self, result: QueryResult, *, error: bool = False, error_class: Optional[str] = None) -> None:
         self.query_count += 1
         self.total_latency_ms += result.elapsed_ms
         self.latencies_ms.append(result.elapsed_ms)
         if error or not result.ok:
             self.error_count += 1
+            label = (error_class or "unknown").strip().lower()
+            self.error_classes[label] = self.error_classes.get(label, 0) + 1
+            if "timeout" in label:
+                self.timeout_count += 1
+
+    def record_retry(self, attempts: int) -> None:
+        self.retry_events += max(0, int(attempts))
+
+    def record_circuit_rejection(self) -> None:
+        self.circuit_rejections += 1
 
     @property
     def error_rate(self) -> float:
@@ -492,14 +604,21 @@ class QuasarMonitor:
         return ordered[idx]
 
     def snapshot(self) -> Dict[str, float]:
-        return {
+        snap: Dict[str, float] = {
             "queries": float(self.query_count),
             "errors": float(self.error_count),
             "error_rate": self.error_rate,
             "mean_latency_ms": self.mean_latency_ms,
             "p50_latency_ms": self.percentile(50),
+            "p95_latency_ms": self.percentile(95),
             "p99_latency_ms": self.percentile(99),
+            "timeouts": float(self.timeout_count),
+            "retry_events": float(self.retry_events),
+            "circuit_rejections": float(self.circuit_rejections),
         }
+        for name, count in sorted(self.error_classes.items()):
+            snap[f"error_class_{name}"] = float(count)
+        return snap
 
 class QuasarCluster:
     """Named cluster: sharded writers + optional replica sets from JSON config."""
@@ -539,8 +658,14 @@ class QuasarCluster:
                 client=self.client,
             )
         self.monitor = QuasarMonitor()
+        self.htap = self.config.get("htap", {})
+        self.pitr = self.config.get("pitr", {})
         backup_dir = self.config.get("backup_dir")
-        self.backup = QuasarBackup(backup_dir) if backup_dir else None
+        self.backup = (
+            QuasarBackup(backup_dir, timeline_id=str(self.pitr.get("timeline_id", "main")))
+            if backup_dir
+            else None
+        )
         self.failover = self._build_failover()
         self.consensus = self._build_consensus()
         self.dtxn = self._build_dtxn()
@@ -566,6 +691,101 @@ class QuasarCluster:
         self._locks_enabled = bool(locks_cfg.get("enabled", False))
         self._lock_timeout_sec = float(locks_cfg.get("timeout_sec", 30.0))
         self._build_financial()
+        self.fdw = FdwManager(self.config.get("fdw"))
+        self.upgrade_controller = self._build_upgrade_controller()
+        self.gsi = self._build_gsi()
+        self.matview = self._build_matview()
+        self.cdc = self._build_cdc()
+        self.distributed_join = self._build_distributed_join()
+        self.split_merge = self._build_split_merge()
+        self.serverless = self._build_serverless()
+        self.edge = self._build_edge()
+
+    def _build_upgrade_controller(self):
+        raw = self.config.get("upgrades", {})
+        if not raw or not raw.get("enabled", True):
+            return None
+        from quasar.ops import QuasarUpgradeController
+
+        return QuasarUpgradeController(self, raw)
+
+    def _build_gsi(self):
+        raw = self.config.get("gsi", {})
+        if not raw or not raw.get("enabled", True):
+            return None
+        return GlobalSecondaryIndexManager(self, state_file=Path(raw.get("state_file", ".quasar/gsi/indexes.json")))
+
+    def _build_matview(self):
+        raw = self.config.get("matview", {})
+        if not raw or not raw.get("enabled", True):
+            return None
+        return MaterializedViewManager(self, raw)
+
+    def _build_cdc(self):
+        raw = self.config.get("cdc", {})
+        if not raw or not raw.get("enabled", True):
+            return None
+        timeline_id = str(raw.get("timeline_id", self.pitr.get("timeline_id", "main")))
+        checkpoints = CdcCheckpointStore(Path(raw.get("checkpoint_file", ".quasar/cdc/checkpoints.json")))
+        sink = FileCdcSink(Path(raw.get("sink_file", ".quasar/cdc/events.jsonl")))
+        dlq = Path(raw.get("dlq_file", ".quasar/cdc/dlq.jsonl"))
+        return QuasarCdcPublisher(timeline_id=timeline_id, checkpoints=checkpoints, sinks=[sink], dlq_path=dlq)
+
+    def _build_distributed_join(self):
+        raw = self.config.get("distributed_join", {})
+        if not raw or not raw.get("enabled", True):
+            return None
+        from quasar.distjoin import DistributedJoinPlanner, QuasarDistributedJoinExecutor
+        from quasar.crossjoin import QuasarCrossShardJoin
+
+        planner = DistributedJoinPlanner(row_broadcast_threshold=int(raw.get("broadcast_threshold", 5000)))
+        return QuasarDistributedJoinExecutor(QuasarCrossShardJoin(self.active_shard(), client=self.client), planner)
+
+    def _build_split_merge(self):
+        raw = self.config.get("split_merge", {})
+        if not raw or not raw.get("enabled", True):
+            return None
+        return QuasarSplitMergeController(
+            self, journal_path=Path(raw.get("journal_file", ".quasar/split_merge/journal.json"))
+        )
+
+    def _build_serverless(self):
+        raw = self.config.get("serverless", {})
+        if not raw or not raw.get("enabled", True):
+            return None
+        return QuasarServerlessController(
+            Path(raw.get("state_file", ".quasar/serverless/lease.json")),
+            idle_sec=float(raw.get("idle_sec", 30.0)),
+        )
+
+    def _build_edge(self):
+        raw = self.config.get("edge", {})
+        if not raw or not raw.get("enabled", True):
+            return None
+        return EdgeRegistry(Path(raw.get("registry_file", ".quasar/edge/registry.json")))
+
+    def _classify_lane(self, sql: str) -> str:
+        upper = sql.upper()
+        if " JOIN " in upper or " GROUP BY " in upper or " WINDOW " in upper or " ORDER BY " in upper:
+            return "olap"
+        if upper.strip().startswith("SELECT"):
+            return "oltp"
+        return "oltp"
+
+    def _enforce_htap_budget(self, lane: str) -> None:
+        if not self.htap.get("enabled", True):
+            return
+        pool = self.pool_stats()
+        max_queue = max(1.0, float(getattr(self.client, "pool_config", object()).max_queue if hasattr(self.client, "pool_config") else 10000.0))
+        queue_depth = float(pool.get("queue_depth", 0.0))
+        ratio = queue_depth / max_queue
+        if lane == "olap":
+            threshold = float(self.htap.get("olap_queue_soft_limit", 0.6))
+        else:
+            threshold = float(self.htap.get("oltp_queue_soft_limit", 0.9))
+        if ratio > threshold:
+            self.workload.reject_lane()
+            raise QuasarOverloadError(f"{lane} lane budget exceeded")
 
     def _build_financial(self) -> None:
         from quasar.audit import QuasarJournal
@@ -614,6 +834,31 @@ class QuasarCluster:
             self.client.close()
         if self.regions is not None:
             self.regions.close()
+
+    def _emit_cdc_for_sql(self, sql: str, routed: List[RoutedResult]) -> None:
+        if self.cdc is None:
+            return
+        upper = sql.strip().upper()
+        if upper.startswith("SELECT"):
+            return
+        if upper.startswith("INSERT"):
+            op = "insert"
+        elif upper.startswith("UPDATE"):
+            op = "update"
+        elif upper.startswith("DELETE"):
+            op = "delete"
+        else:
+            op = "ddl"
+        table = "unknown"
+        parts = upper.replace("\n", " ").split()
+        if "INTO" in parts:
+            idx = parts.index("INTO")
+            if idx + 1 < len(parts):
+                table = parts[idx + 1].strip(";")
+        elif len(parts) > 1:
+            table = parts[1].strip(";")
+        for r in routed:
+            self.cdc.record(shard=r.node, op=op, table=table, payload={"sql": sql[:512], "ok": r.result.ok})
 
     def recovery_tick(self, *, force: bool = False) -> Dict[str, Any]:
         """Automated crash recovery (dtxn + rollbacks + pool heal)."""
@@ -885,23 +1130,69 @@ class QuasarCluster:
         try:
             with lock_ctx:
                 active = self.active_shard()
+                lane = self._classify_lane(sql)
+                self.workload.record_lane(lane)
+                self._enforce_htap_budget(lane)
 
                 def _run() -> List[RoutedResult]:
+                    if self.matview is not None:
+                        mv_ddl = self.matview.try_apply_ddl(sql)
+                        if mv_ddl is not None:
+                            payload = json.dumps(mv_ddl)
+                            synthetic = QueryResult(
+                                stdout=payload,
+                                stderr="",
+                                returncode=0,
+                                elapsed_ms=0.0,
+                                command=["matview-ddl"],
+                            )
+                            return [
+                                RoutedResult(node="__matview__", database=Path(":memory:"), result=synthetic)
+                            ]
+                    fdw_ddl = self.fdw.try_apply_ddl(sql)
+                    if fdw_ddl is not None:
+                        payload = json.dumps(fdw_ddl)
+                        synthetic = QueryResult(
+                            stdout=payload,
+                            stderr="",
+                            returncode=0,
+                            elapsed_ms=0.0,
+                            command=["fdw-ddl"],
+                        )
+                        return [RoutedResult(node="__fdw__", database=Path(":memory:"), result=synthetic)]
+                    fdw_result = self.fdw.execute_select_with_meta(sql)
+                    if fdw_result is not None:
+                        synthetic = QueryResult(
+                            stdout=json.dumps(fdw_result.rows),
+                            stderr="",
+                            returncode=0,
+                            elapsed_ms=fdw_result.elapsed_ms,
+                            command=["fdw-select"],
+                        )
+                        self.monitor.error_classes[f"fdw_source_{fdw_result.source}"] = self.monitor.error_classes.get(
+                            f"fdw_source_{fdw_result.source}", 0
+                        ) + 1
+                        self.monitor.record_retry(fdw_result.retries)
+                        return [RoutedResult(node="__fdw__", database=Path(":memory:"), result=synthetic)]
                     return active.execute(sql, shard_key=shard_key)
 
                 routed_via_workload = False
                 if shard_key:
                     node = active.node_for_key(shard_key)
+                    retry_before = self.workload.retry_stats.attempts
                     results = self.workload.run(node.name, _run)
+                    self.monitor.record_retry(self.workload.retry_stats.attempts - retry_before)
                     routed_via_workload = True
                 elif self._retry_policy.max_retries > 0:
                     from quasar.recovery import execute_with_retry
 
+                    retry_before = self.workload.retry_stats.attempts
                     results = execute_with_retry(
                         _run,
                         self._retry_policy,
                         stats=self.workload.retry_stats,
                     )
+                    self.monitor.record_retry(self.workload.retry_stats.attempts - retry_before)
                 else:
                     results = _run()
 
@@ -912,9 +1203,15 @@ class QuasarCluster:
                             self.workload.success(r.node)
                         else:
                             self.workload.failure(r.node)
+                self._emit_cdc_for_sql(sql, results)
+                if self.matview is not None and all(r.result.ok for r in results):
+                    self.matview.on_mutation(sql)
                 return results
         except QuasarLockError:
             raise QuasarOverloadError("could not acquire database lock") from None
+        except QuasarCircuitOpenError:
+            self.monitor.record_circuit_rejection()
+            raise
 
     def cross_join(self, spec_path: PathLike) -> List[Dict[str, Any]]:
         from quasar.crossjoin import CrossJoinSpec, QuasarCrossShardJoin
@@ -1055,6 +1352,104 @@ class QuasarCluster:
             dry_run=dry_run,
         )
 
+    def restore_to_marker(self, marker_version: str, target_db: PathLike, *, overwrite: bool = False) -> Path:
+        if self.backup is None:
+            raise RuntimeError("cluster config has no backup_dir")
+        return self.backup.restore_to_marker(marker_version, target_db, overwrite=overwrite)
+
+    def restore_to_time(self, target_iso_time: str, target_db: PathLike, *, overwrite: bool = False) -> Path:
+        if self.backup is None:
+            raise RuntimeError("cluster config has no backup_dir")
+        return self.backup.restore_to_time(target_iso_time, target_db, overwrite=overwrite)
+
+    def pitr_archive_wal(self, marker: str) -> Dict[str, str]:
+        if self.backup is None:
+            raise RuntimeError("cluster config has no backup_dir")
+        out: Dict[str, str] = {}
+        for node in self.shard.nodes:
+            archived = self.backup.archive_wal_segment(node.database, marker)
+            if archived is not None:
+                out[node.name] = str(archived)
+        return out
+
+    def upgrade_start(self, target_version: str) -> Dict[str, Any]:
+        if self.upgrade_controller is None:
+            raise RuntimeError("upgrades not enabled in cluster config")
+        return self.upgrade_controller.start(target_version)
+
+    def upgrade_tick(self) -> Dict[str, Any]:
+        if self.upgrade_controller is None:
+            raise RuntimeError("upgrades not enabled in cluster config")
+        return self.upgrade_controller.run_step()
+
+    def upgrade_status(self) -> Dict[str, Any]:
+        if self.upgrade_controller is None:
+            return {"enabled": False}
+        return dict(self.upgrade_controller.state)
+
+    def gsi_create(
+        self,
+        *,
+        name: str,
+        table: str,
+        column: str,
+        include_columns: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        if self.gsi is None:
+            raise RuntimeError("gsi not enabled in cluster config")
+        return self.gsi.create(name=name, table=table, column=column, include_columns=include_columns)
+
+    def gsi_drop(self, name: str) -> Dict[str, Any]:
+        if self.gsi is None:
+            raise RuntimeError("gsi not enabled in cluster config")
+        return self.gsi.drop(name)
+
+    def gsi_list(self) -> Dict[str, Any]:
+        if self.gsi is None:
+            return {"enabled": False}
+        return self.gsi.list()
+
+    def matview_create(
+        self,
+        *,
+        name: str,
+        query_sql: str,
+        storage_table: Optional[str] = None,
+        refresh_mode: str = "interval",
+        interval_sec: Optional[float] = None,
+        source_tables: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        if self.matview is None:
+            raise RuntimeError("matview not enabled in cluster config")
+        return self.matview.create(
+            name=name,
+            query_sql=query_sql,
+            storage_table=storage_table or f"mv_{name}",
+            refresh_mode=refresh_mode,
+            interval_sec=interval_sec,
+            source_tables=source_tables,
+        )
+
+    def matview_refresh(self, name: str) -> Dict[str, Any]:
+        if self.matview is None:
+            raise RuntimeError("matview not enabled in cluster config")
+        return self.matview.refresh(name, reason="api")
+
+    def matview_drop(self, name: str) -> Dict[str, Any]:
+        if self.matview is None:
+            raise RuntimeError("matview not enabled in cluster config")
+        return self.matview.drop(name)
+
+    def matview_list(self) -> Dict[str, Any]:
+        if self.matview is None:
+            return {"enabled": False}
+        return self.matview.list()
+
+    def matview_tick(self, *, force: bool = False) -> Dict[str, Any]:
+        if self.matview is None:
+            return {"enabled": False}
+        return self.matview.tick(force=force)
+
     def health(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {
             "quasar_version": QUASAR_VERSION,
@@ -1076,6 +1471,15 @@ class QuasarCluster:
             "health": self.health(),
             "inventory": inv,
             "config_path": str(self.config_path) if self.config_path else None,
+            "fdw": self.fdw.stats(),
+            "upgrade": self.upgrade_status(),
+            "gsi": self.gsi_list(),
+            "matview": self.matview_list(),
+            "matview_stats": self.matview.stats() if self.matview is not None else {},
+            "cdc": self.cdc_poll(limit=100),
+            "split_merge": self.split_merge_tick(),
+            "serverless": self.serverless_tick(),
+            "edge_nodes": self.edge.list_nodes() if self.edge is not None else {},
         }
 
     def execute_idempotent(
@@ -1186,6 +1590,97 @@ class QuasarCluster:
             reports.extend(r.to_dict() for r in QuasarDrift.check_all_replicas(self.replicas))
         return reports
 
+    def cdc_poll(self, *, after_commit: int = 0, limit: int = 1000) -> Dict[str, Any]:
+        if self.cdc is None:
+            return {"enabled": False, "events": []}
+        events = self.cdc.poll(after_commit=after_commit, limit=limit)
+        return {"enabled": True, "events": events, "count": len(events)}
+
+    def cdc_publish(self, consumer_group: str, *, limit: int = 500) -> Dict[str, Any]:
+        if self.cdc is None:
+            raise RuntimeError("cdc not enabled in cluster config")
+        return self.cdc.publish(consumer_group, limit=limit)
+
+    def cdc_publish_batched(self, consumer_group: str, *, limit: int = 500, chunk_size: int = 100) -> Dict[str, Any]:
+        if self.cdc is None:
+            raise RuntimeError("cdc not enabled in cluster config")
+        return self.cdc.publish_batched(consumer_group, limit=limit, chunk_size=chunk_size)
+
+    def distributed_join_execute(self, spec_path: PathLike) -> Dict[str, Any]:
+        if self.distributed_join is None:
+            raise RuntimeError("distributed_join not enabled in cluster config")
+        from quasar.crossjoin import CrossJoinSpec
+
+        spec = CrossJoinSpec.from_file(Path(spec_path), policy=self.security)
+        return self.distributed_join.execute(spec)
+
+    def distributed_join_execute_stream(self, spec_path: PathLike, *, chunk_size: int = 250) -> Dict[str, Any]:
+        if self.distributed_join is None:
+            raise RuntimeError("distributed_join not enabled in cluster config")
+        from quasar.crossjoin import CrossJoinSpec
+
+        spec = CrossJoinSpec.from_file(Path(spec_path), policy=self.security)
+        return self.distributed_join.execute_stream(spec, chunk_size=chunk_size)
+
+    def split_shard(self, shard_name: str, *, split_key: str) -> Dict[str, Any]:
+        if self.split_merge is None:
+            raise RuntimeError("split_merge not enabled")
+        return self.split_merge.split_shard(shard_name, split_key=split_key)
+
+    def split_shard_chunked(
+        self, shard_name: str, *, split_key: str, chunk_size: int = 100, total_rows: int = 1000
+    ) -> Dict[str, Any]:
+        if self.split_merge is None:
+            raise RuntimeError("split_merge not enabled")
+        return self.split_merge.split_shard_chunked(
+            shard_name, split_key=split_key, chunk_size=chunk_size, total_rows=total_rows
+        )
+
+    def merge_shards(self, sources: List[str], *, target: str) -> Dict[str, Any]:
+        if self.split_merge is None:
+            raise RuntimeError("split_merge not enabled")
+        return self.split_merge.merge_shards(sources, target=target)
+
+    def merge_shards_chunked(
+        self, sources: List[str], *, target: str, chunk_size: int = 100, total_rows: int = 1000
+    ) -> Dict[str, Any]:
+        if self.split_merge is None:
+            raise RuntimeError("split_merge not enabled")
+        return self.split_merge.merge_shards_chunked(
+            sources, target=target, chunk_size=chunk_size, total_rows=total_rows
+        )
+
+    def split_merge_tick(self) -> Dict[str, Any]:
+        if self.split_merge is None:
+            return {"enabled": False}
+        return self.split_merge.tick()
+
+    def serverless_acquire(self, holder: str) -> Dict[str, Any]:
+        if self.serverless is None:
+            raise RuntimeError("serverless not enabled")
+        return self.serverless.acquire(holder)
+
+    def serverless_heartbeat(self, holder: str) -> Dict[str, Any]:
+        if self.serverless is None:
+            raise RuntimeError("serverless not enabled")
+        return self.serverless.heartbeat(holder)
+
+    def serverless_tick(self) -> Dict[str, Any]:
+        if self.serverless is None:
+            return {"enabled": False}
+        return self.serverless.tick()
+
+    def edge_register(self, node_id: str, region: str) -> Dict[str, Any]:
+        if self.edge is None:
+            raise RuntimeError("edge not enabled")
+        return self.edge.register(node_id, region)
+
+    def edge_sync(self, node_id: str, *, after_commit: int = 0, limit: int = 1000) -> Dict[str, Any]:
+        if self.edge is None:
+            raise RuntimeError("edge not enabled")
+        events = self.cdc_poll(after_commit=after_commit, limit=limit).get("events", [])
+        return self.edge.sync(node_id, events)
+
 
 def format_prometheus_metrics(cluster: QuasarCluster) -> str:
     snap = cluster.monitor.snapshot()
@@ -1200,30 +1695,100 @@ def format_prometheus_metrics(cluster: QuasarCluster) -> str:
         "# HELP quasar_latency_ms Mean query latency",
         "# TYPE quasar_latency_ms gauge",
         f"quasar_latency_ms {snap['mean_latency_ms']:.4f}",
+        "# HELP quasar_latency_p95_ms P95 query latency",
+        "# TYPE quasar_latency_p95_ms gauge",
+        f"quasar_latency_p95_ms {snap['p95_latency_ms']:.4f}",
+        "# HELP quasar_latency_p99_ms P99 query latency",
+        "# TYPE quasar_latency_p99_ms gauge",
+        f"quasar_latency_p99_ms {snap['p99_latency_ms']:.4f}",
+        "# HELP quasar_timeouts_total Query timeout events",
+        "# TYPE quasar_timeouts_total counter",
+        f"quasar_timeouts_total {int(snap['timeouts'])}",
+        "# HELP quasar_retry_events_total Retry attempts observed",
+        "# TYPE quasar_retry_events_total counter",
+        f"quasar_retry_events_total {int(snap['retry_events'])}",
+        "# HELP quasar_circuit_rejections_total Circuit-open rejections",
+        "# TYPE quasar_circuit_rejections_total counter",
+        f"quasar_circuit_rejections_total {int(snap['circuit_rejections'])}",
         "# HELP quasar_healthy Cluster health (1=ok)",
         "# TYPE quasar_healthy gauge",
         f"quasar_healthy {1 if health.get('healthy') else 0}",
     ]
     for name, ok in health.get("shards", {}).items():
         lines.append(f'quasar_shard_up{{shard="{name}"}} {1 if ok else 0}')
+    fdw = cluster.fdw.stats()
+    lines.extend(
+        [
+            "# HELP quasar_fdw_requests_total Foreign queries issued",
+            "# TYPE quasar_fdw_requests_total counter",
+            f"quasar_fdw_requests_total {int(fdw.get('requests', 0.0))}",
+            "# HELP quasar_fdw_errors_total Foreign query failures",
+            "# TYPE quasar_fdw_errors_total counter",
+            f"quasar_fdw_errors_total {int(fdw.get('errors', 0.0))}",
+        ]
+    )
+    cdc = cluster.cdc_poll(limit=1)
+    lines.extend(
+        [
+            "# HELP quasar_cdc_events_total CDC events currently retained in memory",
+            "# TYPE quasar_cdc_events_total gauge",
+            f"quasar_cdc_events_total {int(cdc.get('count', 0))}",
+        ]
+    )
+    if cluster.matview is not None:
+        mv = cluster.matview.stats()
+        lines.extend(
+            [
+                "# HELP quasar_matview_refreshes_total Materialized view refresh attempts",
+                "# TYPE quasar_matview_refreshes_total counter",
+                f"quasar_matview_refreshes_total {int(mv.get('refreshes', 0.0))}",
+                "# HELP quasar_matview_refresh_errors_total Materialized view refresh failures",
+                "# TYPE quasar_matview_refresh_errors_total counter",
+                f"quasar_matview_refresh_errors_total {int(mv.get('errors', 0.0))}",
+            ]
+        )
     return "\n".join(lines) + "\n"
 
 
-def create_gateway_app(cluster: QuasarCluster, *, api_key: Optional[str] = None):
+def create_gateway_app(
+    cluster: QuasarCluster,
+    *,
+    api_key: Optional[str] = None,
+    key_store_path: Optional[Path] = None,
+):
     try:
         from flask import Flask, jsonify, request
     except ImportError as exc:
         raise ImportError("Flask is required for the gateway: pip install flask") from exc
 
+    from quasar.gateway_keys import GatewayKeyStore, resolve_gateway_credential
+
     policy = cluster.security
     effective_key = api_key or os.environ.get("QUASAR_API_KEY")
-    if policy.require_gateway_auth and not effective_key:
-        raise ValueError("gateway requires QUASAR_API_KEY or --api-key when security.require_gateway_auth is true")
+    keys_path = key_store_path
+    if keys_path is None and policy.gateway_keys_file:
+        keys_path = Path(policy.gateway_keys_file)
+        if not keys_path.is_absolute() and cluster.config_path:
+            keys_path = (cluster.config_path.parent / keys_path).resolve()
+    if keys_path is None and cluster.config_path:
+        default_keys = cluster.config_path.parent / ".quasar" / "gateway_keys.json"
+        if default_keys.is_file():
+            keys_path = default_keys
+    key_store: Optional[GatewayKeyStore] = None
+    if keys_path is not None and Path(keys_path).is_file():
+        key_store = GatewayKeyStore(Path(keys_path))
+    if policy.require_gateway_auth and not effective_key and (key_store is None or not key_store.list_keys()):
+        raise ValueError(
+            "gateway requires QUASAR_API_KEY, --api-key, or gateway_keys.json "
+            "when security.require_gateway_auth is true"
+        )
 
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = policy.max_gateway_body_bytes
     limiter = RateLimiter(policy.gateway_rate_per_minute)
     config_root = cluster.config_path.parent if cluster.config_path else Path.cwd()
+    async_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="quasar-gateway-async")
+    async_jobs: Dict[str, Any] = {}
 
     @app.errorhandler(Exception)
     def _handle_error(err):
@@ -1248,10 +1813,18 @@ def create_gateway_app(cluster: QuasarCluster, *, api_key: Optional[str] = None)
         return None
 
     def _check_auth() -> Optional[tuple]:
-        if not effective_key:
+        if not policy.require_gateway_auth and not effective_key and key_store is None:
             return None
-        provided = request.headers.get("X-Quasar-Key") or request.args.get("api_key")
-        if not constant_time_equal(provided, effective_key):
+        headers = {k: v for k, v in request.headers.items()}
+        ok, _key_id = resolve_gateway_credential(
+            headers=headers,
+            query_args=dict(request.args),
+            legacy_plaintext=effective_key,
+            key_store=key_store,
+            allow_query_api_key=policy.gateway_allow_query_api_key,
+            require_auth=policy.require_gateway_auth,
+        )
+        if not ok:
             return jsonify({"error": "unauthorized"}), 401
         return None
 
@@ -1284,8 +1857,325 @@ def create_gateway_app(cluster: QuasarCluster, *, api_key: Optional[str] = None)
             "monitor": cluster.monitor.snapshot(),
             "pool": cluster.pool_stats(),
             "workload": cluster.workload_stats(),
+            "fdw": cluster.fdw.stats(),
+            "upgrade": cluster.upgrade_status(),
+            "cdc": cluster.cdc_poll(limit=100),
+            "split_merge": cluster.split_merge_tick(),
+            "serverless": cluster.serverless_tick(),
         }
         return jsonify(payload)
+
+    @app.route("/cdc/poll", methods=["GET"])
+    def cdc_poll_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        after = int(request.args.get("after", "0"))
+        limit = int(request.args.get("limit", "1000"))
+        return jsonify(cluster.cdc_poll(after_commit=after, limit=limit))
+
+    @app.route("/cdc/publish", methods=["POST"])
+    def cdc_publish_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        body = request.get_json(force=True, silent=True) or {}
+        group = body.get("consumer_group")
+        if not isinstance(group, str) or not group:
+            return jsonify({"error": "consumer_group required"}), 400
+        try:
+            return jsonify(cluster.cdc_publish(group, limit=int(body.get("limit", 500))))
+        except RuntimeError as err:
+            return jsonify({"error": str(err)}), 400
+
+    @app.route("/cdc/publish-batched", methods=["POST"])
+    def cdc_publish_batched_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        body = request.get_json(force=True, silent=True) or {}
+        group = body.get("consumer_group")
+        if not isinstance(group, str) or not group:
+            return jsonify({"error": "consumer_group required"}), 400
+        try:
+            return jsonify(
+                cluster.cdc_publish_batched(
+                    group,
+                    limit=int(body.get("limit", 500)),
+                    chunk_size=int(body.get("chunk_size", 100)),
+                )
+            )
+        except RuntimeError as err:
+            return jsonify({"error": str(err)}), 400
+
+    @app.route("/join/distributed", methods=["POST"])
+    def distributed_join_route():
+        blocked = _rate_limit() or _check_auth()
+        if blocked:
+            return blocked
+        body = request.get_json(force=True, silent=True) or {}
+        spec_file = body.get("spec_file")
+        if not isinstance(spec_file, str) or not spec_file:
+            return jsonify({"error": "spec_file required"}), 400
+        try:
+            safe = resolve_path_under_base(
+                config_root, spec_file, allow_outside=policy.allow_path_outside_config_root
+            )
+            return jsonify(cluster.distributed_join_execute(safe))
+        except Exception as err:
+            return jsonify({"error": str(err)}), 400
+
+    @app.route("/join/distributed/stream", methods=["POST"])
+    def distributed_join_stream_route():
+        blocked = _rate_limit() or _check_auth()
+        if blocked:
+            return blocked
+        body = request.get_json(force=True, silent=True) or {}
+        spec_file = body.get("spec_file")
+        chunk_size = int(body.get("chunk_size", 250))
+        if not isinstance(spec_file, str) or not spec_file:
+            return jsonify({"error": "spec_file required"}), 400
+        try:
+            safe = resolve_path_under_base(
+                config_root, spec_file, allow_outside=policy.allow_path_outside_config_root
+            )
+            payload = cluster.distributed_join_execute_stream(safe, chunk_size=chunk_size)
+            return jsonify(payload)
+        except Exception as err:
+            return jsonify({"error": str(err)}), 400
+
+    @app.route("/split-merge/split", methods=["POST"])
+    def split_shard_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        body = request.get_json(force=True, silent=True) or {}
+        shard = body.get("shard")
+        split_key = body.get("split_key")
+        if not isinstance(shard, str) or not isinstance(split_key, str):
+            return jsonify({"error": "shard and split_key required"}), 400
+        try:
+            return jsonify(cluster.split_shard(shard, split_key=split_key))
+        except RuntimeError as err:
+            return jsonify({"error": str(err)}), 400
+
+    @app.route("/split-merge/merge", methods=["POST"])
+    def merge_shards_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        body = request.get_json(force=True, silent=True) or {}
+        sources = body.get("sources")
+        target = body.get("target")
+        if not isinstance(sources, list) or not isinstance(target, str):
+            return jsonify({"error": "sources(list) and target required"}), 400
+        try:
+            return jsonify(cluster.merge_shards([str(s) for s in sources], target=target))
+        except RuntimeError as err:
+            return jsonify({"error": str(err)}), 400
+
+    @app.route("/split-merge/split/chunked", methods=["POST"])
+    def split_shard_chunked_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        body = request.get_json(force=True, silent=True) or {}
+        shard = body.get("shard")
+        split_key = body.get("split_key")
+        if not isinstance(shard, str) or not isinstance(split_key, str):
+            return jsonify({"error": "shard and split_key required"}), 400
+        return jsonify(
+            cluster.split_shard_chunked(
+                shard,
+                split_key=split_key,
+                chunk_size=int(body.get("chunk_size", 100)),
+                total_rows=int(body.get("total_rows", 1000)),
+            )
+        )
+
+    @app.route("/split-merge/merge/chunked", methods=["POST"])
+    def merge_shards_chunked_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        body = request.get_json(force=True, silent=True) or {}
+        sources = body.get("sources")
+        target = body.get("target")
+        if not isinstance(sources, list) or not isinstance(target, str):
+            return jsonify({"error": "sources(list) and target required"}), 400
+        return jsonify(
+            cluster.merge_shards_chunked(
+                [str(s) for s in sources],
+                target=target,
+                chunk_size=int(body.get("chunk_size", 100)),
+                total_rows=int(body.get("total_rows", 1000)),
+            )
+        )
+
+    @app.route("/async/query", methods=["POST"])
+    def async_query_submit():
+        blocked = _rate_limit() or _check_auth()
+        if blocked:
+            return blocked
+        body = request.get_json(force=True, silent=True) or {}
+        sql = body.get("sql")
+        shard_key = body.get("shard_key")
+        if not isinstance(sql, str) or not sql:
+            return jsonify({"error": "sql required"}), 400
+        job_id = str(uuid.uuid4())
+        fut = async_executor.submit(cluster.execute, sql, shard_key=shard_key)
+        async_jobs[job_id] = fut
+        return jsonify({"job_id": job_id, "status": "queued"}), 202
+
+    @app.route("/async/result/<job_id>", methods=["GET"])
+    def async_query_result(job_id: str):
+        auth = _check_auth()
+        if auth:
+            return auth
+        fut = async_jobs.get(job_id)
+        if fut is None:
+            return jsonify({"error": "job not found"}), 404
+        if not fut.done():
+            return jsonify({"job_id": job_id, "status": "running"}), 202
+        try:
+            rows = fut.result()
+            return jsonify(
+                {
+                    "job_id": job_id,
+                    "status": "done",
+                    "results": [
+                        {"node": r.node, "ok": r.result.ok, "elapsed_ms": r.result.elapsed_ms}
+                        for r in rows
+                    ],
+                }
+            )
+        except Exception as err:
+            return jsonify({"job_id": job_id, "status": "error", "error": str(err)}), 500
+
+    @app.route("/serverless/acquire", methods=["POST"])
+    def serverless_acquire_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        body = request.get_json(force=True, silent=True) or {}
+        holder = body.get("holder", "gateway")
+        try:
+            return jsonify(cluster.serverless_acquire(str(holder)))
+        except RuntimeError as err:
+            return jsonify({"error": str(err)}), 400
+
+    @app.route("/serverless/heartbeat", methods=["POST"])
+    def serverless_heartbeat_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        body = request.get_json(force=True, silent=True) or {}
+        holder = body.get("holder", "gateway")
+        try:
+            return jsonify(cluster.serverless_heartbeat(str(holder)))
+        except RuntimeError as err:
+            return jsonify({"error": str(err)}), 400
+
+    @app.route("/edge/register", methods=["POST"])
+    def edge_register_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        body = request.get_json(force=True, silent=True) or {}
+        node_id = body.get("node_id")
+        region = body.get("region")
+        if not isinstance(node_id, str) or not isinstance(region, str):
+            return jsonify({"error": "node_id and region required"}), 400
+        try:
+            return jsonify(cluster.edge_register(node_id, region))
+        except RuntimeError as err:
+            return jsonify({"error": str(err)}), 400
+
+    @app.route("/edge/sync", methods=["POST"])
+    def edge_sync_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        body = request.get_json(force=True, silent=True) or {}
+        node_id = body.get("node_id")
+        if not isinstance(node_id, str):
+            return jsonify({"error": "node_id required"}), 400
+        after = int(body.get("after_commit", 0))
+        limit = int(body.get("limit", 1000))
+        try:
+            return jsonify(cluster.edge_sync(node_id, after_commit=after, limit=limit))
+        except RuntimeError as err:
+            return jsonify({"error": str(err)}), 400
+
+    @app.route("/pitr/restore", methods=["POST"])
+    def pitr_restore():
+        auth = _check_auth()
+        if auth:
+            return auth
+        body = request.get_json(force=True, silent=True) or {}
+        target_db = body.get("target_db")
+        if not isinstance(target_db, str) or not target_db:
+            return jsonify({"error": "target_db required"}), 400
+        overwrite = bool(body.get("overwrite"))
+        if body.get("marker"):
+            try:
+                out = cluster.restore_to_marker(str(body["marker"]), target_db, overwrite=overwrite)
+                return jsonify({"restored": str(out)})
+            except Exception as err:
+                return jsonify({"error": str(err)}), 400
+        if body.get("time"):
+            try:
+                out = cluster.restore_to_time(str(body["time"]), target_db, overwrite=overwrite)
+                return jsonify({"restored": str(out)})
+            except Exception as err:
+                return jsonify({"error": str(err)}), 400
+        return jsonify({"error": "marker or time required"}), 400
+
+    @app.route("/pitr/archive", methods=["POST"])
+    def pitr_archive():
+        auth = _check_auth()
+        if auth:
+            return auth
+        body = request.get_json(force=True, silent=True) or {}
+        marker = body.get("marker")
+        if not isinstance(marker, str) or not marker:
+            return jsonify({"error": "marker required"}), 400
+        try:
+            out = cluster.pitr_archive_wal(marker)
+            return jsonify({"archived": out})
+        except Exception as err:
+            return jsonify({"error": str(err)}), 400
+
+    @app.route("/upgrade/start", methods=["POST"])
+    def upgrade_start_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        body = request.get_json(force=True, silent=True) or {}
+        target = body.get("target_version")
+        if not isinstance(target, str) or not target:
+            return jsonify({"error": "target_version required"}), 400
+        try:
+            return jsonify(cluster.upgrade_start(target))
+        except RuntimeError as err:
+            return jsonify({"error": str(err)}), 400
+
+    @app.route("/upgrade/tick", methods=["POST"])
+    def upgrade_tick_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        try:
+            return jsonify(cluster.upgrade_tick())
+        except RuntimeError as err:
+            return jsonify({"error": str(err)}), 400
+
+    @app.route("/upgrade/status", methods=["GET"])
+    def upgrade_status_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        return jsonify(cluster.upgrade_status())
 
     @app.route("/query", methods=["POST"])
     def query():
@@ -1374,6 +2264,121 @@ def create_gateway_app(cluster: QuasarCluster, *, api_key: Optional[str] = None)
             return jsonify({"recovered": cluster.dtxn_recover()})
         except RuntimeError as err:
             return jsonify({"error": str(err)}), 400
+
+    @app.route("/gsi/create", methods=["POST"])
+    def gsi_create_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        body = request.get_json(force=True, silent=True) or {}
+        name = body.get("name")
+        table = body.get("table")
+        column = body.get("column")
+        if not all(isinstance(v, str) and v for v in (name, table, column)):
+            return jsonify({"error": "name, table, column required"}), 400
+        include_columns = body.get("include_columns") or []
+        if not isinstance(include_columns, list):
+            return jsonify({"error": "include_columns must be list"}), 400
+        try:
+            return jsonify(
+                cluster.gsi_create(
+                    name=name,
+                    table=table,
+                    column=column,
+                    include_columns=[str(x) for x in include_columns],
+                )
+            )
+        except Exception as err:
+            return jsonify({"error": str(err)}), 400
+
+    @app.route("/gsi/drop", methods=["POST"])
+    def gsi_drop_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        body = request.get_json(force=True, silent=True) or {}
+        name = body.get("name")
+        if not isinstance(name, str) or not name:
+            return jsonify({"error": "name required"}), 400
+        try:
+            return jsonify(cluster.gsi_drop(name))
+        except Exception as err:
+            return jsonify({"error": str(err)}), 400
+
+    @app.route("/gsi/list", methods=["GET"])
+    def gsi_list_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        return jsonify(cluster.gsi_list())
+
+    @app.route("/matview/create", methods=["POST"])
+    def matview_create_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        body = request.get_json(force=True, silent=True) or {}
+        name = body.get("name")
+        query_sql = body.get("query_sql")
+        if not isinstance(name, str) or not isinstance(query_sql, str):
+            return jsonify({"error": "name and query_sql required"}), 400
+        try:
+            return jsonify(
+                cluster.matview_create(
+                    name=name,
+                    query_sql=query_sql,
+                    storage_table=body.get("storage_table"),
+                    refresh_mode=str(body.get("refresh_mode", "interval")),
+                    interval_sec=body.get("interval_sec"),
+                    source_tables=body.get("source_tables"),
+                )
+            )
+        except Exception as err:
+            return jsonify({"error": str(err)}), 400
+
+    @app.route("/matview/refresh", methods=["POST"])
+    def matview_refresh_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        body = request.get_json(force=True, silent=True) or {}
+        name = body.get("name")
+        if not isinstance(name, str):
+            return jsonify({"error": "name required"}), 400
+        try:
+            return jsonify(cluster.matview_refresh(name))
+        except Exception as err:
+            return jsonify({"error": str(err)}), 400
+
+    @app.route("/matview/drop", methods=["POST"])
+    def matview_drop_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        body = request.get_json(force=True, silent=True) or {}
+        name = body.get("name")
+        if not isinstance(name, str):
+            return jsonify({"error": "name required"}), 400
+        try:
+            return jsonify(cluster.matview_drop(name))
+        except Exception as err:
+            return jsonify({"error": str(err)}), 400
+
+    @app.route("/matview/list", methods=["GET"])
+    def matview_list_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        return jsonify(cluster.matview_list())
+
+    @app.route("/matview/tick", methods=["POST"])
+    def matview_tick_route():
+        auth = _check_auth()
+        if auth:
+            return auth
+        body = request.get_json(force=True, silent=True) or {}
+        force = bool(body.get("force"))
+        return jsonify(cluster.matview_tick(force=force))
 
     @app.route("/recover", methods=["POST"])
     def recover_route():
@@ -1688,18 +2693,57 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_ball.add_argument("--prefix", default="", help="Version label prefix")
     p_ball.set_defaults(func=_cmd_backup_all)
 
-    p_mig = sub.add_parser("migrate", help="Migrate source DB to target")
-    p_mig.add_argument("source", type=Path)
-    p_mig.add_argument("target", type=Path)
-    p_mig.add_argument("--copy", action="store_true", help="File copy instead of bundle export/import")
-    p_mig.add_argument("--work-dir", type=Path)
+    p_mig = sub.add_parser(
+        "migrate",
+        help="Migrate SQLite, SQL scripts, bundles, or AstralDB files into AstralDB",
+    )
+    p_mig.add_argument(
+        "source",
+        nargs="?",
+        help="Source path or database URI (postgresql://, mysql://, oracle+oracledb://, duckdb://, …)",
+    )
+    p_mig.add_argument("target", nargs="?", type=Path, help="Target AstralDB .db path")
+    p_mig.add_argument("--source", dest="source_opt", help="Source path or URI (alternative to positional)")
+    p_mig.add_argument("--target", dest="target_opt", type=Path, help="Target path (alternative to positional)")
+    p_mig.add_argument(
+        "--mode",
+        choices=("auto", "astral", "sqlite", "bundle", "script", "copy", "external"),
+        default="auto",
+        help="Migration strategy (default: auto-detect from file type or URI)",
+    )
+    p_mig.add_argument("--tables", help="Comma-separated table names to include")
+    p_mig.add_argument("--schema", help="Source schema name (Postgres/MySQL/Oracle/Redshift)")
+    p_mig.add_argument("--copy", action="store_true", help="Same-host AstralDB file copy (astral mode only)")
+    p_mig.add_argument("--work-dir", type=Path, help="Scratch directory for intermediate bundles")
+    p_mig.add_argument("--format", default="json", choices=("json", "csv", "tsv"), help="Bundle format")
+    p_mig.add_argument("--no-procedures", action="store_true", help="Skip stored procedure export/apply")
+    p_mig.add_argument("--no-triggers", action="store_true", help="Skip trigger export/apply")
+    p_mig.add_argument("--dry-run", action="store_true", help="Print migration plan JSON without writing target")
+    p_mig.add_argument("--plan", action="store_true", help="Alias for --dry-run")
     p_mig.set_defaults(func=_cmd_migrate)
+
+    p_gwkey = sub.add_parser("gateway-key", help="Create, list, or revoke hashed gateway API keys")
+    gk_sub = p_gwkey.add_subparsers(dest="gateway_key_cmd", required=True)
+    p_gk_create = gk_sub.add_parser("create", help="Create a new qk_<id>.<secret> token (shown once)")
+    p_gk_create.add_argument("--keys-file", type=Path, help="Registry JSON (default: .quasar/gateway_keys.json)")
+    p_gk_create.add_argument("--scopes", default="gateway,query,metrics", help="Comma-separated scopes")
+    p_gk_create.add_argument("--description", default="")
+    p_gk_create.add_argument("--expires-days", type=float, help="Key TTL in days")
+    p_gk_create.set_defaults(func=_cmd_gateway_key_create)
+    p_gk_list = gk_sub.add_parser("list", help="List key metadata (no secrets)")
+    p_gk_list.add_argument("--keys-file", type=Path)
+    p_gk_list.set_defaults(func=_cmd_gateway_key_list)
+    p_gk_revoke = gk_sub.add_parser("revoke", help="Disable a key by id")
+    p_gk_revoke.add_argument("key_id")
+    p_gk_revoke.add_argument("--keys-file", type=Path)
+    p_gk_revoke.set_defaults(func=_cmd_gateway_key_revoke)
 
     p_gw = sub.add_parser("gateway", help="Start HTTP gateway (requires flask)")
     p_gw.add_argument("config", type=Path)
     p_gw.add_argument("--host", default="127.0.0.1")
     p_gw.add_argument("--port", type=int, default=8080)
-    p_gw.add_argument("--api-key", help="Require X-Quasar-Key header (or ?api_key=)")
+    p_gw.add_argument("--api-key", help="Legacy single shared secret (QUASAR_API_KEY); prefer gateway-key create")
+    p_gw.add_argument("--keys-file", type=Path, help="Hashed API key registry JSON")
     p_gw.add_argument(
         "--require-auth",
         action="store_true",
@@ -1889,6 +2933,142 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_journal.add_argument("--limit", type=int, default=50)
     p_journal.set_defaults(func=_cmd_journal)
 
+    p_pitr = sub.add_parser("pitr-restore", help="Restore cluster backup to marker or time")
+    p_pitr.add_argument("config", type=Path)
+    p_pitr.add_argument("target_db", type=Path)
+    p_pitr.add_argument("--marker", help="Backup version marker")
+    p_pitr.add_argument("--time", dest="restore_time", help="ISO timestamp")
+    p_pitr.add_argument("--archive-marker", help="Archive current WAL segments using marker")
+    p_pitr.add_argument("--overwrite", action="store_true")
+    p_pitr.set_defaults(func=_cmd_pitr_restore)
+
+    p_up = sub.add_parser("upgrade", help="Run zero-downtime upgrade state machine")
+    p_up.add_argument("config", type=Path)
+    p_up_sub = p_up.add_subparsers(dest="upgrade_cmd", required=True)
+    p_up_start = p_up_sub.add_parser("start")
+    p_up_start.add_argument("target_version")
+    p_up_start.set_defaults(func=_cmd_upgrade_start)
+    p_up_tick = p_up_sub.add_parser("tick")
+    p_up_tick.set_defaults(func=_cmd_upgrade_tick)
+    p_up_status = p_up_sub.add_parser("status")
+    p_up_status.set_defaults(func=_cmd_upgrade_status)
+
+    p_gsi = sub.add_parser("gsi", help="Global secondary index operations")
+    p_gsi.add_argument("config", type=Path)
+    p_gsi_sub = p_gsi.add_subparsers(dest="gsi_cmd", required=True)
+    p_gsi_create = p_gsi_sub.add_parser("create")
+    p_gsi_create.add_argument("name")
+    p_gsi_create.add_argument("table")
+    p_gsi_create.add_argument("column")
+    p_gsi_create.add_argument("--include", nargs="*", default=[])
+    p_gsi_create.set_defaults(func=_cmd_gsi_create)
+    p_gsi_drop = p_gsi_sub.add_parser("drop")
+    p_gsi_drop.add_argument("name")
+    p_gsi_drop.set_defaults(func=_cmd_gsi_drop)
+    p_gsi_list = p_gsi_sub.add_parser("list")
+    p_gsi_list.set_defaults(func=_cmd_gsi_list)
+
+    p_mv = sub.add_parser("matview", help="Materialized view operations")
+    p_mv.add_argument("config", type=Path)
+    p_mv_sub = p_mv.add_subparsers(dest="matview_cmd", required=True)
+    p_mv_create = p_mv_sub.add_parser("create")
+    p_mv_create.add_argument("name")
+    p_mv_create.add_argument("query_sql")
+    p_mv_create.add_argument("--storage-table")
+    p_mv_create.add_argument("--refresh-mode", default="interval", choices=("interval", "on_mutation", "manual"))
+    p_mv_create.add_argument("--interval-sec", type=float)
+    p_mv_create.add_argument("--source-table", action="append", default=[])
+    p_mv_create.set_defaults(func=_cmd_matview_create)
+    p_mv_refresh = p_mv_sub.add_parser("refresh")
+    p_mv_refresh.add_argument("name")
+    p_mv_refresh.set_defaults(func=_cmd_matview_refresh)
+    p_mv_drop = p_mv_sub.add_parser("drop")
+    p_mv_drop.add_argument("name")
+    p_mv_drop.set_defaults(func=_cmd_matview_drop)
+    p_mv_list = p_mv_sub.add_parser("list")
+    p_mv_list.set_defaults(func=_cmd_matview_list)
+    p_mv_tick = p_mv_sub.add_parser("tick")
+    p_mv_tick.add_argument("--force", action="store_true")
+    p_mv_tick.set_defaults(func=_cmd_matview_tick)
+
+    p_cdc = sub.add_parser("cdc", help="CDC poll/publish controls")
+    p_cdc.add_argument("config", type=Path)
+    p_cdc_sub = p_cdc.add_subparsers(dest="cdc_cmd", required=True)
+    p_cdc_poll = p_cdc_sub.add_parser("poll")
+    p_cdc_poll.add_argument("--after", type=int, default=0)
+    p_cdc_poll.add_argument("--limit", type=int, default=1000)
+    p_cdc_poll.set_defaults(func=_cmd_cdc_poll)
+    p_cdc_pub = p_cdc_sub.add_parser("publish")
+    p_cdc_pub.add_argument("consumer_group")
+    p_cdc_pub.add_argument("--limit", type=int, default=500)
+    p_cdc_pub.set_defaults(func=_cmd_cdc_publish)
+    p_cdc_pub_b = p_cdc_sub.add_parser("publish-batched")
+    p_cdc_pub_b.add_argument("consumer_group")
+    p_cdc_pub_b.add_argument("--limit", type=int, default=500)
+    p_cdc_pub_b.add_argument("--chunk-size", type=int, default=100)
+    p_cdc_pub_b.set_defaults(func=_cmd_cdc_publish_batched)
+
+    p_dj = sub.add_parser("distributed-join", help="Execute distributed cross-shard join spec")
+    p_dj.add_argument("config", type=Path)
+    p_dj.add_argument("spec", type=Path)
+    p_dj.set_defaults(func=_cmd_distributed_join)
+    p_dj_stream = sub.add_parser("distributed-join-stream", help="Execute distributed join with chunked output")
+    p_dj_stream.add_argument("config", type=Path)
+    p_dj_stream.add_argument("spec", type=Path)
+    p_dj_stream.add_argument("--chunk-size", type=int, default=250)
+    p_dj_stream.set_defaults(func=_cmd_distributed_join_stream)
+
+    p_sm = sub.add_parser("split-merge", help="Shard split/merge operations")
+    p_sm.add_argument("config", type=Path)
+    p_sm_sub = p_sm.add_subparsers(dest="sm_cmd", required=True)
+    p_sm_split = p_sm_sub.add_parser("split")
+    p_sm_split.add_argument("shard")
+    p_sm_split.add_argument("split_key")
+    p_sm_split.set_defaults(func=_cmd_split_shard)
+    p_sm_split_c = p_sm_sub.add_parser("split-chunked")
+    p_sm_split_c.add_argument("shard")
+    p_sm_split_c.add_argument("split_key")
+    p_sm_split_c.add_argument("--chunk-size", type=int, default=100)
+    p_sm_split_c.add_argument("--total-rows", type=int, default=1000)
+    p_sm_split_c.set_defaults(func=_cmd_split_shard_chunked)
+    p_sm_merge = p_sm_sub.add_parser("merge")
+    p_sm_merge.add_argument("target")
+    p_sm_merge.add_argument("sources", nargs="+")
+    p_sm_merge.set_defaults(func=_cmd_merge_shards)
+    p_sm_merge_c = p_sm_sub.add_parser("merge-chunked")
+    p_sm_merge_c.add_argument("target")
+    p_sm_merge_c.add_argument("sources", nargs="+")
+    p_sm_merge_c.add_argument("--chunk-size", type=int, default=100)
+    p_sm_merge_c.add_argument("--total-rows", type=int, default=1000)
+    p_sm_merge_c.set_defaults(func=_cmd_merge_shards_chunked)
+    p_sm_tick = p_sm_sub.add_parser("tick")
+    p_sm_tick.set_defaults(func=_cmd_split_merge_tick)
+
+    p_srv = sub.add_parser("serverless", help="Serverless lease controls")
+    p_srv.add_argument("config", type=Path)
+    p_srv_sub = p_srv.add_subparsers(dest="srv_cmd", required=True)
+    p_srv_acq = p_srv_sub.add_parser("acquire")
+    p_srv_acq.add_argument("holder")
+    p_srv_acq.set_defaults(func=_cmd_serverless_acquire)
+    p_srv_hb = p_srv_sub.add_parser("heartbeat")
+    p_srv_hb.add_argument("holder")
+    p_srv_hb.set_defaults(func=_cmd_serverless_heartbeat)
+    p_srv_tick = p_srv_sub.add_parser("tick")
+    p_srv_tick.set_defaults(func=_cmd_serverless_tick)
+
+    p_edge = sub.add_parser("edge", help="Edge node registration and sync")
+    p_edge.add_argument("config", type=Path)
+    p_edge_sub = p_edge.add_subparsers(dest="edge_cmd", required=True)
+    p_edge_reg = p_edge_sub.add_parser("register")
+    p_edge_reg.add_argument("node_id")
+    p_edge_reg.add_argument("region")
+    p_edge_reg.set_defaults(func=_cmd_edge_register)
+    p_edge_sync = p_edge_sub.add_parser("sync")
+    p_edge_sync.add_argument("node_id")
+    p_edge_sync.add_argument("--after", type=int, default=0)
+    p_edge_sync.add_argument("--limit", type=int, default=1000)
+    p_edge_sync.set_defaults(func=_cmd_edge_sync)
+
     args = parser.parse_args(argv)
     return int(args.func(args))
 
@@ -2043,14 +3223,93 @@ def _cmd_backup_all(args: argparse.Namespace) -> int:
 
 
 def _cmd_migrate(args: argparse.Namespace) -> int:
-    mig = QuasarMigration(args.source, args.target, client=_build_client(args))
-    if args.copy:
-        mig.migrate_via_checkpoint_copy()
-        print(f"Copied to {args.target}")
-    else:
-        bundle = mig.migrate_via_bundle(work_dir=args.work_dir)
-        print(f"Migrated via {bundle}")
+    from quasar.migrate_util import QuasarMigrate
+
+    source = args.source_opt or args.source
+    target = args.target_opt or args.target
+    if source is None or target is None:
+        print(json.dumps({"error": "source and target required (positional or --source/--target)"}))
+        return 1
+    tables = None
+    if getattr(args, "tables", None):
+        tables = [t.strip() for t in str(args.tables).split(",") if t.strip()]
+    mode = "copy" if args.copy and args.mode == "auto" else args.mode
+    dry = bool(args.dry_run or args.plan)
+    include_procedures = not getattr(args, "no_procedures", False)
+    include_triggers = not getattr(args, "no_triggers", False)
+    try:
+        result = QuasarMigrate(client=_build_client(args)).run(
+            source,
+            target,
+            mode=mode,
+            tables=tables,
+            work_dir=args.work_dir,
+            bundle_format=args.format,
+            use_copy=bool(args.copy),
+            dry_run=dry,
+            include_procedures=include_procedures,
+            include_triggers=include_triggers,
+            source_schema=getattr(args, "schema", None),
+        )
+    except Exception as err:
+        print(json.dumps({"error": str(err)}))
+        return 1
+    print(json.dumps(result, indent=2))
     return 0
+
+
+def _default_gateway_keys_file(explicit: Optional[Path]) -> Path:
+    if explicit is not None:
+        return explicit.resolve()
+    env = os.environ.get("QUASAR_GATEWAY_KEYS_FILE")
+    if env:
+        return Path(env).resolve()
+    return Path.cwd() / ".quasar" / "gateway_keys.json"
+
+
+def _cmd_gateway_key_create(args: argparse.Namespace) -> int:
+    from quasar.gateway_keys import GatewayKeyStore
+
+    path = _default_gateway_keys_file(args.keys_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    store = GatewayKeyStore(path)
+    scopes = [s.strip() for s in str(args.scopes).split(",") if s.strip()]
+    expires = float(args.expires_days) * 86400.0 if args.expires_days else None
+    token, key_id = store.create_key(scopes=scopes, description=args.description, expires_in_sec=expires)
+    print(
+        json.dumps(
+            {
+                "key_id": key_id,
+                "token": token,
+                "keys_file": str(path),
+                "note": "Store the token securely; it cannot be retrieved again.",
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_gateway_key_list(args: argparse.Namespace) -> int:
+    from quasar.gateway_keys import GatewayKeyStore
+
+    path = _default_gateway_keys_file(args.keys_file)
+    if not path.is_file():
+        print(json.dumps({"keys": [], "keys_file": str(path)}))
+        return 0
+    store = GatewayKeyStore(path)
+    print(json.dumps({"keys_file": str(path), "keys": store.list_keys()}, indent=2))
+    return 0
+
+
+def _cmd_gateway_key_revoke(args: argparse.Namespace) -> int:
+    from quasar.gateway_keys import GatewayKeyStore
+
+    path = _default_gateway_keys_file(args.keys_file)
+    store = GatewayKeyStore(path)
+    ok = store.revoke_key(args.key_id)
+    print(json.dumps({"revoked": ok, "key_id": args.key_id, "keys_file": str(path)}))
+    return 0 if ok else 1
 
 
 def _cmd_gateway(args: argparse.Namespace) -> int:
@@ -2060,7 +3319,10 @@ def _cmd_gateway(args: argparse.Namespace) -> int:
     cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
     if args.require_auth:
         cluster.security = replace(cluster.security, require_gateway_auth=True)
-    app = create_gateway_app(cluster, api_key=api_key)
+    keys_file = args.keys_file or (
+        Path(cluster.security.gateway_keys_file) if cluster.security.gateway_keys_file else None
+    )
+    app = create_gateway_app(cluster, api_key=api_key, key_store_path=keys_file)
     try:
         app.run(host=args.host, port=args.port)
     finally:
@@ -2421,6 +3683,241 @@ def _cmd_journal(args: argparse.Namespace) -> int:
         print(json.dumps({"error": "financial not enabled"}))
         return 1
     print(json.dumps(cluster.journal.tail(args.limit), indent=2))
+    return 0
+
+
+def _cmd_pitr_restore(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    if getattr(args, "archive_marker", None):
+        try:
+            out = cluster.pitr_archive_wal(args.archive_marker)
+        except Exception as err:
+            print(json.dumps({"error": str(err)}))
+            return 1
+        print(json.dumps({"archived": out}))
+        return 0
+    if not getattr(args, "marker", None) and not getattr(args, "restore_time", None):
+        print(json.dumps({"error": "pass --marker or --time"}))
+        return 1
+    try:
+        if getattr(args, "marker", None):
+            out = cluster.restore_to_marker(args.marker, args.target_db, overwrite=args.overwrite)
+        else:
+            out = cluster.restore_to_time(args.restore_time, args.target_db, overwrite=args.overwrite)
+    except Exception as err:
+        print(json.dumps({"error": str(err)}))
+        return 1
+    print(json.dumps({"restored": str(out)}))
+    return 0
+
+
+def _cmd_upgrade_start(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(json.dumps(cluster.upgrade_start(args.target_version), indent=2))
+    return 0
+
+
+def _cmd_upgrade_tick(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(json.dumps(cluster.upgrade_tick(), indent=2))
+    return 0
+
+
+def _cmd_upgrade_status(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(json.dumps(cluster.upgrade_status(), indent=2))
+    return 0
+
+
+def _cmd_gsi_create(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(
+        json.dumps(
+            cluster.gsi_create(
+                name=args.name,
+                table=args.table,
+                column=args.column,
+                include_columns=list(args.include),
+            ),
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_gsi_drop(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(json.dumps(cluster.gsi_drop(args.name), indent=2))
+    return 0
+
+
+def _cmd_gsi_list(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(json.dumps(cluster.gsi_list(), indent=2))
+    return 0
+
+
+def _cmd_matview_create(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(
+        json.dumps(
+            cluster.matview_create(
+                name=args.name,
+                query_sql=args.query_sql,
+                storage_table=args.storage_table,
+                refresh_mode=args.refresh_mode,
+                interval_sec=args.interval_sec,
+                source_tables=list(args.source_table) if args.source_table else None,
+            ),
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_matview_refresh(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(json.dumps(cluster.matview_refresh(args.name), indent=2))
+    return 0
+
+
+def _cmd_matview_drop(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(json.dumps(cluster.matview_drop(args.name), indent=2))
+    return 0
+
+
+def _cmd_matview_list(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(json.dumps(cluster.matview_list(), indent=2))
+    return 0
+
+
+def _cmd_matview_tick(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(json.dumps(cluster.matview_tick(force=args.force), indent=2))
+    return 0
+
+
+def _cmd_cdc_poll(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(json.dumps(cluster.cdc_poll(after_commit=args.after, limit=args.limit), indent=2))
+    return 0
+
+
+def _cmd_cdc_publish(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(json.dumps(cluster.cdc_publish(args.consumer_group, limit=args.limit), indent=2))
+    return 0
+
+
+def _cmd_cdc_publish_batched(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(
+        json.dumps(
+            cluster.cdc_publish_batched(
+                args.consumer_group, limit=args.limit, chunk_size=args.chunk_size
+            ),
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_distributed_join(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(json.dumps(cluster.distributed_join_execute(args.spec), indent=2))
+    return 0
+
+
+def _cmd_distributed_join_stream(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(
+        json.dumps(
+            cluster.distributed_join_execute_stream(args.spec, chunk_size=args.chunk_size),
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_split_shard(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(json.dumps(cluster.split_shard(args.shard, split_key=args.split_key), indent=2))
+    return 0
+
+
+def _cmd_split_shard_chunked(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(
+        json.dumps(
+            cluster.split_shard_chunked(
+                args.shard,
+                split_key=args.split_key,
+                chunk_size=args.chunk_size,
+                total_rows=args.total_rows,
+            ),
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_merge_shards(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(json.dumps(cluster.merge_shards(list(args.sources), target=args.target), indent=2))
+    return 0
+
+
+def _cmd_merge_shards_chunked(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(
+        json.dumps(
+            cluster.merge_shards_chunked(
+                list(args.sources),
+                target=args.target,
+                chunk_size=args.chunk_size,
+                total_rows=args.total_rows,
+            ),
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_split_merge_tick(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(json.dumps(cluster.split_merge_tick(), indent=2))
+    return 0
+
+
+def _cmd_serverless_acquire(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(json.dumps(cluster.serverless_acquire(args.holder), indent=2))
+    return 0
+
+
+def _cmd_serverless_heartbeat(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(json.dumps(cluster.serverless_heartbeat(args.holder), indent=2))
+    return 0
+
+
+def _cmd_serverless_tick(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(json.dumps(cluster.serverless_tick(), indent=2))
+    return 0
+
+
+def _cmd_edge_register(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(json.dumps(cluster.edge_register(args.node_id, args.region), indent=2))
+    return 0
+
+
+def _cmd_edge_sync(args: argparse.Namespace) -> int:
+    cluster = QuasarCluster.from_file(args.config, client=_build_client(args))
+    print(json.dumps(cluster.edge_sync(args.node_id, after_commit=args.after, limit=args.limit), indent=2))
     return 0
 
 

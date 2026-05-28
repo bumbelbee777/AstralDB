@@ -17,9 +17,8 @@ if str(_REPO_ROOT) not in sys.path:
 from quasar.client import AstralDBClient  # noqa: E402
 
 
-@pytest.fixture
-def mock_astraldb(tmp_path: Path) -> Path:
-    """Minimal AstralDB CLI stub for subprocess tests."""
+def create_mock_astraldb(tmp_path: Path) -> Path:
+    """Build a minimal AstralDB CLI stub executable under *tmp_path*."""
     script = tmp_path / "mock_astraldb.py"
     script.write_text(
         r'''
@@ -115,7 +114,38 @@ if __name__ == "__main__":
 
 
 @pytest.fixture
+def mock_astraldb(tmp_path: Path) -> Path:
+    return create_mock_astraldb(tmp_path)
+
+
+@pytest.fixture(scope="session")
+def astraldb_bin() -> Path | None:
+    """Release binary under bin/ (preferred for integration tests)."""
+    exe = _REPO_ROOT / "bin" / "astraldb.exe"
+    if exe.is_file():
+        return exe
+    alt = _REPO_ROOT / "bin" / "astraldb"
+    return alt if alt.is_file() else None
+
+
+@pytest.fixture
 def mock_client(mock_astraldb: Path) -> AstralDBClient:
+    """Fast stub CLI for unit tests (default suite)."""
+    return AstralDBClient(executable=mock_astraldb, timeout_sec=10.0)
+
+
+@pytest.fixture
+def mock_only_client(mock_astraldb: Path) -> AstralDBClient:
+    """Alias for mock_client (tests that assert mock-specific stdout)."""
+    return AstralDBClient(executable=mock_astraldb, timeout_sec=10.0)
+
+
+@pytest.fixture
+def astraldb_client(astraldb_bin: Path | None, mock_astraldb: Path) -> AstralDBClient:
+    """Integration client: prefers bin/astraldb.exe, falls back to mock if missing."""
+    force_mock = os.environ.get("QUASAR_TEST_MOCK", "").strip().lower() in ("1", "true", "yes")
+    if not force_mock and astraldb_bin is not None:
+        return AstralDBClient(executable=astraldb_bin, timeout_sec=180.0)
     return AstralDBClient(executable=mock_astraldb, timeout_sec=10.0)
 
 

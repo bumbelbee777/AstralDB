@@ -136,33 +136,40 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: List release assets
-        run: find artifacts -type f | sort
+      - name: Stage release assets and SHA256SUMS
+        run: bash .github/scripts/stage-release-assets.sh artifacts release
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**
+          files: release/*
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
           body: |
-            ## AstralDB v1.0
+            ## AstralDB ${{ github.ref_name }}
 
             ### `astraldb` CLI (single static executable, no runtime deps)
 
             | Platform | Asset |
             |----------|-------|
-            | Linux x86_64 | `astraldb-linux-amd64/astraldb` |
-            | macOS Apple Silicon (arm64) | `astraldb-macos-arm64/astraldb` |
-            | Windows x86_64 | `astraldb-windows-amd64/astraldb.exe` |
+            | Linux x86_64 | `astraldb-linux-amd64` |
+            | macOS Apple Silicon (arm64) | `astraldb-macos-arm64` |
+            | Windows x86_64 | `astraldb-windows-amd64.exe` |
 
-            Download the binary for your OS, mark it executable on Unix (`chmod +x astraldb`), and run `./astraldb -v`.
+            Download the binary for your OS, mark it executable on Unix (`chmod +x astraldb-linux-amd64`), and run `./astraldb-linux-amd64 -v` (rename if you prefer).
+
+            ### Verify downloads
+
+            ```bash
+            sha256sum -c SHA256SUMS
+            ```
 
             ### Quasar orchestration (Python)
 
-            Install from the attached wheel (version matches this tag):
+            Install from the attached `quasar-*-py3-none-any.whl` (version matches this tag):
 
             ```bash
-            pip install quasar-1.0.0-py3-none-any.whl
+            pip install quasar-*-py3-none-any.whl
             export QUASAR_ASTRALDB=/path/to/astraldb
             python -m quasar --help
             ```

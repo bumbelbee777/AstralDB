@@ -107,6 +107,7 @@ def test_gateway_constant_time_auth(tmp_path: Path):
     cfg = {
         "shards": [{"name": "s0", "database": str(tmp_path / "s0.db")}],
         "virtual_nodes": 8,
+        "security": {"require_gateway_auth": True},
     }
     cluster = QuasarCluster(cfg, config_path=tmp_path / "cluster.json")
     app = create_gateway_app(cluster, api_key="correct-key")
@@ -120,6 +121,6 @@ def test_gateway_constant_time_auth(tmp_path: Path):
     good = client.post(
         "/query",
         json={"sql": "SELECT 1"},
-        headers={"X-Quasar-Key": "correct-key"},
+        headers={"Authorization": "Bearer correct-key"},
     )
     assert good.status_code in (200, 500)  # mock CLI may error; auth passed

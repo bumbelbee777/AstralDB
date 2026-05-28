@@ -46,6 +46,9 @@ class BytecodeInterpreter {
 	std::optional<StorageLayout> SessionStorageHint_;
 	/** Extra SELECT columns pushed by the most recent \c COLUMNS_EXPAND in this query. */
 	size_t ColumnsExpandExtra_ = 0;
+	int64_t SessionIsolation_ = 0;
+	std::unordered_map<std::string, std::string> TableComments_;
+	std::unordered_map<std::string, std::unordered_map<std::string, std::string>> ColumnComments_;
 
 	struct ProcTryFrame {
 		std::string Savepoint;
@@ -163,3 +166,4 @@ public:
 };
 } // namespace SQL
 } // namespace AstralDB
+

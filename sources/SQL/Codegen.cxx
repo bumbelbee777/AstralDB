@@ -2085,17 +2085,29 @@ void DropViewAST::EmitBytecode(BytecodeScratch &Instructions) const {
 }
 
 void CreateProcedureAST::EmitBytecode(BytecodeScratch &Instructions) const {
-	if(ExceptionHandlers_.empty())
+	if(ExceptionHandlers_.empty() && ControlFlowJson_.empty())
 		AppendInstruction(Instructions,
 		                  MakeInstruction(Opcode::CREATE_PROCEDURE, ProcedureName, BodySql_,
 		                                  static_cast<int64_t>(IfNotExists ? 1 : 0),
 		                                  static_cast<int64_t>(OrReplace ? 1 : 0), SourceDialect_));
-	else
+	else if(ControlFlowJson_.empty())
 		AppendInstruction(Instructions,
 		                  MakeInstruction(Opcode::CREATE_PROCEDURE, ProcedureName, BodySql_,
 		                                  static_cast<int64_t>(IfNotExists ? 1 : 0),
 		                                  static_cast<int64_t>(OrReplace ? 1 : 0), SourceDialect_,
 		                                  EncodeExceptionHandlersJson(ExceptionHandlers_)));
+	else if(ExceptionHandlers_.empty())
+		AppendInstruction(Instructions,
+		                  MakeInstruction(Opcode::CREATE_PROCEDURE, ProcedureName, BodySql_,
+		                                  static_cast<int64_t>(IfNotExists ? 1 : 0),
+		                                  static_cast<int64_t>(OrReplace ? 1 : 0), SourceDialect_,
+		                                  std::string(), ControlFlowJson_));
+	else
+		AppendInstruction(Instructions,
+		                  MakeInstruction(Opcode::CREATE_PROCEDURE, ProcedureName, BodySql_,
+		                                  static_cast<int64_t>(IfNotExists ? 1 : 0),
+		                                  static_cast<int64_t>(OrReplace ? 1 : 0), SourceDialect_,
+		                                  EncodeExceptionHandlersJson(ExceptionHandlers_), ControlFlowJson_));
 }
 
 void DropProcedureAST::EmitBytecode(BytecodeScratch &Instructions) const {

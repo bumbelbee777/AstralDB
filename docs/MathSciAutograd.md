@@ -21,6 +21,17 @@ Diagonal contributions for elementwise maps \(y = f(x)\): `AD_HESSIAN(second_der
 | `AD_HESSIAN_RELU(x, upstream)` | 2 | Zeros (ReLU has zero curvature). |
 | `AD_HESSIAN_SIGMOID(y, upstream)` | 2 | Uses sigmoid output `y` and upstream ∂L/∂y′. |
 | `AD_HESSIAN_SQUARE(x, upstream)` | 2 | For \(f(x)=x^2\), diagonal factor `2·upstream`. |
+| `AD_HESSIAN_TANH(y, upstream)` | 2 | Uses tanh output `y` and upstream ∂L/∂y′. |
+
+## First-order PINN helpers (real)
+
+| Function | Arity | Description |
+|----------|-------|-------------|
+| `AD_GRAD_TANH(y, upstream)` | 2 | ∂L/∂x for \(y=\tanh(x)\) given `y` and upstream. |
+| `AD_GRAD_MATVEC_IN(W, upstream)` | 2 | ∂L/∂x for \(y=Wx\); `upstream` length = rows of `W`. |
+| `AD_GRAD_MATVEC_W(W, x, upstream)` | 3 | ∂L/∂W flattened (list) for \(y=Wx\). |
+| `AD_GRAD_MSE_PRED(pred, target)` | 2 | ∂L/∂pred for mean squared error. |
+| `PINN_FD_CENTRAL(f_plus, f_minus, h)` | 3 | Central finite difference \((f_+-f_-)/(2h)\). |
 
 ## Wirtinger (complex)
 

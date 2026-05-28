@@ -1,4 +1,4 @@
-# Build AstralDB with CMake and run the full doctest suite (unit tests + examples/*.sql).
+# Build AstralDB with CMake; run fast-labelled ctest, torture_test.sql CLI smoke, and Quasar pytest.
 name: CI
 
 on:
@@ -112,11 +112,21 @@ jobs:
       - name: Test
         run: ${{ matrix.test }}
 
+      - name: SHA256 checksum (CLI)
+        shell: bash
+        run: |
+          set -euo pipefail
+          CLI="${{ matrix.cli }}"
+          sha256sum "$CLI" | awk -v f="$(basename "$CLI")" '{print $1 "  " f}' > "${CLI}.sha256"
+          cat "${CLI}.sha256"
+
       - name: Upload astraldb binary
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.cli }}
+          path: |
+            ${{ matrix.cli }}
+            ${{ matrix.cli }}.sha256
           if-no-files-found: error
 
       - name: Smoke-check CLI (torture_test.sql)
@@ -135,3 +145,37 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
           python -m pytest quasar/tests -q
+
+  quasar-wheel:
+    name: quasar-wheel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel --outdir dist
+
+      - name: SHA256 checksum (wheel)
+        shell: bash
+        run: |
+          set -euo pipefail
+          WHEEL=(dist/*.whl)
+          sha256sum "${WHEEL[0]}" | awk -v f="$(basename "${WHEEL[0]}")" '{print $1 "  " f}' > dist/quasar-wheel.sha256
+          cat dist/quasar-wheel.sha256
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: quasar-wheel
+          path: dist/*
+          if-no-files-found: error

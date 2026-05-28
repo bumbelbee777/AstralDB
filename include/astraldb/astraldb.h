@@ -2,25 +2,45 @@
 
 #include <stddef.h>
 
+#define ASTRALDB_VERSION "2.0"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef struct astraldb_t astraldb_t;
-typedef struct astraldb_stmt_t astraldb_stmt_t;
+typedef struct AstralDb AstralDb;
+typedef struct AstralDbStmt AstralDbStmt;
 
-int astraldb_open(const char *path, astraldb_t **out_db);
-void astraldb_close(astraldb_t *db);
+/** Per-cell callback for \c AstralDbExecQuery (\c Row is 0-based). Return non-zero to stop. */
+typedef int (*AstralDbRowCallback)(void *Ctx, int Row, int Col, const char *ColName, const char *ColText);
 
-int astraldb_exec(astraldb_t *db, const char *sql);
-const char *astraldb_last_error(const astraldb_t *db);
+const char *AstralDbVersion(void);
 
-int astraldb_prepare(astraldb_t *db, const char *sql, astraldb_stmt_t **out_stmt);
-int astraldb_stmt_step(astraldb_stmt_t *stmt);
-int astraldb_stmt_column_count(const astraldb_stmt_t *stmt);
-const char *astraldb_stmt_column_name(const astraldb_stmt_t *stmt, int col);
-const char *astraldb_stmt_column_text(const astraldb_stmt_t *stmt, int col);
-void astraldb_stmt_finalize(astraldb_stmt_t *stmt);
+int AstralDbOpen(const char *Path, AstralDb **OutDb);
+void AstralDbClose(AstralDb *Db);
+
+int AstralDbExec(AstralDb *Db, const char *Sql);
+const char *AstralDbLastError(const AstralDb *Db);
+
+/** Execute a registered procedure by name (equivalent to \c CALL Name;). */
+int AstralDbCall(AstralDb *Db, const char *ProcedureName);
+
+/**
+ * Run a \c SELECT and invoke \c Callback once per column per row.
+ * \c ColText may be null when the cell is SQL NULL.
+ */
+int AstralDbExecQuery(AstralDb *Db, const char *Sql, AstralDbRowCallback Callback, void *Ctx);
+
+int AstralDbPrepare(AstralDb *Db, const char *Sql, AstralDbStmt **OutStmt);
+/** Bind a \c ? placeholder (1-based index) before \c AstralDbPrepare or after \c AstralDbStmtReset. */
+int AstralDbBindInt64(AstralDbStmt *Stmt, int Index, long long Value);
+int AstralDbBindText(AstralDbStmt *Stmt, int Index, const char *Value);
+int AstralDbStmtStep(AstralDbStmt *Stmt);
+void AstralDbStmtReset(AstralDbStmt *Stmt);
+int AstralDbStmtColumnCount(const AstralDbStmt *Stmt);
+const char *AstralDbStmtColumnName(const AstralDbStmt *Stmt, int Col);
+const char *AstralDbStmtColumnText(const AstralDbStmt *Stmt, int Col);
+void AstralDbStmtFinalize(AstralDbStmt *Stmt);
 
 #ifdef __cplusplus
 }

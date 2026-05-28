@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -9,6 +11,24 @@ namespace AstralDB {
 namespace MathSciSolves {
 
 constexpr size_t MaxSolveLen = 1u << 20;
+/** Max explicit ODE steps per \c DEQ_INTEGRATE call (keeps wall time in the tens of ms). */
+constexpr size_t MaxOdeIntegrateSteps = 8192;
+
+enum class OdeMethodTag : std::uint8_t {
+	Euler,
+	Heun,
+	Midpoint,
+	Rk3,
+	Rk4,
+	Implicit,
+	Trapezoid,
+	SemiImplicit,
+	CrankNicolson,
+	AdamsBashforth2,
+	Unknown,
+};
+
+OdeMethodTag ParseOdeMethod(std::string_view Method);
 
 /** One explicit Euler step: y + dt·slope (scalar). */
 double OdeEulerScalar(double Y0, double Dt, double Slope);
@@ -169,6 +189,30 @@ double RootSecantStepFromReal(double X0, double X1, double F0, double F1);
 double RootBisectStepFromReal(double Lo, double Hi, double Flo, double Fhi);
 double RootHalleyStepFromReal(double X, double Fx, double Dfx, double D2fx);
 double RootSolveStepFromReal(std::string_view Method, double A, double B, double C, double D);
+
+/** Fused explicit march (float path, no per-step heap). \p K2–\p K4 may be empty for low-order methods. */
+std::vector<double> DeqIntegrateFromReal(std::string_view Method, const std::vector<double> &Y, double Dt,
+                                          size_t Steps, const std::vector<double> &K1, const std::vector<double> &K2,
+                                          const std::vector<double> &K3, const std::vector<double> &K4);
+
+/** Adaptive RK4 pair (step-doubling) with constant slopes; advances from \p T0 toward \p T1. */
+std::vector<double> DeqAdaptFromReal(std::string_view Method, const std::vector<double> &Y, double T0, double T1,
+                                     double HInit, double Rtol, double Atol, const std::vector<double> &K1,
+                                     const std::vector<double> &K2, const std::vector<double> &K3,
+                                     const std::vector<double> &K4);
+
+/** Uniform time grid \p T0..\p T1 with \p N points (inclusive). */
+std::optional<std::vector<double>> DeqLinspaceFromReal(double T0, double T1, size_t N);
+
+std::optional<std::string> DeqIntegrateCellFromReal(const std::string &Method, const std::string &Y, const std::string &Dt,
+                                                  const std::string &Steps, const std::string &K1,
+                                                  const std::string &K2, const std::string &K3, const std::string &K4);
+std::optional<std::string> DeqAdaptCellFromReal(const std::string &Method, const std::string &Y, const std::string &T0,
+                                                const std::string &T1, const std::string &HInit,
+                                                const std::string &Rtol, const std::string &Atol,
+                                                const std::string &K1, const std::string &K2, const std::string &K3,
+                                                const std::string &K4);
+std::optional<std::string> DeqLinspaceCellFromReal(const std::string &T0, const std::string &T1, const std::string &N);
 
 } // namespace MathSciSolves
 } // namespace AstralDB

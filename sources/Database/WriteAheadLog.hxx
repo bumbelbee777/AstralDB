@@ -14,12 +14,20 @@ namespace AstralDB {
 
 class Database;
 
+struct WalSegmentMetadata {
+	std::string TimelineId = "main";
+	std::string SegmentStartMarker;
+	std::string SegmentEndMarker;
+	uint64_t ApproxChecksum = 0;
+};
+
 /** Append-only redo log for durability between checkpoints. Truncated after a successful SyncToFile. */
 class WriteAheadLog {
 	std::filesystem::path WalPath_;
 	std::array<uint8_t, 32> WalKey_;
 	Mutex Mut_;
 	std::vector<std::string> BufferedLines_;
+	WalSegmentMetadata SegmentMeta_;
 
 	void FlushBufferedUnlocked();
 	std::string EncryptRecordToLine(std::string_view PlainLine) const;
@@ -36,6 +44,8 @@ public:
 	void Flush();
 	void Replay(Database &Db);
 	void Truncate();
+	const WalSegmentMetadata &SegmentMetadata() const { return SegmentMeta_; }
+	void SetTimelineId(std::string TimelineId) { SegmentMeta_.TimelineId = std::move(TimelineId); }
 
 	~WriteAheadLog();
 };

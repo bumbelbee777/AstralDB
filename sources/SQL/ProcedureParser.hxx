@@ -19,10 +19,26 @@ struct ProcedureExceptionWhen {
 	std::string HandlerSql;
 };
 
+struct ProcedureIfBranch;
+
+/** Linear SQL prefix followed by an optional conditional chain (may repeat per procedure body). */
+struct ProcedureControlSegment {
+	std::string LinearSql;
+	std::vector<ProcedureIfBranch> IfBranches;
+};
+
+/** One arm of a runtime \c IF / \c ELSIF / \c ELSE or \c CASE … \c WHEN chain (empty \c Condition = ELSE). */
+struct ProcedureIfBranch {
+	std::string ConditionSql;
+	std::vector<ProcedureControlSegment> Segments;
+};
+
 /** Lowered try body plus optional exception handlers for bytecode stitching. */
 struct LoweredProcedureBody {
-	std::string TryBodySql;
+	std::vector<ProcedureControlSegment> Segments;
 	std::vector<ProcedureExceptionWhen> ExceptionHandlers;
+	/** Flattened linear SQL (no control flow) for metadata and legacy callers. */
+	std::string TryBodySql;
 };
 
 struct ProcedureParseResult {

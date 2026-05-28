@@ -37,6 +37,20 @@ from quasar.recovery_auto import CrashRecoveryManager, RecoveryAutomationConfig
 from quasar.crossquery import CrossQueryResult, CrossQuerySpec, QuasarCrossQuery, parse_stdout_rows
 from quasar.autoscale import AutoscaleConfig, AutoscaleDecision, QuasarAutoscale
 from quasar.consensus import ClusterConsensus, ConsensusConfig, build_consensus
+from quasar.fdw import FdwManager, FdwResult, ForeignSource, ForeignTable
+from quasar.gsi import GlobalSecondaryIndex, GlobalSecondaryIndexManager
+from quasar.matview import MaterializedViewManager, MaterializedViewSpec
+from quasar.migrate_util import MigrationPlan, QuasarMigrate, detect_migration_mode, is_sqlite_file
+from quasar.migrate_sources import export_external_bundle, is_database_uri, parse_database_uri
+from quasar.proc_trigger import ProcedureSpec, QuasarProcTrigger, TriggerSpec
+from quasar.gateway_keys import GatewayKeyStore, format_api_token
+from quasar.cdc import BinaryFileCdcSink, CdcCheckpointStore, CdcEvent, FileCdcSink, QuasarCdcPublisher
+from quasar.binary_ipc import decode_frames, encode_frames
+from quasar.distjoin import DistributedJoinPlan, DistributedJoinPlanner, QuasarDistributedJoinExecutor
+from quasar.edge import EdgeNode, EdgeRegistry
+from quasar.serverless import QuasarServerlessController
+from quasar.splitmerge import QuasarSplitMergeController
+from quasar.ops import QuasarUpgradeController
 from quasar.rebalance_auto import QuasarRebalanceAutomator, RebalanceAutomationConfig
 from quasar.inventory import QuasarInventory
 from quasar.ops import QuasarRolling, QuasarWatch, repair_replica_set, shard_ring_map
@@ -130,4 +144,39 @@ __all__ = [
     "build_consensus",
     "QuasarRebalanceAutomator",
     "RebalanceAutomationConfig",
+    "FdwManager",
+    "FdwResult",
+    "ForeignSource",
+    "ForeignTable",
+    "GlobalSecondaryIndex",
+    "GlobalSecondaryIndexManager",
+    "MaterializedViewManager",
+    "MaterializedViewSpec",
+    "QuasarMigrate",
+    "MigrationPlan",
+    "detect_migration_mode",
+    "is_sqlite_file",
+    "is_database_uri",
+    "parse_database_uri",
+    "export_external_bundle",
+    "ProcedureSpec",
+    "TriggerSpec",
+    "QuasarProcTrigger",
+    "GatewayKeyStore",
+    "format_api_token",
+    "QuasarUpgradeController",
+    "CdcCheckpointStore",
+    "CdcEvent",
+    "FileCdcSink",
+    "QuasarCdcPublisher",
+    "DistributedJoinPlan",
+    "DistributedJoinPlanner",
+    "QuasarDistributedJoinExecutor",
+    "EdgeNode",
+    "EdgeRegistry",
+    "QuasarServerlessController",
+    "QuasarSplitMergeController",
+    "BinaryFileCdcSink",
+    "encode_frames",
+    "decode_frames",
 ]

@@ -5,6 +5,9 @@
 #include <Database/MathSciClassify.hxx>
 #include <Database/MathSciComplex.hxx>
 #include <Database/MathSciEmbeddings.hxx>
+#include <Database/MathSciModel.hxx>
+#include <Database/MathSciInference.hxx>
+#include <Database/MathSciFokkerPlanck.hxx>
 #include <Database/MathSciNlp.hxx>
 #include <Database/MathSciSimdUtil.hxx>
 #include <Database/MathSciSignal.hxx>
@@ -350,7 +353,10 @@ const std::unordered_map<std::string, Entry> &BuiltinTable() {
 	    {"LIST_SORT_DESC", {ScalarSqlFn::ListSortDesc, 1, 1}},
 	    {"LIST_REVERSE", {ScalarSqlFn::ListReverse, 1, 1}},
 	    {"JSON_EXTRACT", {ScalarSqlFn::JsonExtract, 2, 2}},
+	    {"JSON_VALUE", {ScalarSqlFn::JsonExtract, 2, 2}},
+	    {"JSON_QUERY", {ScalarSqlFn::JsonExtract, 2, 2}},
 	    {"JSON_CONTAINS", {ScalarSqlFn::JsonContains, 2, 2}},
+	    {"JSON_EXISTS", {ScalarSqlFn::JsonContains, 2, 2}},
 	    {"JSON_MERGE", {ScalarSqlFn::JsonMerge, 2, 2}},
 	    {"JSON_ARRAY_LENGTH", {ScalarSqlFn::JsonArrayLength, 1, 1}},
 	    {"JSON_KEYS", {ScalarSqlFn::JsonKeys, 1, 1}},
@@ -361,8 +367,11 @@ const std::unordered_map<std::string, Entry> &BuiltinTable() {
 	    {"REGEXP_MATCH", {ScalarSqlFn::RegexpMatch, 2, 2}},
 	    {"MATCH_AGAINST", {ScalarSqlFn::TextMatch, 2, 2}},
 	    {"XML_EXTRACT", {ScalarSqlFn::XmlExtract, 2, 2}},
+	    {"XMLQUERY", {ScalarSqlFn::XmlExtract, 2, 2}},
 	    {"XML_SERIALIZE", {ScalarSqlFn::XmlSerialize, 1, 1}},
+	    {"XMLSERIALIZE", {ScalarSqlFn::XmlSerialize, 1, 1}},
 	    {"XML_VALID", {ScalarSqlFn::XmlValid, 1, 1}},
+	    {"XMLEXISTS", {ScalarSqlFn::XmlExtract, 2, 2}},
 	    {"TEXT_RANK", {ScalarSqlFn::TextRank, 2, 2}},
 	    {"VECTOR_TOPK", {ScalarSqlFn::VectorTopK, 3, 3}},
 	    {"FFT", {ScalarSqlFn::Fft, 1, 1}},
@@ -380,6 +389,10 @@ const std::unordered_map<std::string, Entry> &BuiltinTable() {
 	    {"AD_GRAD_MUL_RHS", {ScalarSqlFn::AdGradMulRhs, 3, 3}},
 	    {"AD_GRAD_RELU", {ScalarSqlFn::AdGradRelu, 2, 2}},
 	    {"AD_GRAD_SIGMOID", {ScalarSqlFn::AdGradSigmoid, 2, 2}},
+	    {"AD_GRAD_TANH", {ScalarSqlFn::AdGradTanh, 2, 2}},
+	    {"AD_GRAD_MATVEC_IN", {ScalarSqlFn::AdGradMatVecIn, 2, 2}},
+	    {"AD_GRAD_MATVEC_W", {ScalarSqlFn::AdGradMatVecW, 3, 3}},
+	    {"AD_GRAD_MSE_PRED", {ScalarSqlFn::AdGradMsePred, 2, 2}},
 	    {"AD_GRAD_CONV1D_IN", {ScalarSqlFn::AdGradConv1dIn, 3, 3}},
 	    {"AD_GRAD_CONV1D_K", {ScalarSqlFn::AdGradConv1dK, 3, 3}},
 	    {"AD_CHAIN", {ScalarSqlFn::AdChain, 2, 2}},
@@ -387,6 +400,8 @@ const std::unordered_map<std::string, Entry> &BuiltinTable() {
 	    {"AD_HESSIAN_RELU", {ScalarSqlFn::AdHessianRelu, 2, 2}},
 	    {"AD_HESSIAN_SIGMOID", {ScalarSqlFn::AdHessianSigmoid, 2, 2}},
 	    {"AD_HESSIAN_SQUARE", {ScalarSqlFn::AdHessianSquare, 2, 2}},
+	    {"AD_HESSIAN_TANH", {ScalarSqlFn::AdHessianTanh, 2, 2}},
+	    {"PINN_FD_CENTRAL", {ScalarSqlFn::PinnFdCentral, 3, 3}},
 	    {"AD_WIRTINGER_MUL_LHS", {ScalarSqlFn::AdWirtingerMulLhs, 3, 3}},
 	    {"AD_WIRTINGER_MUL_RHS", {ScalarSqlFn::AdWirtingerMulRhs, 3, 3}},
 	    {"AD_WIRTINGER_ABS2", {ScalarSqlFn::AdWirtingerAbs2, 2, 2}},
@@ -499,6 +514,24 @@ const std::unordered_map<std::string, Entry> &BuiltinTable() {
 	    {"NLP_EMBED_LOAD", {ScalarSqlFn::NlpEmbedLoad, 1, 1}},
 	    {"NLP_EMBED_FINGERPRINT", {ScalarSqlFn::NlpEmbedFingerprint, 1, 1}},
 	    {"NLP_EMBED_MEAN", {ScalarSqlFn::NlpEmbedMean, 2, 2}},
+	    {"MATHSCI_MODEL_BUILD", {ScalarSqlFn::MathSciModelBuild, 2, 2}},
+	    {"MATHSCI_MODEL_SERIALIZE", {ScalarSqlFn::MathSciModelSerialize, 1, 1}},
+	    {"MATHSCI_MODEL_IMPORT", {ScalarSqlFn::MathSciModelImport, 1, 1}},
+	    {"MATHSCI_MODEL_LOAD", {ScalarSqlFn::MathSciModelLoad, 1, 1}},
+	    {"MATHSCI_MODEL_FINGERPRINT", {ScalarSqlFn::MathSciModelFingerprint, 1, 1}},
+	    {"PREDICT", {ScalarSqlFn::Predict, 2, 2}},
+	    {"DEQ_INTEGRATE", {ScalarSqlFn::DeqIntegrate, 8, 8}},
+	    {"DEQ_ADAPT", {ScalarSqlFn::DeqAdapt, 11, 11}},
+	    {"DEQ_LINSPACE", {ScalarSqlFn::DeqLinspace, 3, 3}},
+	    {"MCTS_SEARCH", {ScalarSqlFn::MctsSearch, 4, 4}},
+	    {"MCTS_UCT_PICK", {ScalarSqlFn::MctsUctPick, 5, 5}},
+	    {"BAYES_BETA_POST", {ScalarSqlFn::BayesBetaPost, 4, 4}},
+	    {"BAYES_NORMAL_POST", {ScalarSqlFn::BayesNormalPost, 5, 5}},
+	    {"BAYES_GRID_POST", {ScalarSqlFn::BayesGridPost, 2, 2}},
+	    {"BAYES_LOG_EVIDENCE", {ScalarSqlFn::BayesLogEvidence, 2, 2}},
+	    {"NFP_MACRO_STEP", {ScalarSqlFn::NfpMacroStep, 9, 9}},
+	    {"NFP_MACRO_MARCH", {ScalarSqlFn::NfpMacroMarch, 10, 10}},
+	    {"NFP_MACRO_MOMENTS", {ScalarSqlFn::NfpMacroMoments, 2, 2}},
 	};
 	return T;
 }
@@ -521,7 +554,8 @@ bool IsMathSciScalarFn(ScalarSqlFn Fn) {
 	return (Fn >= ScalarSqlFn::Abs && Fn <= ScalarSqlFn::TextMatch) ||
 	       (Fn >= ScalarSqlFn::XmlExtract && Fn <= ScalarSqlFn::VectorTopK) ||
 	       (Fn >= ScalarSqlFn::Fft && Fn <= ScalarSqlFn::StMeshRepair) ||
-	       (Fn >= ScalarSqlFn::OdeRk3 && Fn <= ScalarSqlFn::SolveRoot);
+	       (Fn >= ScalarSqlFn::OdeRk3 && Fn <= ScalarSqlFn::SolveRoot) ||
+	       (Fn >= ScalarSqlFn::AdGradTanh && Fn <= ScalarSqlFn::NfpMacroMoments);
 }
 
 BuiltinArity ArityFor(ScalarSqlFn Fn) {
@@ -822,6 +856,13 @@ std::optional<std::string> EvalScalar(ScalarSqlFn Fn, const std::vector<std::str
 		return FmtNum(SafeDiv(SafeDiv(Cov, static_cast<double>(A->size())), std::sqrt(*Va * *Vb)));
 	}
 	case ScalarSqlFn::Sigmoid: {
+		if(const auto V = ParseSeq(Cells[0])) {
+			std::vector<std::string> Out;
+			Out.reserve(V->size());
+			for(double X : *V)
+				Out.push_back(FmtNum(1.0 / (1.0 + std::exp(-X))));
+			return AdvancedTypes::FormatListCell(Out);
+		}
 		const auto X = UnaryNum(Cells);
 		if(!X)
 			return std::nullopt;
@@ -1406,6 +1447,58 @@ std::optional<std::string> EvalScalar(ScalarSqlFn Fn, const std::vector<std::str
 		const auto Gf = SeqToF32(P->second);
 		return FormatSeqList(ToF64Vec(MathSciSignal::AdGradSigmoidF32(Yf.data(), Gf.data(), Yf.size())));
 	}
+	case ScalarSqlFn::AdGradTanh: {
+		const auto P = BinarySeq(Cells);
+		if(!P)
+			return std::nullopt;
+		const auto Yf = SeqToF32(P->first);
+		const auto Gf = SeqToF32(P->second);
+		return FormatSeqList(ToF64Vec(MathSciSignal::AdGradTanhF32(Yf.data(), Gf.data(), Yf.size())));
+	}
+	case ScalarSqlFn::AdGradMatVecIn: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		const auto Wm = MathSciComplex::ParseNumericMat(Cells[0]);
+		const auto G = ParseSeq(Cells[1]);
+		if(!Wm || Wm->Kind != MathSciComplex::NumericKind::Real || !G || G->empty())
+			return std::nullopt;
+		const auto Gf = SeqToF32(*G);
+		if(G->size() != Wm->Rows)
+			return std::nullopt;
+		return FormatSeqList(
+		    ToF64Vec(MathSciSignal::AdGradMatVecInputF32(Wm->Flat.data(), Wm->Rows, Wm->Cols, Gf.data())));
+	}
+	case ScalarSqlFn::AdGradMatVecW: {
+		if(Cells.size() != 3)
+			return std::nullopt;
+		const auto Wm = MathSciComplex::ParseNumericMat(Cells[0]);
+		const auto X = ParseSeq(Cells[1]);
+		const auto G = ParseSeq(Cells[2]);
+		if(!Wm || Wm->Kind != MathSciComplex::NumericKind::Real || !X || !G)
+			return std::nullopt;
+		if(X->size() != Wm->Cols || G->size() != Wm->Rows)
+			return std::nullopt;
+		const auto Xf = SeqToF32(*X);
+		const auto Gf = SeqToF32(*G);
+		const auto Gw = MathSciSignal::AdGradMatVecWeightF32(Xf.data(), Wm->Cols, Gf.data(), Wm->Rows);
+		std::vector<std::string> Flat;
+		Flat.reserve(Gw.size());
+		for(float V : Gw) {
+			std::ostringstream O;
+			O.precision(12);
+			O << static_cast<double>(V);
+			Flat.push_back(std::move(O).str());
+		}
+		return AdvancedTypes::FormatListCell(Flat);
+	}
+	case ScalarSqlFn::AdGradMsePred: {
+		const auto P = BinarySeq(Cells);
+		if(!P)
+			return std::nullopt;
+		const auto Pf = SeqToF32(P->first);
+		const auto Tf = SeqToF32(P->second);
+		return FormatSeqList(ToF64Vec(MathSciSignal::AdGradMsePredF32(Pf.data(), Tf.data(), Pf.size())));
+	}
 	case ScalarSqlFn::AdGradConv1dIn: {
 		if(Cells.size() != 3)
 			return std::nullopt;
@@ -1467,6 +1560,22 @@ std::optional<std::string> EvalScalar(ScalarSqlFn Fn, const std::vector<std::str
 		if(!P)
 			return std::nullopt;
 		return FormatSeqList(MathSciAutograd::AdHessianSquareFromReal(P->first, P->second));
+	}
+	case ScalarSqlFn::AdHessianTanh: {
+		const auto P = BinarySeq(Cells);
+		if(!P)
+			return std::nullopt;
+		return FormatSeqList(MathSciAutograd::AdHessianTanhFromReal(P->first, P->second));
+	}
+	case ScalarSqlFn::PinnFdCentral: {
+		if(Cells.size() != 3)
+			return std::nullopt;
+		const auto Fp = ToNum(Cells[0]);
+		const auto Fm = ToNum(Cells[1]);
+		const auto H = ToNum(Cells[2]);
+		if(!Fp || !Fm || !H || *H == 0.0)
+			return std::nullopt;
+		return FmtNum((*Fp - *Fm) / (2.0 * *H));
 	}
 	case ScalarSqlFn::AdWirtingerMulLhs: {
 		if(Cells.size() != 3)
@@ -2485,6 +2594,60 @@ std::optional<std::string> EvalScalar(ScalarSqlFn Fn, const std::vector<std::str
 		return Cells.size() == 1 ? MathSciEmbeddings::FingerprintCellFromReal(Cells[0]) : std::nullopt;
 	case ScalarSqlFn::NlpEmbedMean:
 		return Cells.size() == 2 ? MathSciEmbeddings::MeanCellFromReal(Cells[0], Cells[1], Db) : std::nullopt;
+	case ScalarSqlFn::MathSciModelBuild:
+		return Cells.size() == 2 ? MathSciModel::BuildCellFromReal(Cells[0], Cells[1]) : std::nullopt;
+	case ScalarSqlFn::MathSciModelSerialize:
+		return Cells.size() == 1 ? MathSciModel::SerializeCellFromReal(Cells[0]) : std::nullopt;
+	case ScalarSqlFn::MathSciModelImport:
+		return Cells.size() == 1 ? MathSciModel::ImportCellFromReal(Cells[0]) : std::nullopt;
+	case ScalarSqlFn::MathSciModelLoad:
+		return Cells.size() == 1 ? MathSciModel::LoadCellFromReal(Cells[0]) : std::nullopt;
+	case ScalarSqlFn::MathSciModelFingerprint:
+		return Cells.size() == 1 ? MathSciModel::FingerprintCellFromReal(Cells[0]) : std::nullopt;
+	case ScalarSqlFn::Predict:
+		return Cells.size() == 2 ? MathSciModel::PredictCellFromReal(Cells[0], Cells[1]) : std::nullopt;
+	case ScalarSqlFn::DeqIntegrate:
+		return Cells.size() == 8 ? MathSciSolves::DeqIntegrateCellFromReal(Cells[0], Cells[1], Cells[2], Cells[3],
+		                                                                   Cells[4], Cells[5], Cells[6], Cells[7])
+		                         : std::nullopt;
+	case ScalarSqlFn::DeqAdapt:
+		return Cells.size() == 11
+		           ? MathSciSolves::DeqAdaptCellFromReal(Cells[0], Cells[1], Cells[2], Cells[3], Cells[4], Cells[5],
+		                                                 Cells[6], Cells[7], Cells[8], Cells[9], Cells[10])
+		           : std::nullopt;
+	case ScalarSqlFn::DeqLinspace:
+		return Cells.size() == 3 ? MathSciSolves::DeqLinspaceCellFromReal(Cells[0], Cells[1], Cells[2]) : std::nullopt;
+	case ScalarSqlFn::MctsSearch:
+		return Cells.size() == 4 ? MathSciInference::MctsSearchCellFromReal(Cells[0], Cells[1], Cells[2], Cells[3])
+		                         : std::nullopt;
+	case ScalarSqlFn::MctsUctPick:
+		return Cells.size() == 5 ? MathSciInference::MctsUctPickCellFromReal(Cells[0], Cells[1], Cells[2], Cells[3],
+		                                                                      Cells[4])
+		                         : std::nullopt;
+	case ScalarSqlFn::BayesBetaPost:
+		return Cells.size() == 4
+		           ? MathSciInference::BayesBetaPostCellFromReal(Cells[0], Cells[1], Cells[2], Cells[3])
+		           : std::nullopt;
+	case ScalarSqlFn::BayesNormalPost:
+		return Cells.size() == 5 ? MathSciInference::BayesNormalPostCellFromReal(Cells[0], Cells[1], Cells[2], Cells[3],
+		                                                                           Cells[4])
+		                         : std::nullopt;
+	case ScalarSqlFn::BayesGridPost:
+		return Cells.size() == 2 ? MathSciInference::BayesGridPostCellFromReal(Cells[0], Cells[1]) : std::nullopt;
+	case ScalarSqlFn::BayesLogEvidence:
+		return Cells.size() == 2 ? MathSciInference::BayesLogEvidenceCellFromReal(Cells[0], Cells[1]) : std::nullopt;
+	case ScalarSqlFn::NfpMacroStep:
+		return Cells.size() == 9
+		           ? MathSciFokkerPlanck::NfpMacroStepCellFromReal(Cells[0], Cells[1], Cells[2], Cells[3], Cells[4],
+		                                                             Cells[5], Cells[6], Cells[7], Cells[8])
+		           : std::nullopt;
+	case ScalarSqlFn::NfpMacroMarch:
+		return Cells.size() == 10
+		           ? MathSciFokkerPlanck::NfpMacroMarchCellFromReal(Cells[0], Cells[1], Cells[2], Cells[3], Cells[4],
+		                                                              Cells[5], Cells[6], Cells[7], Cells[8], Cells[9])
+		           : std::nullopt;
+	case ScalarSqlFn::NfpMacroMoments:
+		return Cells.size() == 2 ? MathSciFokkerPlanck::NfpMacroMomentsCellFromReal(Cells[0], Cells[1]) : std::nullopt;
 	default:
 		return std::nullopt;
 	}
