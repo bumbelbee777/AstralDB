@@ -142,7 +142,6 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-          merge-multiple: true
 
       - name: Stage release assets and SHA256SUMS
         run: bash .github/scripts/stage-release-assets.sh artifacts release
