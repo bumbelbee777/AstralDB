@@ -38,6 +38,7 @@
 #include <string_view>
 #include <new>
 #include <cctype>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <numeric>
@@ -115,6 +116,39 @@ static std::optional<double> TryParseWindowNumeric(const std::string &Cell) {
 		const double D = std::stod(Cell, &Pos);
 		if(Pos > 0)
 			return D;
+	} catch(...) {
+	}
+	return std::nullopt;
+}
+
+static std::optional<int64_t> ParseTimezoneOffsetMinutes(const std::string &S) {
+	if(S.empty())
+		return std::nullopt;
+	bool HasColon = S.find(':') != std::string::npos;
+	if((S[0] == '+' || S[0] == '-') && (HasColon || S.size() == 5)) {
+		const int Sign = S[0] == '-' ? -1 : 1;
+		std::string Hs;
+		std::string Ms;
+		if(HasColon) {
+			const size_t Pos = S.find(':');
+			Hs = S.substr(1, Pos - 1);
+			Ms = S.substr(Pos + 1);
+		} else {
+			Hs = S.substr(1, 2);
+			Ms = S.substr(3, 2);
+		}
+		try {
+			const int64_t H = std::stoll(Hs);
+			const int64_t M = std::stoll(Ms);
+			if(M < 0 || M > 59)
+				return std::nullopt;
+			return Sign * (H * 60 + M);
+		} catch(...) {
+			return std::nullopt;
+		}
+	}
+	try {
+		return std::stoll(S);
 	} catch(...) {
 	}
 	return std::nullopt;
@@ -368,6 +402,8 @@ static bool SplitInList(const std::string &Blob, std::vector<std::string> &OutVa
 using RowTriple = std::tuple<std::string, std::string, std::string>;
 
 static constexpr char kExistPredColBytecode[] = "__ASTRAL_EXISTS__";
+static constexpr char kQuantifiedSubqueryColBytecode[] = "__ASTRAL_QSUBQ__";
+static constexpr char kRowCompareColBytecode[] = "__ASTRAL_ROWCMP__";
 static constexpr char kAstRhsColMarker[] = "__AST_RHS_COL__:";
 
 /** Correlate enclosing row with inner; only overwrite with inner cells that belong to the inner relation's schema so
@@ -509,6 +545,124 @@ static std::string FirstInnerColumnValue(const Database *Db, const std::string &
 	return std::string();
 }
 
+static bool DecodeRowExprAtom(const std::string &Serialized, char &Kind, std::string &Payload) {
+	if(Serialized.empty())
+		return false;
+	Kind = Serialized[0];
+	size_t Off = 1;
+	if(!PullSizedString(Serialized, Off, Payload))
+		return false;
+	return Off == Serialized.size();
+}
+
+static std::optional<std::string> ResolveRowExprAtomValue(const Database::Item &Row, char Kind,
+                                                          const std::string &Payload) {
+	if(Kind == 'N')
+		return std::nullopt;
+	if(Kind == 'L')
+		return Payload;
+	if(Kind == 'C') {
+		auto It = Row.find(Payload);
+		if(It == Row.end() || It->second.empty())
+			return std::nullopt;
+		return It->second;
+	}
+	return std::nullopt;
+}
+
+static bool EvaluateRowComparePredicate(const RowTriple &Pred, const Database::Item &Row) {
+	const auto &[Col, Op, Rhs] = Pred;
+	(void)Col;
+	size_t Off = 0;
+	int64_t N = 0;
+	if(!PullLeI64(Rhs, Off, N) || N <= 0 || N > 64)
+		return false;
+	int FirstNonEq = 0;
+	for(int64_t I = 0; I < N; ++I) {
+		std::string LSer;
+		std::string RSer;
+		if(!PullSizedString(Rhs, Off, LSer) || !PullSizedString(Rhs, Off, RSer))
+			return false;
+		char Lk = 0;
+		char Rk = 0;
+		std::string Lp;
+		std::string Rp;
+		if(!DecodeRowExprAtom(LSer, Lk, Lp) || !DecodeRowExprAtom(RSer, Rk, Rp))
+			return false;
+		const auto Lv = ResolveRowExprAtomValue(Row, Lk, Lp);
+		const auto Rv = ResolveRowExprAtomValue(Row, Rk, Rp);
+		if(!Lv.has_value() || !Rv.has_value())
+			return false;
+		if(FirstNonEq == 0)
+			FirstNonEq = CompareScalars(*Lv, *Rv);
+	}
+	if(Op == "=" || Op == "==")
+		return FirstNonEq == 0;
+	if(Op == "!=")
+		return FirstNonEq != 0;
+	if(Op == "<")
+		return FirstNonEq < 0;
+	if(Op == "<=")
+		return FirstNonEq <= 0;
+	if(Op == ">")
+		return FirstNonEq > 0;
+	if(Op == ">=")
+		return FirstNonEq >= 0;
+	return false;
+}
+
+static bool EvaluateQuantifiedSubqueryPredicate(const Database *Db, const RowTriple &Pred,
+                                                const Database::Item &EnclosingRow) {
+	const auto &[Col, Op, Rhs] = Pred;
+	(void)Col;
+	if(!Db)
+		FailVm("INTERNAL: quantified subquery evaluation requires Database context");
+	size_t Off = 0;
+	int64_t Qk = 0;
+	if(!PullLeI64(Rhs, Off, Qk) || (Qk != 0 && Qk != 1))
+		return false;
+	std::string LhsSer;
+	std::string InnerTable;
+	std::string InnerCol;
+	std::string DnfBlob;
+	if(!PullSizedString(Rhs, Off, LhsSer) || !PullSizedString(Rhs, Off, InnerTable) ||
+	   !PullSizedString(Rhs, Off, InnerCol) || !PullSizedString(Rhs, Off, DnfBlob) || Off != Rhs.size())
+		return false;
+	char Lk = 0;
+	std::string Lp;
+	if(!DecodeRowExprAtom(LhsSer, Lk, Lp))
+		return false;
+	const auto LhsVal = ResolveRowExprAtomValue(EnclosingRow, Lk, Lp);
+	if(!LhsVal.has_value())
+		return false;
+	std::vector<std::vector<RowTriple>> Inner;
+	if(!DecodePackedDnfOperands(DnfBlob, 0, DnfBlob.size(), Inner))
+		return false;
+	const auto Tit = Db->Tables_.find(InnerTable);
+	if(Tit == Db->Tables_.end())
+		return Qk == 1;
+	bool SeenAny = false;
+	bool AnyMatch = false;
+	bool AllMatch = true;
+	for(const auto &InnerRow : Tit->second.RowStore) {
+		const Database::Item Combined = MergeForExistsRow(Db, InnerTable, EnclosingRow, InnerRow);
+		if(!MatchWhereDnf(Db, InnerTable, Combined, Inner))
+			continue;
+		const std::string InnerVal = FirstInnerColumnValue(Db, InnerTable, InnerRow, InnerCol);
+		if(SqlCellIsNullValue(InnerVal))
+			continue;
+		SeenAny = true;
+		const bool Cmp = CellCompare(*LhsVal, InnerVal, Op);
+		AnyMatch = AnyMatch || Cmp;
+		AllMatch = AllMatch && Cmp;
+	}
+	if(Qk == 0)
+		return AnyMatch;
+	if(!SeenAny)
+		return true;
+	return AllMatch;
+}
+
 static bool InSubqueryPredicateHolds(const Database *Db, const RowTriple &Pred, const Database::Item &EnclosingRow) {
 	const auto &[LhsCol, Op, Rhs] = Pred;
 	(void)Op;
@@ -551,6 +705,10 @@ static bool MatchOnePredicate(const Database *Db, const std::string &ContextTabl
 	const auto &[Col, Op, Rhs] = Pred;
 	if(Col == kExistPredColBytecode)
 		return ExistPredicateHolds(Db, Pred, Row);
+	if(Col == kQuantifiedSubqueryColBytecode)
+		return EvaluateQuantifiedSubqueryPredicate(Db, Pred, Row);
+	if(Col == kRowCompareColBytecode)
+		return EvaluateRowComparePredicate(Pred, Row);
 	if(Op == kInSubPredColBytecode)
 		return InSubqueryPredicateHolds(Db, Pred, Row);
 	auto ItCol = Row.find(Col);
@@ -807,6 +965,35 @@ static std::optional<std::string> EvalSqlSubstringCells(const std::vector<std::s
 static std::optional<std::string> EvalScalarSqlFn(ScalarSqlFn Fn, const std::vector<std::string> &Cells,
                                                   const Database::Item &Row, Database *Db) {
 	switch(Fn) {
+	case ScalarSqlFn::Now: {
+		if(!Cells.empty())
+			return std::nullopt;
+		const auto Now = std::chrono::system_clock::now();
+		const auto Sec = std::chrono::duration_cast<std::chrono::seconds>(Now.time_since_epoch()).count();
+		return TimeSeries::FormatEpochSeconds(static_cast<int64_t>(Sec));
+	}
+	case ScalarSqlFn::CurrentDate: {
+		if(!Cells.empty())
+			return std::nullopt;
+		const auto Now = std::chrono::system_clock::now();
+		const auto Sec = std::chrono::duration_cast<std::chrono::seconds>(Now.time_since_epoch()).count();
+		const std::string Ts = TimeSeries::FormatEpochSeconds(static_cast<int64_t>(Sec));
+		return Ts.size() >= 10 ? Ts.substr(0, 10) : Ts;
+	}
+	case ScalarSqlFn::CurrentTime: {
+		if(!Cells.empty())
+			return std::nullopt;
+		const auto Now = std::chrono::system_clock::now();
+		const auto Sec = std::chrono::duration_cast<std::chrono::seconds>(Now.time_since_epoch()).count();
+		return TimeSeries::FormatEpochSeconds(static_cast<int64_t>(Sec));
+	}
+	case ScalarSqlFn::CurrentTimestamp: {
+		if(!Cells.empty())
+			return std::nullopt;
+		const auto Now = std::chrono::system_clock::now();
+		const auto Sec = std::chrono::duration_cast<std::chrono::seconds>(Now.time_since_epoch()).count();
+		return TimeSeries::FormatEpochSeconds(static_cast<int64_t>(Sec));
+	}
 	case ScalarSqlFn::Upper: {
 		if(Cells.size() != 1)
 			return std::nullopt;
@@ -983,6 +1170,26 @@ static std::optional<std::string> EvalScalarSqlFn(ScalarSqlFn Fn, const std::vec
 			return std::nullopt;
 		const auto Tr = TimeSeries::TruncateEpoch(*Ep, *Unit);
 		return Tr ? std::optional<std::string>(TimeSeries::FormatEpochSeconds(*Tr)) : std::nullopt;
+	}
+	case ScalarSqlFn::AtTimeZone: {
+		if(Cells.size() != 2)
+			return std::nullopt;
+		const auto Ep = TimeSeries::ParseEpochSeconds(Cells[0]);
+		const auto OffMin = ParseTimezoneOffsetMinutes(Cells[1]);
+		if(!Ep || !OffMin)
+			return std::nullopt;
+		return TimeSeries::FormatEpochSeconds(*Ep + (*OffMin * 60));
+	}
+	case ScalarSqlFn::ConvertTimezone: {
+		if(Cells.size() != 3)
+			return std::nullopt;
+		const auto Ep = TimeSeries::ParseEpochSeconds(Cells[0]);
+		const auto FromMin = ParseTimezoneOffsetMinutes(Cells[1]);
+		const auto ToMin = ParseTimezoneOffsetMinutes(Cells[2]);
+		if(!Ep || !FromMin || !ToMin)
+			return std::nullopt;
+		const int64_t Shift = (*ToMin - *FromMin) * 60;
+		return TimeSeries::FormatEpochSeconds(*Ep + Shift);
 	}
 	case ScalarSqlFn::Grouping: {
 		if(Cells.size() != 1 || Cells[0].empty())
@@ -1998,6 +2205,9 @@ void BytecodeInterpreter::Execute(const Bytecode &Code, const std::vector<std::s
 	Reset();
 	StringOperandPool_ = StringPool;
 	StepsExecuted_ = 0;
+	double TelemetryStepMsTotal = 0.0;
+	double TelemetryStepMsMax = 0.0;
+	std::size_t TelemetryFailures = 0;
 	while(Ic < Code.size()) {
 		if(DebugSession_ && DebugSession_->Report().HaltedEarly)
 			break;
@@ -2014,13 +2224,31 @@ void BytecodeInterpreter::Execute(const Bytecode &Code, const std::vector<std::s
 		++StepsExecuted_;
 		if((StepsExecuted_ & 63) == 0 && StepsExecuted_ > Limits::MaxInterpreterSteps)
 			FailVm("Statement exceeded the VM step limit (safety guard against infinite loops or oversized programs).");
-		if(!Step(Code))
-			break;
+		const auto StepStarted = std::chrono::steady_clock::now();
+		try {
+			if(!Step(Code))
+				break;
+		} catch(...) {
+			++TelemetryFailures;
+			throw;
+		}
+		const auto StepEnded = std::chrono::steady_clock::now();
+		const double StepMs = std::chrono::duration<double, std::milli>(StepEnded - StepStarted).count();
+		TelemetryStepMsTotal += StepMs;
+		if(StepMs > TelemetryStepMsMax)
+			TelemetryStepMsMax = StepMs;
 	}
 	if(StepsExecuted_ > Limits::MaxInterpreterSteps)
 		FailVm("Statement exceeded the VM step limit (safety guard against infinite loops or oversized programs).");
 	if(DebugSession_)
 		DebugSession_->NotifyCompleted();
+	if(Logger_ && StepsExecuted_ > 0) {
+		const double MeanStepMs = TelemetryStepMsTotal / static_cast<double>(StepsExecuted_);
+		Logger_->Info("VM telemetry steps=" + std::to_string(static_cast<unsigned long long>(StepsExecuted_)) +
+		              " mean_ms=" + std::to_string(MeanStepMs) +
+		              " max_ms=" + std::to_string(TelemetryStepMsMax) +
+		              " failures=" + std::to_string(static_cast<unsigned long long>(TelemetryFailures)));
+	}
 	StringOperandPool_ = nullptr;
 }
 
@@ -2174,6 +2402,11 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
 				if(inst.Operands.size() > 4) {
 					if(auto Sl = std::get_if<int64_t>(&inst.Operands[4]))
 						CreateStorage = static_cast<StorageLayout>(*Sl);
+				}
+				std::string OfTypeName;
+				if(inst.Operands.size() > 5) {
+					if(auto Ty = std::get_if<std::string>(&inst.Operands[5]))
+						OfTypeName = *Ty;
 				}
                 if (TableConstraintBlocks < 0 || TableConstraintBlocks > 256)
                     FailVm("CREATE_TABLE invalid table constraint count");
@@ -2360,6 +2593,19 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 }
 
                 if (!SkipCreate) {
+					if(!OfTypeName.empty()) {
+						const auto TypeFields = Databases_[0]->ResolveObjectTypeFields(OfTypeName);
+						if(!TypeFields.has_value())
+							FailVm("CREATE TABLE ... OF references unknown type \"" + OfTypeName + "\".");
+						if(!Schema.empty())
+							FailVm("Internal: typed table schema must be empty before expansion.");
+						for(const auto &Tf : *TypeFields) {
+							Database::Column Col;
+							Col.Name = Tf.Name;
+							Col.DefaultValue = Tf.Type;
+							Schema.push_back(std::move(Col));
+						}
+					}
                     for (Database::Column &Co : Schema) {
                         if(!Co.IsIdentity)
                             continue;
@@ -2367,6 +2613,8 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                             Co.IdentitySequenceName = "__astral_id_" + *tableName + "_" + Co.Name;
                     }
                     Databases_[0]->CreateTable(*tableName, Schema, CreateStorage).get();
+					if(!OfTypeName.empty())
+						Databases_[0]->BindTypedTableToObjectType(*tableName, OfTypeName);
                     for (const Database::Column &Co : Schema) {
                         if (Co.DeclaredFk.has_value())
                             Databases_[0]->AddForeignKey(*tableName, *Co.DeclaredFk).get();
@@ -2383,6 +2631,47 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             }
             break;
         }
+		case Opcode::CREATE_TYPE: {
+			if(inst.Operands.size() < 2)
+				FailVm("CREATE_TYPE expects name and field count");
+			const auto *TypeName = std::get_if<std::string>(&inst.Operands[0]);
+			const auto *Nf = std::get_if<int64_t>(&inst.Operands[1]);
+			if(!TypeName || !Nf || *Nf <= 0)
+				FailVm("CREATE_TYPE bad operands");
+			if (Databases_.empty())
+				Databases_.push_back(std::make_unique<Database>(DatabasePath_, Logger_));
+			std::vector<Database::ObjectTypeField> Fields;
+			size_t J = Ic + 1;
+			for(int64_t K = 0; K < *Nf; ++K) {
+				auto FieldName = StrPushOperand(Code, J, StringOperandPool_);
+				if(!FieldName)
+					FailVm("CREATE_TYPE missing field name");
+				++J;
+				auto FieldType = StrPushOperand(Code, J, StringOperandPool_);
+				if(!FieldType)
+					FailVm("CREATE_TYPE missing field type");
+				++J;
+				Fields.push_back(Database::ObjectTypeField{*FieldName, *FieldType});
+			}
+			Databases_[0]->CreateObjectType(*TypeName, std::move(Fields));
+			Ic = J;
+			break;
+		}
+		case Opcode::DROP_TYPE: {
+			if(inst.Operands.empty())
+				FailVm("DROP_TYPE expects type name");
+			const auto *TypeName = std::get_if<std::string>(&inst.Operands[0]);
+			if(!TypeName)
+				FailVm("DROP_TYPE bad operand");
+			const int64_t IfExists = (inst.Operands.size() > 1 && std::holds_alternative<int64_t>(inst.Operands[1]))
+			                             ? std::get<int64_t>(inst.Operands[1])
+			                             : 0;
+			if (Databases_.empty())
+				Databases_.push_back(std::make_unique<Database>(DatabasePath_, Logger_));
+			Databases_[0]->DropObjectType(*TypeName, IfExists != 0);
+			++Ic;
+			break;
+		}
         case Opcode::DROP_TABLE: {
             if (inst.Operands.empty()) FailVm("DROP_TABLE requires table name operand");
             if (auto tableName = std::get_if<std::string>(&inst.Operands[0])) {
@@ -2443,6 +2732,78 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             } else {
                 FailVm("DROP_VIEW expects string view name");
             }
+            ++Ic;
+            break;
+        }
+        case Opcode::COMMENT_ON: {
+            if(inst.Operands.size() < 4)
+                FailVm("COMMENT_ON expects target, table, column, comment");
+            const auto *K = std::get_if<int64_t>(&inst.Operands[0]);
+            const auto *Tn = std::get_if<std::string>(&inst.Operands[1]);
+            const auto *Cn = std::get_if<std::string>(&inst.Operands[2]);
+            const auto *Cv = std::get_if<std::string>(&inst.Operands[3]);
+            if(!K || !Tn || !Cn || !Cv)
+                FailVm("COMMENT_ON operand types");
+            if(*K == 0)
+                TableComments_[*Tn] = *Cv;
+            else
+                ColumnComments_[*Tn][*Cn] = *Cv;
+            ++Ic;
+            break;
+        }
+        case Opcode::SHOW_TABLES: {
+            Database *Db = MutatingDatabase();
+            const std::string Out = "__astral_show_tables";
+            Database::Schema Sch;
+            Database::Column C;
+            C.Name = "table_name";
+            C.DefaultValue = "TEXT";
+            Sch.push_back(std::move(C));
+            Database::Table Rows;
+            Db->WithExclusiveBytecodeLock([&]() {
+                for(const auto &Pr : Db->Tables_) {
+                    Database::Item R;
+                    R["table_name"] = Pr.first;
+                    Rows.push_back(std::move(R));
+                }
+            });
+            Db->ReplaceTableContents(Out, Sch, std::move(Rows));
+            PushOwningStringHeap(new std::string(Out));
+            ++Ic;
+            break;
+        }
+        case Opcode::DESCRIBE_TABLE: {
+            const auto *Tn = inst.Operands.empty() ? nullptr : std::get_if<std::string>(&inst.Operands[0]);
+            if(!Tn)
+                FailVm("DESCRIBE_TABLE expects table name");
+            Database *Db = MutatingDatabase();
+            auto SchemaOpt = Db->TableSchemaSnapshot(*Tn);
+            if(!SchemaOpt)
+                FailVm("DESCRIBE: table not found");
+            const std::string Out = "__astral_describe";
+            Database::Schema Sch;
+            for(const char *Nm : {"column_name", "data_type", "is_nullable", "column_comment"}) {
+                Database::Column C;
+                C.Name = Nm;
+                C.DefaultValue = "TEXT";
+                Sch.push_back(std::move(C));
+            }
+            Database::Table Rows;
+            for(const auto &Col : *SchemaOpt) {
+                Database::Item R;
+                R["column_name"] = Col.Name;
+                R["data_type"] = Col.DefaultValue;
+                R["is_nullable"] = Col.IsNotNull ? "NO" : "YES";
+                auto ItT = ColumnComments_.find(*Tn);
+                if(ItT != ColumnComments_.end()) {
+                    auto ItC = ItT->second.find(Col.Name);
+                    if(ItC != ItT->second.end())
+                        R["column_comment"] = ItC->second;
+                }
+                Rows.push_back(std::move(R));
+            }
+            Db->ReplaceTableContents(Out, Sch, std::move(Rows));
+            PushOwningStringHeap(new std::string(Out));
             ++Ic;
             break;
         }
@@ -3953,7 +4314,53 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 FailVm("CLONE_TABLE operands must be non-empty strings");
             if(Databases_.empty())
                 Databases_.push_back(std::make_unique<Database>(DatabasePath_));
-            Databases_[0]->CloneTable(*Dest, *Src);
+            Database *Db = Databases_[0].get();
+            if(*Src == "__astral_information_schema_tables") {
+                Database::Schema Sch;
+                for(const char *Nm : {"table_schema", "table_name"}) {
+                    Database::Column C;
+                    C.Name = Nm;
+                    C.DefaultValue = "TEXT";
+                    Sch.push_back(std::move(C));
+                }
+                Database::Table Rows;
+                Db->WithExclusiveBytecodeLock([&]() {
+                    for(const auto &Pr : Db->Tables_) {
+                        Database::Item R;
+                        R["table_schema"] = "public";
+                        R["table_name"] = Pr.first;
+                        Rows.push_back(std::move(R));
+                    }
+                });
+                Db->ReplaceTableContents(*Dest, Sch, std::move(Rows));
+            } else if(*Src == "__astral_information_schema_columns") {
+                Database::Schema Sch;
+                for(const char *Nm : {"table_schema", "table_name", "column_name", "data_type"}) {
+                    Database::Column C;
+                    C.Name = Nm;
+                    C.DefaultValue = "TEXT";
+                    Sch.push_back(std::move(C));
+                }
+                Database::Table Rows;
+                Db->WithExclusiveBytecodeLock([&]() {
+                    for(const auto &Pr : Db->Tables_) {
+                        const auto Snap = Db->TableSchemaAssumeDbMutexHeld(Pr.first);
+                        if(!Snap)
+                            continue;
+                        for(const auto &Col : *Snap) {
+                            Database::Item R;
+                            R["table_schema"] = "public";
+                            R["table_name"] = Pr.first;
+                            R["column_name"] = Col.Name;
+                            R["data_type"] = Col.DefaultValue;
+                            Rows.push_back(std::move(R));
+                        }
+                    }
+                });
+                Db->ReplaceTableContents(*Dest, Sch, std::move(Rows));
+            } else {
+                Db->CloneTable(*Dest, *Src);
+            }
             ++Ic;
             break;
         }
@@ -4066,7 +4473,7 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 const auto *Sc = std::get_if<std::string>(&inst.Operands[NP + 5]);
                 const auto *Fo = std::get_if<int64_t>(&inst.Operands[NP + 6]);
                 const auto *ExFl = std::get_if<int64_t>(&inst.Operands[NP + 7]);
-                if(!Ok || *Ok < 0 || *Ok > 8)
+                if(!Ok || *Ok < 0 || *Ok > 14)
                     FailVm("WINDOW_ROW_NUMBER bad window kind operand");
                 if(!Sc || !Fo || *Fo < 0)
                     FailVm("WINDOW_ROW_NUMBER bad source column or frame offset");
@@ -4256,6 +4663,117 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                     else
                         WT[R][*OutCol] = It->second;
                 }
+            } else if(OrdKind == static_cast<int>(WindowFnKind::FirstValue) ||
+                      OrdKind == static_cast<int>(WindowFnKind::LastValue) ||
+                      OrdKind == static_cast<int>(WindowFnKind::NthValue)) {
+                for(size_t R = 0; R < WT.size(); ++R) {
+                    const size_t Pf = PartFirst[R];
+                    const size_t Ps = PartSize[R];
+                    const size_t LocalIdx = R - Pf;
+                    size_t LoLocal = 0;
+                    size_t HiLocal = 0;
+                    if(FrameMode == 2) {
+                        const auto Bounds =
+                            ResolveRangeFrameLocalBounds(WT, Pf, Ps, LocalIdx, OC, Ascending, FrameStart, FrameEnd);
+                        LoLocal = Bounds.first;
+                        HiLocal = Bounds.second;
+                    } else {
+                        LoLocal = ResolveRowsFrameLocalIndex(FrameStart.Kind, FrameStart.Offset, LocalIdx, Ps);
+                        HiLocal = ResolveRowsFrameLocalIndex(FrameEnd.Kind, FrameEnd.Offset, LocalIdx, Ps);
+                    }
+                    if(LoLocal > HiLocal || Ps == 0) {
+                        WT[R].erase(*OutCol);
+                        continue;
+                    }
+                    size_t TargetLocal = LoLocal;
+                    if(OrdKind == static_cast<int>(WindowFnKind::LastValue))
+                        TargetLocal = HiLocal;
+                    else if(OrdKind == static_cast<int>(WindowFnKind::NthValue)) {
+                        const size_t N = static_cast<size_t>(FrameOffset);
+                        if(N == 0) {
+                            WT[R].erase(*OutCol);
+                            continue;
+                        }
+                        const size_t Need = LoLocal + (N - 1);
+                        if(Need > HiLocal) {
+                            WT[R].erase(*OutCol);
+                            continue;
+                        }
+                        TargetLocal = Need;
+                    }
+                    auto It = WT[Pf + TargetLocal].find(SrcCol);
+                    if(It == WT[Pf + TargetLocal].end() || It->second.empty())
+                        WT[R].erase(*OutCol);
+                    else
+                        WT[R][*OutCol] = It->second;
+                }
+            } else if(OrdKind == static_cast<int>(WindowFnKind::PercentRank) ||
+                      OrdKind == static_cast<int>(WindowFnKind::CumeDist)) {
+                size_t Pf = 0;
+                while(Pf < WT.size()) {
+                    const size_t Ps = PartSize[Pf];
+                    const size_t Pend = Pf + Ps;
+                    if(Ps == 0)
+                        break;
+                    std::vector<long long> RankAt(Ps, 1);
+                    std::vector<size_t> PeerEndAt(Ps, 0);
+                    long long CurrentRank = 1;
+                    std::string PrevOrd;
+                    bool HavePrev = false;
+                    size_t PeerStart = 0;
+                    for(size_t I = 0; I < Ps; ++I) {
+                        const auto It = WT[Pf + I].find(OC);
+                        const std::string OrdVal = It == WT[Pf + I].end() ? "" : It->second;
+                        if(!HavePrev || OrdVal != PrevOrd)
+                            CurrentRank = static_cast<long long>(I) + 1;
+                        RankAt[I] = CurrentRank;
+                        if(!HavePrev || OrdVal != PrevOrd) {
+                            if(HavePrev) {
+                                for(size_t J = PeerStart; J < I; ++J)
+                                    PeerEndAt[J] = I - 1;
+                            }
+                            PeerStart = I;
+                        }
+                        PrevOrd = OrdVal;
+                        HavePrev = true;
+                    }
+                    for(size_t J = PeerStart; J < Ps; ++J)
+                        PeerEndAt[J] = Ps - 1;
+                    for(size_t I = 0; I < Ps; ++I) {
+                        if(OrdKind == static_cast<int>(WindowFnKind::PercentRank)) {
+                            double Val = 0.0;
+                            if(Ps > 1) {
+                                Val = static_cast<double>(RankAt[I] - 1) /
+                                      static_cast<double>(static_cast<long long>(Ps) - 1);
+                            }
+                            std::ostringstream O;
+                            O << Val;
+                            WT[Pf + I][*OutCol] = O.str();
+                        } else {
+                            const double Val = static_cast<double>(PeerEndAt[I] + 1) / static_cast<double>(Ps);
+                            std::ostringstream O;
+                            O << Val;
+                            WT[Pf + I][*OutCol] = O.str();
+                        }
+                    }
+                    Pf = Pend;
+                }
+            } else if(OrdKind == static_cast<int>(WindowFnKind::Ntile)) {
+                const size_t Buckets = static_cast<size_t>(FrameOffset);
+                if(Buckets == 0)
+                    FailVm("NTILE bucket count must be positive");
+                size_t Pf = 0;
+                while(Pf < WT.size()) {
+                    const size_t Ps = PartSize[Pf];
+                    const size_t Pend = Pf + Ps;
+                    if(Ps == 0)
+                        break;
+                    for(size_t I = 0; I < Ps; ++I) {
+                        const size_t Tile = (I * Buckets) / Ps + 1;
+                        WT[Pf + I][*OutCol] = std::to_string(static_cast<long long>(Tile));
+                    }
+                    Pf = Pend;
+                }
             } else {
                 std::string PrevPartSig;
                 std::string PrevOrdVal;
@@ -4307,6 +4825,16 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             ++Ic;
             break;
         }
+        case Opcode::SET_TRANSACTION_ISOLATION: {
+            if(inst.Operands.size() < 1)
+                FailVm("SET_TRANSACTION_ISOLATION expects isolation tag");
+            const auto *Iso = std::get_if<int64_t>(&inst.Operands[0]);
+            if(!Iso)
+                FailVm("SET_TRANSACTION_ISOLATION operand type");
+            SessionIsolation_ = *Iso;
+            ++Ic;
+            break;
+        }
         case Opcode::BEGIN: {
             if (Databases_.empty()) {
                 Databases_.push_back(std::make_unique<Database>(DatabasePath_));
@@ -4315,6 +4843,8 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             snapshotPath += ".txn.snap";
             Databases_[0]->SyncToFileAndCopyMainDbFileTo(snapshotPath);
             Savepoints_["__transaction__"] = snapshotPath.string();
+            if(SessionIsolation_ == static_cast<int64_t>(TransactionIsolationLevel::Serializable) && Logger_)
+                Logger_->Warn("Serializable requested; current engine uses snapshot-isolation fallback.");
             if(Logger_) Logger_->Info("Transaction started (snapshot)");
             ++Ic;
             break;
@@ -4677,7 +5207,7 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             const size_t Need = 3 + static_cast<size_t>(*Argc) * 2;
             if(inst.Operands.size() != Need)
                 FailVm("SCALAR_FUNC_EVAL: operand count does not match argc");
-            if(*FnTag < 0 || *FnTag > ScalarSqlFnTag(ScalarSqlFn::SolveRoot))
+            if(*FnTag < 0 || *FnTag > ScalarSqlFnTag(ScalarSqlFn::ConvertTimezone))
                 FailVm("SCALAR_FUNC_EVAL: bad function tag");
             const ScalarSqlFn Fn = static_cast<ScalarSqlFn>(*FnTag);
             size_t Idx = 3;
@@ -5898,12 +6428,12 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
 		case Opcode::PROC_TRY: {
 			if(inst.Operands.size() < 2)
 				FailVm("PROC_TRY requires savepoint, end IP, and handler pairs");
-			const auto *Sp = std::get_if<std::string>(&inst.Operands[0]);
+			const auto *SavepointName = std::get_if<std::string>(&inst.Operands[0]);
 			const auto *EndIp = std::get_if<int64_t>(&inst.Operands[1]);
-			if(!Sp || !EndIp)
+			if(!SavepointName || !EndIp)
 				FailVm("PROC_TRY expects string savepoint and int64 end IP");
 			ProcTryFrame Frame;
-			Frame.Savepoint = *Sp;
+			Frame.Savepoint = *SavepointName;
 			Frame.EndIc = static_cast<std::size_t>(*EndIp);
 			for(std::size_t O = 2; O + 1 < inst.Operands.size(); O += 2) {
 				const auto *HandlerIp = std::get_if<int64_t>(&inst.Operands[O]);
@@ -5912,7 +6442,7 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
 					FailVm("PROC_TRY handler entries require int64 IP and string condition");
 				Frame.Handlers.emplace_back(static_cast<std::size_t>(*HandlerIp), *Cond);
 			}
-			VmSavepoint(*Sp);
+			VmSavepoint(*SavepointName);
 			ProcTryStack_.push_back(std::move(Frame));
 			++Ic;
 			break;
@@ -5920,12 +6450,12 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
 		case Opcode::PROC_END_TRY: {
 			if(inst.Operands.size() < 2)
 				FailVm("PROC_END_TRY requires savepoint and end IP");
-			const auto *Sp = std::get_if<std::string>(&inst.Operands[0]);
+			const auto *SavepointName = std::get_if<std::string>(&inst.Operands[0]);
 			const auto *EndIp = std::get_if<int64_t>(&inst.Operands[1]);
-			if(!Sp || !EndIp)
+			if(!SavepointName || !EndIp)
 				FailVm("PROC_END_TRY expects string savepoint and int64 end IP");
-			VmReleaseSavepoint(*Sp);
-			if(!ProcTryStack_.empty() && ProcTryStack_.back().Savepoint == *Sp)
+			VmReleaseSavepoint(*SavepointName);
+			if(!ProcTryStack_.empty() && ProcTryStack_.back().Savepoint == *SavepointName)
 				ProcTryStack_.pop_back();
 			Ic = static_cast<uintptr_t>(*EndIp);
 			break;
@@ -6018,3 +6548,4 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
 
 } // namespace SQL
 } // namespace AstralDB
+

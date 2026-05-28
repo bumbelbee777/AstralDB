@@ -11,7 +11,7 @@ project_dirs:
   - sources/SQL
   - sources/IO
   - sources/DS
-output: bin/libastraldb.a
+output: bin/libastraldb_core.a
 compiler_flags:
   global: "-Wall -Wextra -Werror -fstack-protector-strong -fpie -Isources -Ithird_party -Itests"
   common: "-Os"
@@ -21,8 +21,11 @@ compiler_flags:
 
 unit_tests:
   project_dirs:
+    - sources/API
     - tests
   output: bin/run_tests
 
 subprojects:
+  - sources/API
+  - tests
   - app

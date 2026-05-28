@@ -260,6 +260,10 @@ std::string OpcodeName(Opcode Op) {
 		return "CREATE_TABLE";
 	case Opcode::DROP_TABLE:
 		return "DROP_TABLE";
+	case Opcode::CREATE_TYPE:
+		return "CREATE_TYPE";
+	case Opcode::DROP_TYPE:
+		return "DROP_TYPE";
 	case Opcode::SET:
 		return "SET";
 	case Opcode::WHERE:
@@ -370,6 +374,8 @@ std::string OpcodeName(Opcode Op) {
 		return "COMMIT";
 	case Opcode::ROLLBACK:
 		return "ROLLBACK";
+	case Opcode::SET_TRANSACTION_ISOLATION:
+		return "SET_TRANSACTION_ISOLATION";
 	case Opcode::INNER_JOIN:
 		return "INNER_JOIN";
 	case Opcode::LEFT_JOIN:
@@ -452,6 +458,12 @@ std::string OpcodeName(Opcode Op) {
 		return "CREATE_VIEW";
 	case Opcode::DROP_VIEW:
 		return "DROP_VIEW";
+	case Opcode::COMMENT_ON:
+		return "COMMENT_ON";
+	case Opcode::SHOW_TABLES:
+		return "SHOW_TABLES";
+	case Opcode::DESCRIBE_TABLE:
+		return "DESCRIBE_TABLE";
 	case Opcode::CREATE_PROCEDURE:
 		return "CREATE_PROCEDURE";
 	case Opcode::DROP_PROCEDURE:
@@ -726,3 +738,4 @@ BytecodeValidationReport ValidateBytecode(const Bytecode &Code) {
 
 } // namespace SQL
 } // namespace AstralDB
+

@@ -168,6 +168,8 @@ static constexpr const char *kOpIn = "__IN__";
 static constexpr const char *kOpNotIn = "__NOT_IN__";
 static constexpr const char *kBoolConstCol = "__ASTRAL_BOOL__";
 static constexpr const char *kOpBoolConst = "__BOOL_CONST__";
+static constexpr const char *kQuantifiedSubqueryCol = "__ASTRAL_QSUBQ__";
+static constexpr const char *kRowCompareCol = "__ASTRAL_ROWCMP__";
 
 static std::string MapHavingAggOutputColumn(const FuncCallExprAST &F, const SelectAST &Sel) {
 	switch(F.BuiltinKind) {
@@ -307,6 +309,73 @@ bool LiteralOrNullCsv(const ExpressionAST *E, std::string &Out) {
 	return false;
 }
 
+static bool SerializeRowExprAtom(const ExpressionAST *E, std::string &Out) {
+	if(const auto *C = dynamic_cast<const ColumnRefAST *>(E)) {
+		Out.clear();
+		Out.push_back('C');
+		PackLenStr(Out, C->Name);
+		return true;
+	}
+	if(const auto *L = dynamic_cast<const LiteralAST *>(E)) {
+		Out.clear();
+		Out.push_back('L');
+		PackLenStr(Out, L->Value);
+		return true;
+	}
+	if(dynamic_cast<const NullLiteralAST *>(E)) {
+		Out.clear();
+		Out.push_back('N');
+		PackLenStr(Out, std::string());
+		return true;
+	}
+	return false;
+}
+
+static bool SerializeRowComparePayload(const RowConstructorExprAST *Lr, const RowConstructorExprAST *Rr,
+                                       std::string &Out) {
+	if(!Lr || !Rr || Lr->Elements.empty() || Lr->Elements.size() != Rr->Elements.size())
+		return false;
+	Out.clear();
+	PutLeI64(Out, static_cast<int64_t>(Lr->Elements.size()));
+	for(size_t I = 0; I < Lr->Elements.size(); ++I) {
+		std::string Ls;
+		std::string Rs;
+		if(!SerializeRowExprAtom(Lr->Elements[I].get(), Ls) || !SerializeRowExprAtom(Rr->Elements[I].get(), Rs))
+			return false;
+		PackLenStr(Out, Ls);
+		PackLenStr(Out, Rs);
+	}
+	return true;
+}
+
+static bool SerializeQuantifiedSubqueryLhs(const ExpressionAST *Lhs, std::string &Out) {
+	return SerializeRowExprAtom(Lhs, Out);
+}
+
+static bool SerializeQuantifiedSubqueryPayload(const ExpressionAST *Lhs, const QuantifiedSubqueryAST *Q,
+                                               std::string &Out) {
+	if(!Q)
+		return false;
+	std::string LhsSer;
+	if(!SerializeQuantifiedSubqueryLhs(Lhs, LhsSer))
+		return false;
+	std::vector<std::vector<RowTriple>> Inner;
+	if(Q->InnerWhere) {
+		if(!BuildWhereDnf(Q->InnerWhere.get(), Inner))
+			return false;
+	} else
+		Inner.push_back({});
+	std::string DnfBlob;
+	PackDnfOperandsBlob(Inner, DnfBlob);
+	Out.clear();
+	PutLeI64(Out, static_cast<int64_t>(Q->Kind));
+	PackLenStr(Out, LhsSer);
+	PackLenStr(Out, Q->InnerTable);
+	PackLenStr(Out, Q->InnerValueColumn);
+	PackLenStr(Out, DnfBlob);
+	return true;
+}
+
 bool ExtractOneComparison(const ExpressionAST *Expr, RowTriple &Out) {
 	if(!Expr)
 		return false;
@@ -324,6 +393,9 @@ bool ExtractOneComparison(const ExpressionAST *Expr, RowTriple &Out) {
 	const auto *LBool = dynamic_cast<const BooleanLiteralAST *>(Bin->LHS.get());
 	const auto *LNullLhs = dynamic_cast<const NullLiteralAST *>(Bin->LHS.get());
 	const auto *RCol = dynamic_cast<const ColumnRefAST *>(Bin->RHS.get());
+	const auto *LRow = dynamic_cast<const RowConstructorExprAST *>(Bin->LHS.get());
+	const auto *RRow = dynamic_cast<const RowConstructorExprAST *>(Bin->RHS.get());
+	const auto *QSub = dynamic_cast<const QuantifiedSubqueryAST *>(Bin->RHS.get());
 
 	std::string Col;
 	std::string Op = Bin->Op;
@@ -356,6 +428,22 @@ bool ExtractOneComparison(const ExpressionAST *Expr, RowTriple &Out) {
 		if(Op == "==")
 			Op = "=";
 		Rhs = std::string(kAstRhsColMarker) + RCol->Name;
+	} else if(QSub) {
+		if(Op != "=" && Op != "==" && Op != "!=" && Op != "<" && Op != "<=" && Op != ">" && Op != ">=")
+			return false;
+		std::string Payload;
+		if(!SerializeQuantifiedSubqueryPayload(Bin->LHS.get(), QSub, Payload))
+			return false;
+		Out = RowTriple(std::string(kQuantifiedSubqueryCol), std::move(Op), std::move(Payload));
+		return true;
+	} else if(LRow && RRow) {
+		if(Op != "=" && Op != "==" && Op != "!=" && Op != "<" && Op != "<=" && Op != ">" && Op != ">=")
+			return false;
+		std::string Payload;
+		if(!SerializeRowComparePayload(LRow, RRow, Payload))
+			return false;
+		Out = RowTriple(std::string(kRowCompareCol), std::move(Op), std::move(Payload));
+		return true;
 	} else
 		return false;
 
@@ -762,12 +850,16 @@ static void EmitCastEvalInstruction(const CastExprAST &C, const std::string &Out
 
 static void EmitScalarFuncEvalInstruction(const ScalarFuncExprAST &F, const std::string &OutCol,
                                           BytecodeScratch &Instructions) {
-	if(F.Args.empty())
-		FailCodegen("Internal: scalar builtin missing arguments.");
 	if(F.Args.size() > Limits::MaxScalarSqlFuncArgs)
 		FailCodegen("Too many scalar function arguments (see Limits::MaxScalarSqlFuncArgs).");
 	size_t Need = 0;
 	switch(F.Fn) {
+	case ScalarSqlFn::Now:
+	case ScalarSqlFn::CurrentDate:
+	case ScalarSqlFn::CurrentTime:
+	case ScalarSqlFn::CurrentTimestamp:
+		Need = 0;
+		break;
 	case ScalarSqlFn::Upper:
 	case ScalarSqlFn::Lower:
 	case ScalarSqlFn::CharLength:
@@ -797,6 +889,12 @@ static void EmitScalarFuncEvalInstruction(const ScalarFuncExprAST &F, const std:
 	case ScalarSqlFn::TimestampDiffSeconds:
 	case ScalarSqlFn::DateAddSeconds:
 		Need = 2;
+		break;
+	case ScalarSqlFn::AtTimeZone:
+		Need = 2;
+		break;
+	case ScalarSqlFn::ConvertTimezone:
+		Need = 3;
 		break;
 	case ScalarSqlFn::ConcatVariadic:
 		if(F.Args.size() < 2)
@@ -974,6 +1072,14 @@ void InSubqueryPredAST::EmitBytecode(BytecodeScratch &) const {
 	FailCodegen("Internal: IN subquery should not emit standalone bytecode.");
 }
 
+void QuantifiedSubqueryAST::EmitBytecode(BytecodeScratch &) const {
+	FailCodegen("Internal: quantified subquery predicate should not emit standalone bytecode.");
+}
+
+void RowConstructorExprAST::EmitBytecode(BytecodeScratch &) const {
+	FailCodegen("Internal: row constructor expression should not emit standalone bytecode.");
+}
+
 void CaseExprAST::EmitBytecode(BytecodeScratch &) const {
 	FailCodegen("Internal: CASE projection is lowered via Opcode::CASE_EVAL, not standalone bytecode.");
 }
@@ -1009,6 +1115,19 @@ void GroupingIdExprAST::EmitBytecode(BytecodeScratch &Instructions) const {
 	FailCodegen("GROUPING_ID() is lowered via EmitGroupingIdEvalInstruction in SELECT codegen.");
 }
 
+void CreateTypeAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions,
+	                  MakeInstruction(Opcode::CREATE_TYPE, TypeName, static_cast<int64_t>(Fields.size())));
+	for(const auto &F : Fields) {
+		AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, F.Name));
+		AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, F.Type));
+	}
+}
+
+void DropTypeAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	AppendInstruction(Instructions, MakeInstruction(Opcode::DROP_TYPE, TypeName, static_cast<int64_t>(IfExists ? 1 : 0)));
+}
+
 void DropAST::EmitBytecode(BytecodeScratch& Instructions) const {
 	const int64_t Flags = static_cast<int64_t>((IfExists ? 1 : 0) | (Cascade ? 2 : 0));
 	AppendInstruction(Instructions, MakeInstruction(Opcode::DROP_TABLE, TableName, Flags));
@@ -1023,7 +1142,7 @@ void CreateAST::EmitBytecode(BytecodeScratch& Instructions) const {
 	AppendInstruction(Instructions,
 	                   MakeInstruction(Opcode::CREATE_TABLE, TableName, static_cast<int64_t>(Columns.size()), Flags,
 	                                   static_cast<int64_t>(TableConstraints.size()),
-	                                   static_cast<int64_t>(StoragePolicy)));
+	                                   static_cast<int64_t>(StoragePolicy), OfTypeName));
 	for(const auto &Column : Columns) {
 		AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Column.Name));
 		AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Column.Type));
@@ -1200,6 +1319,8 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 		AppendInstruction(Instructions, MakeInstruction(Opcode::CLONE_TABLE, Work, FromBase));
 	for(size_t Ij = 0; Ij < JoinSpecs().size(); ++Ij) {
 		const JoinClause &Jc = JoinSpecs()[Ij];
+		if(Jc.IsLateral)
+			FailCodegen("LATERAL JOIN is parsed but this join shape is not lowered yet.");
 		const std::string Dst = JoinDestPrefix + std::to_string(Ij);
 		Instruction Ji;
 		Ji.Opcode_ = SqlJoinToOpcode(Jc.Kind);
@@ -1380,10 +1501,12 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 		if(Ws.OrderColumn.empty() || Ws.OutputColumn.empty())
 			FailCodegen("Internal: window spec missing ORDER BY or output column.");
 		const int64_t KindTag = static_cast<int64_t>(Ws.Kind);
-		if(KindTag < 0 || KindTag > 8)
+		if(KindTag < 0 || KindTag > 14)
 			FailCodegen("Internal: unsupported window function kind.");
 		if((Ws.Kind == WindowFnKind::Sum || Ws.Kind == WindowFnKind::Min || Ws.Kind == WindowFnKind::Max ||
-		    Ws.Kind == WindowFnKind::Avg || Ws.Kind == WindowFnKind::Lag || Ws.Kind == WindowFnKind::Lead) &&
+		    Ws.Kind == WindowFnKind::Avg || Ws.Kind == WindowFnKind::Lag || Ws.Kind == WindowFnKind::Lead ||
+		    Ws.Kind == WindowFnKind::FirstValue || Ws.Kind == WindowFnKind::LastValue ||
+		    Ws.Kind == WindowFnKind::NthValue) &&
 		   Ws.SourceColumn.empty())
 			FailCodegen("Internal: window aggregate/shift missing source column.");
 		Instruction WI;

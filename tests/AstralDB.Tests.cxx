@@ -31,6 +31,7 @@
 #include <SQL/BytecodeProcedures.hxx>
 #include <SQL/BytecodeTriggers.hxx>
 #include <SQL/ProcedureParser.hxx>
+#include <astraldb/astraldb.h>
 #include "AstralTestHelpers.hxx"
 #include <algorithm>
 #include <chrono>
@@ -383,6 +384,72 @@ TEST_CASE("SQL: multi-column SELECT finalizes") {
 	REQUIRE_NOTHROW(I.Execute(Code));
 }
 
+TEST_CASE("SQL: SHOW TABLES, DESCRIBE, and INFORMATION_SCHEMA execute") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_meta_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "meta.log").string(), false);
+	const char *Q = "CREATE TABLE tmeta (id INT, name TEXT); "
+	                "SHOW TABLES; "
+	                "DESCRIBE tmeta; "
+	                "SELECT table_name FROM information_schema.tables;";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	I.Execute(Code);
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	REQUIRE(TableExists(Db, "__astral_show_tables"));
+	REQUIRE(TableExists(Db, "__astral_describe"));
+	const auto ShowRows = AllRows(Db, "__astral_show_tables");
+	bool FoundMeta = false;
+	for(const auto &R : ShowRows) {
+		auto It = R.find("table_name");
+		if(It != R.end() && It->second == "tmeta") {
+			FoundMeta = true;
+			break;
+		}
+	}
+	REQUIRE(FoundMeta);
+}
+
+TEST_CASE("SQL: NOW and CURRENT date/time parse to scalar bytecode") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_timefn_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "timefn.log").string(), false);
+	const char *Q = "CREATE TABLE tt (id INT); INSERT INTO tt VALUES (1); "
+	                "SELECT NOW() AS n, CURRENT_DATE AS d, CURRENT_TIME AS t FROM tt;";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	I.Execute(Code);
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	REQUIRE(TableExists(Db, "tt"));
+}
+
+TEST_CASE("SQL: SET TRANSACTION ISOLATION LEVEL SERIALIZABLE parses") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_txiso_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "txiso.log").string(), false);
+	const char *Q = "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; BEGIN; COMMIT;";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	bool SawSetIso = false;
+	for(const auto &Inst : Code)
+		if(Inst.Opcode_ == AstralDB::SQL::Opcode::SET_TRANSACTION_ISOLATION)
+			SawSetIso = true;
+	REQUIRE(SawSetIso);
+}
+
 TEST_CASE("SQL: DROP TABLE, INSERT column list, AND WHERE, DISTINCT, LIMIT syntax") {
 	AstralDB::SQL::SetParserDiagnostics(false);
 	fs::path Dir = UniqueTempDir("astral_ext_");
@@ -667,6 +734,98 @@ TEST_CASE("SQL: correlated EXISTS / NOT EXISTS (column = column in inner WHERE)"
 		REQUIRE(Rows2.size() == 1);
 		REQUIRE(Rows2[0].at("pk") == "2");
 	}
+}
+
+TEST_CASE("SQL: ANY SOME ALL quantified scalar subqueries") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_qsub_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "_qsub.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE lhs (x INT); INSERT INTO lhs VALUES (1),(5),(9); "
+	    "CREATE TABLE rhs (y INT); INSERT INTO rhs VALUES (3),(7); "
+	    "SELECT x FROM lhs WHERE x > ANY (SELECT y FROM rhs) ORDER BY x ASC;";
+	AstralDB::SQL::Parser P(Q);
+	auto Code = AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	const auto *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	auto Rows = AllRows(Db, "lhs");
+	REQUIRE(Rows.size() == 2);
+	REQUIRE(Rows[0].at("x") == "5");
+	REQUIRE(Rows[1].at("x") == "9");
+
+	const char *Q2 =
+	    "CREATE TABLE lhs2 (x INT); INSERT INTO lhs2 VALUES (1),(5),(9); "
+	    "CREATE TABLE rhs2 (y INT); INSERT INTO rhs2 VALUES (3),(7); "
+	    "SELECT x FROM lhs2 WHERE x > SOME (SELECT y FROM rhs2) ORDER BY x ASC;";
+	AstralDB::SQL::Parser P2(Q2);
+	REQUIRE_NOTHROW(I.Execute(AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None)));
+	Rows = AllRows(Db, "lhs2");
+	REQUIRE(Rows.size() == 2);
+	REQUIRE(Rows[0].at("x") == "5");
+	REQUIRE(Rows[1].at("x") == "9");
+
+	const char *Q3 =
+	    "CREATE TABLE lhs3 (x INT); INSERT INTO lhs3 VALUES (1),(5),(9); "
+	    "CREATE TABLE rhs3 (y INT); INSERT INTO rhs3 VALUES (3),(7); "
+	    "SELECT x FROM lhs3 WHERE x > ALL (SELECT y FROM rhs3) ORDER BY x ASC;";
+	AstralDB::SQL::Parser P3(Q3);
+	REQUIRE_NOTHROW(I.Execute(AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None)));
+	Rows = AllRows(Db, "lhs3");
+	REQUIRE(Rows.size() == 1);
+	REQUIRE(Rows[0].at("x") == "9");
+}
+
+TEST_CASE("SQL: row constructor comparisons") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_rowcmp_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "_rowcmp.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE rc (a INT, b INT); INSERT INTO rc VALUES (1,2),(1,3),(2,1); "
+	    "SELECT a, b FROM rc WHERE (a, b) >= (1, 3) ORDER BY a ASC, b ASC;";
+	AstralDB::SQL::Parser P(Q);
+	auto Code = AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	const auto *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	const auto Rows = AllRows(Db, "rc");
+	REQUIRE(Rows.size() == 2);
+	std::vector<std::pair<int, int>> Got;
+	for(const auto &R : Rows)
+		Got.emplace_back(std::stoi(R.at("a")), std::stoi(R.at("b")));
+	std::sort(Got.begin(), Got.end());
+	REQUIRE(Got[0] == std::make_pair(1, 3));
+	REQUIRE(Got[1] == std::make_pair(2, 1));
+}
+
+TEST_CASE("SQL: CURRENT_TIMESTAMP and timezone conversion functions") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_tz_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "_tz.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE tz (base TEXT); INSERT INTO tz VALUES ('2024-01-01T00:00:00Z'); "
+	    "SELECT CURRENT_TIMESTAMP() AS ct, AT_TIME_ZONE(base, '+02:00') AS t1, "
+	    "CONVERT_TZ(base, '+00:00', '+03:00') AS t2 FROM tz;";
+	AstralDB::SQL::Parser P(Q);
+	auto Code = AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	const auto *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	const auto Rows = AllRows(Db, "tz");
+	REQUIRE(Rows.size() == 1);
+	REQUIRE(Rows[0].find("ct") != Rows[0].end());
+	REQUIRE(Rows[0].at("ct").find('T') != std::string::npos);
+	REQUIRE(Rows[0].at("t1") == "2024-01-01T02:00:00Z");
+	REQUIRE(Rows[0].at("t2") == "2024-01-01T03:00:00Z");
 }
 
 TEST_CASE("SQL: WITH clones source and evaluates main SELECT on CTE") {
@@ -1221,6 +1380,132 @@ TEST_CASE("SQL: DENSE_RANK has no gaps after ties") {
 	REQUIRE(Rows[Order[1]].at("d") == "2");
 	REQUIRE(Rows[Order[2]].at("d") == "2");
 	REQUIRE(Rows[Order[3]].at("d") == "3");
+}
+
+TEST_CASE("SQL: FIRST_VALUE LAST_VALUE NTH_VALUE window functions") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_wvals_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "_wvals.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE wfvals (k INT, v INT); "
+	    "INSERT INTO wfvals VALUES (1, 10), (1, 20), (1, 30), (2, 5), (2, 15); "
+	    "SELECT k, v, FIRST_VALUE(v) OVER (PARTITION BY k ORDER BY v ASC) AS fv, "
+	    "LAST_VALUE(v) OVER (PARTITION BY k ORDER BY v ASC "
+	    "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS lv, "
+	    "NTH_VALUE(v, 2) OVER (PARTITION BY k ORDER BY v ASC "
+	    "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS nv "
+	    "FROM wfvals;";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	const auto Rows = AllRows(Db, "wfvals");
+	REQUIRE(Rows.size() == 5);
+	std::vector<size_t> Order(Rows.size());
+	std::iota(Order.begin(), Order.end(), size_t{0});
+	std::sort(Order.begin(), Order.end(), [&](size_t A, size_t B) {
+		const int Ka = std::stoi(Rows[A].at("k"));
+		const int Kb = std::stoi(Rows[B].at("k"));
+		if(Ka != Kb)
+			return Ka < Kb;
+		return std::stoi(Rows[A].at("v")) < std::stoi(Rows[B].at("v"));
+	});
+	REQUIRE(Rows[Order[0]].at("fv") == "10");
+	REQUIRE(Rows[Order[1]].at("fv") == "10");
+	REQUIRE(Rows[Order[2]].at("fv") == "10");
+	REQUIRE(Rows[Order[0]].at("lv") == "30");
+	REQUIRE(Rows[Order[1]].at("lv") == "30");
+	REQUIRE(Rows[Order[2]].at("lv") == "30");
+	REQUIRE(Rows[Order[0]].at("nv") == "20");
+	REQUIRE(Rows[Order[1]].at("nv") == "20");
+	REQUIRE(Rows[Order[2]].at("nv") == "20");
+	REQUIRE(Rows[Order[3]].at("fv") == Rows[Order[4]].at("fv"));
+	REQUIRE(Rows[Order[3]].at("lv") == "15");
+	REQUIRE(Rows[Order[3]].at("nv") == "15");
+}
+
+TEST_CASE("SQL: PERCENT_RANK and CUME_DIST on ties") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_wdist_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "_wdist.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE wdist (x INT); INSERT INTO wdist VALUES (10), (20), (20), (40); "
+	    "SELECT x, PERCENT_RANK() OVER (ORDER BY x ASC) AS pr, "
+	    "CUME_DIST() OVER (ORDER BY x ASC) AS cd FROM wdist;";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	const auto Rows = AllRows(Db, "wdist");
+	REQUIRE(Rows.size() == 4);
+	std::vector<size_t> Order(Rows.size());
+	std::iota(Order.begin(), Order.end(), size_t{0});
+	std::sort(Order.begin(), Order.end(), [&](size_t A, size_t B) {
+		const int Xa = std::stoi(Rows[A].at("x"));
+		const int Xb = std::stoi(Rows[B].at("x"));
+		if(Xa != Xb)
+			return Xa < Xb;
+		return A < B;
+	});
+	auto Nearly = [](const std::string &S, double Expected) {
+		const double Delta = std::stod(S) - Expected;
+		return Delta < 1e-9 && Delta > -1e-9;
+	};
+	REQUIRE(Nearly(Rows[Order.front()].at("pr"), 0.0));
+	REQUIRE(Nearly(Rows[Order.back()].at("pr"), 1.0));
+	REQUIRE(Nearly(Rows[Order.back()].at("cd"), 1.0));
+	double PrevPr = -1.0;
+	double PrevCd = -1.0;
+	for(size_t Idx : Order) {
+		const double Pr = std::stod(Rows[Idx].at("pr"));
+		const double Cd = std::stod(Rows[Idx].at("cd"));
+		REQUIRE(Pr >= 0.0);
+		REQUIRE(Pr <= 1.0);
+		REQUIRE(Cd >= 0.0);
+		REQUIRE(Cd <= 1.0);
+		REQUIRE(Pr + 1e-9 >= PrevPr);
+		REQUIRE(Cd + 1e-9 >= PrevCd);
+		PrevPr = Pr;
+		PrevCd = Cd;
+	}
+}
+
+TEST_CASE("SQL: NTILE distributes rows into buckets") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_ntile_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "_ntile.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE wnt (x INT); INSERT INTO wnt VALUES (1), (2), (3), (4), (5); "
+	    "SELECT x, NTILE(3) OVER (ORDER BY x ASC) AS tile FROM wnt;";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	const auto Rows = AllRows(Db, "wnt");
+	REQUIRE(Rows.size() == 5);
+	std::vector<size_t> Order(Rows.size());
+	std::iota(Order.begin(), Order.end(), size_t{0});
+	std::sort(Order.begin(), Order.end(), [&](size_t A, size_t B) { return Rows[A].at("x") < Rows[B].at("x"); });
+	REQUIRE(Rows[Order[0]].at("tile") == "1");
+	REQUIRE(Rows[Order[1]].at("tile") == "1");
+	REQUIRE(Rows[Order[2]].at("tile") == "2");
+	REQUIRE(Rows[Order[3]].at("tile") == "2");
+	REQUIRE(Rows[Order[4]].at("tile") == "3");
 }
 
 TEST_CASE("SQL: CASE expression in SELECT (searched WHEN/THEN/ELSE)") {
@@ -3061,6 +3346,106 @@ TEST_CASE("SQL: text search GROUPING_ID XML") {
 	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
 	AstralDB::SQL::BytecodeInterpreter I(&Log);
 	REQUIRE_NOTHROW(I.Execute(Code));
+}
+
+TEST_CASE("SQL: ARRAY/MDARRAY aliases and ISO JSON/XML spellings") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_isojx_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "isojx.log").string(), false);
+	const char *Q =
+	    "CREATE TABLE iso_types (id INT, a ARRAY(INT), m MDARRAY(2,2) FLOAT); "
+	    "INSERT INTO iso_types VALUES (1, 'L[3]:1,2,3', 'T[2,2]:1,0,0,1'); "
+	    "CREATE TABLE iso_docs (id INT, j TEXT, x TEXT); "
+	    "INSERT INTO iso_docs VALUES (1, '{\"n\":7,\"obj\":{\"k\":\"v\"}}', '<r><t>x</t></r>'); "
+	    "SELECT JSON_VALUE(j, 'n') AS jv, JSON_QUERY(j, 'obj') AS jq, JSON_EXISTS(j, 'obj') AS je FROM iso_docs; "
+	    "SELECT XMLQUERY(x, 'r.t') AS xq, XMLSERIALIZE(x) AS xs, XMLEXISTS(x, 'r.t') AS xe FROM iso_docs;";
+	AstralDB::SQL::Parser P(Q);
+	AstralDB::SQL::Bytecode Code =
+	    AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Code));
+}
+
+TEST_CASE("SQL: CREATE TYPE and CREATE TABLE OF") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_type_table_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "_typed.log").string(), false);
+	const char *Code =
+	    "CREATE TYPE customer_t AS (id INT, name TEXT);"
+	    "CREATE TABLE customers OF customer_t;"
+	    "INSERT INTO customers VALUES (7, 'eve');";
+	AstralDB::SQL::Parser P(Code);
+	auto Bc = AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(Bc));
+	const AstralDB::Database *Db = I.PrimaryDatabase();
+	REQUIRE(Db != nullptr);
+	REQUIRE(TableExists(Db, "customers"));
+	auto Rows = AllRows(Db, "customers");
+	REQUIRE(Rows.size() == 1);
+	REQUIRE(Rows[0].at("id") == "7");
+	REQUIRE(Rows[0].at("name") == "eve");
+}
+
+TEST_CASE("SQL: DROP TYPE rejects referenced typed tables") {
+	AstralDB::SQL::SetParserDiagnostics(false);
+	fs::path Dir = UniqueTempDir("astral_type_drop_guard_");
+	ScopedCwd Cwd(Dir);
+	RemoveEphemeralDb(Dir);
+	AstralDB::Logger Log((Dir / "_typed_drop.log").string(), false);
+	const char *Setup =
+	    "CREATE TYPE customer_t AS (id INT, name TEXT);"
+	    "CREATE TABLE customers OF customer_t;";
+	AstralDB::SQL::Parser P0(Setup);
+	auto B0 = AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	AstralDB::SQL::BytecodeInterpreter I(&Log);
+	REQUIRE_NOTHROW(I.Execute(B0));
+
+	const char *Drop = "DROP TYPE customer_t;";
+	AstralDB::SQL::Parser P1(Drop);
+	auto B1 = AstralDB::SQL::BuildBytecode(&Log, AstralDB::SQL::OptimizationLevel::None);
+	REQUIRE_THROWS_AS(I.Execute(B1), std::runtime_error);
+}
+
+TEST_CASE("C API: open exec prepare step finalize") {
+	fs::path Dir = UniqueTempDir("astral_capi_");
+	const fs::path DbPath = Dir / "astral_capi.db";
+	astraldb_t *Db = nullptr;
+	REQUIRE(astraldb_open(DbPath.string().c_str(), &Db) == 0);
+	REQUIRE(Db != nullptr);
+	REQUIRE(astraldb_exec(Db, "CREATE TABLE capi_t (id INT, name TEXT);") == 0);
+	REQUIRE(astraldb_exec(Db, "INSERT INTO capi_t VALUES (1, 'alpha');") == 0);
+	astraldb_stmt_t *Stmt = nullptr;
+	REQUIRE(astraldb_prepare(Db, "SELECT id, name FROM capi_t;", &Stmt) == 0);
+	REQUIRE(Stmt != nullptr);
+	REQUIRE(astraldb_stmt_step(Stmt) == 1);
+	REQUIRE(astraldb_stmt_column_count(Stmt) == 2);
+	REQUIRE(std::string(astraldb_stmt_column_name(Stmt, 0)) == "id");
+	REQUIRE(std::string(astraldb_stmt_column_text(Stmt, 0)) == "1");
+	REQUIRE(std::string(astraldb_stmt_column_text(Stmt, 1)) == "alpha");
+	REQUIRE(astraldb_stmt_step(Stmt) == 0);
+	astraldb_stmt_finalize(Stmt);
+	astraldb_close(Db);
+}
+
+TEST_CASE("C API: prepare rejects non-SELECT SQL") {
+	fs::path Dir = UniqueTempDir("astral_capi_prepare_guard_");
+	const fs::path DbPath = Dir / "astral_capi_guard.db";
+	astraldb_t *Db = nullptr;
+	REQUIRE(astraldb_open(DbPath.string().c_str(), &Db) == 0);
+	REQUIRE(Db != nullptr);
+	REQUIRE(astraldb_exec(Db, "CREATE TABLE capi_guard (id INT);") == 0);
+	astraldb_stmt_t *Stmt = reinterpret_cast<astraldb_stmt_t *>(0x1);
+	REQUIRE(astraldb_prepare(Db, "INSERT INTO capi_guard VALUES (1);", &Stmt) == -1);
+	REQUIRE(Stmt == nullptr);
+	const char *Err = astraldb_last_error(Db);
+	REQUIRE(Err != nullptr);
+	REQUIRE(std::string(Err).find("SELECT statements only") != std::string::npos);
+	astraldb_close(Db);
 }
 
 TEST_CASE("MathSci: signal FFT conv Laplacian autograd") {

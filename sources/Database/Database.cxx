@@ -1136,6 +1136,71 @@ static bool StripAndParseUserAclSnapshotTrailer(std::string &RawData, bool &OutP
 
 } // namespace
 
+namespace {
+
+constexpr std::string_view kObjectTypeSnapshotMarker = "\n__ASTRAL_OBJECT_TYPES__\n";
+
+void AppendObjectTypeSnapshotTrailer(std::string &RawData,
+                                     const std::unordered_map<std::string, Database::ObjectTypeSchema> &Types,
+                                     const std::unordered_map<std::string, std::string> &TypedBindings) {
+	std::ostringstream O;
+	O << kObjectTypeSnapshotMarker << Types.size() << '\n';
+	for(const auto &Pr : Types) {
+		O << WalEncodeSqlBody(Pr.first) << '\n' << Pr.second.size() << '\n';
+		for(const auto &F : Pr.second)
+			O << WalEncodeSqlBody(F.Name) << '\n' << WalEncodeSqlBody(F.Type) << '\n';
+	}
+	O << TypedBindings.size() << '\n';
+	for(const auto &Pr : TypedBindings)
+		O << WalEncodeSqlBody(Pr.first) << '\n' << WalEncodeSqlBody(Pr.second) << '\n';
+	RawData += O.str();
+}
+
+bool StripAndParseObjectTypeSnapshotTrailer(std::string &RawData,
+                                            std::unordered_map<std::string, Database::ObjectTypeSchema> &OutTypes,
+                                            std::unordered_map<std::string, std::string> &OutTypedBindings) {
+	const size_t Pos = RawData.rfind(kObjectTypeSnapshotMarker);
+	if(Pos == std::string::npos)
+		return true;
+	std::istringstream In(RawData.substr(Pos + kObjectTypeSnapshotMarker.size()));
+	size_t TypeCount = 0;
+	In >> TypeCount;
+	In.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+	for(size_t I = 0; I < TypeCount; ++I) {
+		std::string TypeNameEnc;
+		if(!std::getline(In, TypeNameEnc))
+			return false;
+		size_t FieldCount = 0;
+		if(!(In >> FieldCount))
+			return false;
+		In.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+		Database::ObjectTypeSchema Fields;
+		for(size_t J = 0; J < FieldCount; ++J) {
+			std::string FNameEnc;
+			std::string FTypeEnc;
+			if(!std::getline(In, FNameEnc) || !std::getline(In, FTypeEnc))
+				return false;
+			Fields.push_back({WalDecodeSqlBodyB64(FNameEnc), WalDecodeSqlBodyB64(FTypeEnc)});
+		}
+		OutTypes[WalDecodeSqlBodyB64(TypeNameEnc)] = std::move(Fields);
+	}
+	size_t BindingCount = 0;
+	if(!(In >> BindingCount))
+		return false;
+	In.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+	for(size_t I = 0; I < BindingCount; ++I) {
+		std::string TableEnc;
+		std::string TypeEnc;
+		if(!std::getline(In, TableEnc) || !std::getline(In, TypeEnc))
+			return false;
+		OutTypedBindings[WalDecodeSqlBodyB64(TableEnc)] = WalDecodeSqlBodyB64(TypeEnc);
+	}
+	RawData.erase(Pos);
+	return true;
+}
+
+} // namespace
+
 void Database::AppendWalAfterSetTableStorage(const std::string &TableName, StorageLayout Layout) {
 	if(WalSuspended_.load(std::memory_order_acquire))
 		return;
@@ -1173,6 +1238,28 @@ void Database::AppendWalAfterDropSequence(const std::string &Name) {
 	if(WalSuspended_.load(std::memory_order_acquire))
 		return;
 	Wal_.AppendLine(std::string("SD|") + Name);
+}
+
+void Database::AppendWalAfterCreateType(const std::string &TypeName, const ObjectTypeSchema &Fields) {
+	if(WalSuspended_.load(std::memory_order_acquire))
+		return;
+	std::ostringstream O;
+	O << "TY|" << WalEncodeSqlBody(TypeName) << '|' << Fields.size();
+	for(const auto &F : Fields)
+		O << '|' << WalEncodeSqlBody(F.Name) << '|' << WalEncodeSqlBody(F.Type);
+	Wal_.AppendLine(O.str());
+}
+
+void Database::AppendWalAfterDropType(const std::string &TypeName) {
+	if(WalSuspended_.load(std::memory_order_acquire))
+		return;
+	Wal_.AppendLine(std::string("TDY|") + WalEncodeSqlBody(TypeName));
+}
+
+void Database::AppendWalAfterBindTypedTable(const std::string &TableName, const std::string &TypeName) {
+	if(WalSuspended_.load(std::memory_order_acquire))
+		return;
+	Wal_.AppendLine(std::string("BT|") + WalEncodeSqlBody(TableName) + "|" + WalEncodeSqlBody(TypeName));
 }
 
 void Database::AppendWalAfterInsert(const std::string &TableName, const Item &Row) {
@@ -1427,6 +1514,7 @@ void Database::SyncToFileUnlocked() {
 	AppendTriggerSnapshotTrailer(RawData, TriggerDefinitions_);
 	AppendGraphCatalogSnapshotTrailer(RawData, Graphs_);
 	AppendEmbeddingCatalogSnapshotTrailer(RawData, Embeddings_);
+	AppendObjectTypeSnapshotTrailer(RawData, ObjectTypes_, TypedTableBindings_);
 	std::string CompressedData = CompressData(RawData);
 	std::string EncryptedData = EncryptData(CompressedData);
 	std::ofstream File(DbPath_, std::ios::binary);
@@ -2554,6 +2642,7 @@ std::future<void> Database::DropTable(const std::string &TableName, bool Cascade
 				AppendWalAfterDrop(Tn);
 				TableSchemas_.erase(Tn);
 				Tables_.erase(Tn);
+				TypedTableBindings_.erase(Tn);
 				Indexes_.erase(Tn);
 				ForeignKeys_.erase(Tn);
 				TableCheckConstraints_.erase(Tn);
@@ -2755,6 +2844,55 @@ std::future<void> Database::DropSequence(const std::string &Name, bool IfExists)
 	});
 }
 
+void Database::CreateObjectType(const std::string &TypeName, ObjectTypeSchema Fields) {
+	std::scoped_lock Guard(DbMutex_);
+	RequireSessionDdlAssumeLocked();
+	if(TypeName.empty())
+		FailStorage("CREATE TYPE requires a non-empty type name.");
+	if(Fields.empty())
+		FailStorage("CREATE TYPE requires at least one field.");
+	if(ObjectTypes_.count(TypeName) != 0)
+		FailStorage("CREATE TYPE: type \"" + TypeName + "\" already exists.");
+	ObjectTypes_[TypeName] = std::move(Fields);
+	AppendWalAfterCreateType(TypeName, ObjectTypes_.at(TypeName));
+	Dirty_.store(true, std::memory_order_release);
+}
+
+void Database::DropObjectType(const std::string &TypeName, bool IfExists) {
+	std::scoped_lock Guard(DbMutex_);
+	RequireSessionDdlAssumeLocked();
+	const auto ItType = ObjectTypes_.find(TypeName);
+	if(ItType == ObjectTypes_.end()) {
+		if(IfExists)
+			return;
+		FailStorage("DROP TYPE: type \"" + TypeName + "\" does not exist.");
+	}
+	for(const auto &Pr : TypedTableBindings_) {
+		if(Pr.second == TypeName) {
+			FailStorage("DROP TYPE: type \"" + TypeName + "\" is still referenced by typed table \"" + Pr.first +
+			            "\".");
+		}
+	}
+	ObjectTypes_.erase(ItType);
+	AppendWalAfterDropType(TypeName);
+	Dirty_.store(true, std::memory_order_release);
+}
+
+std::optional<Database::ObjectTypeSchema> Database::ResolveObjectTypeFields(const std::string &TypeName) const {
+	std::shared_lock Guard(DbMutex_);
+	auto It = ObjectTypes_.find(TypeName);
+	if(It == ObjectTypes_.end())
+		return std::nullopt;
+	return It->second;
+}
+
+void Database::BindTypedTableToObjectType(const std::string &TableName, const std::string &TypeName) {
+	std::scoped_lock Guard(DbMutex_);
+	TypedTableBindings_[TableName] = TypeName;
+	AppendWalAfterBindTypedTable(TableName, TypeName);
+	Dirty_.store(true, std::memory_order_release);
+}
+
 std::string Database::NextSequenceValueAssumeLocked(const std::string &Name) {
 	auto It = Sequences_.find(Name);
 	if(It == Sequences_.end())
@@ -2781,6 +2919,27 @@ void Database::ReplayWalCreateSequence(const std::string &Name, int64_t Start, i
 void Database::ReplayWalDropSequence(const std::string &Name) {
 	std::scoped_lock Guard(DbMutex_);
 	Sequences_.erase(Name);
+}
+
+void Database::ReplayWalCreateType(const std::string &TypeName, ObjectTypeSchema Fields) {
+	std::scoped_lock Guard(DbMutex_);
+	ObjectTypes_[TypeName] = std::move(Fields);
+}
+
+void Database::ReplayWalDropType(const std::string &TypeName) {
+	std::scoped_lock Guard(DbMutex_);
+	ObjectTypes_.erase(TypeName);
+	for(auto It = TypedTableBindings_.begin(); It != TypedTableBindings_.end();) {
+		if(It->second == TypeName)
+			It = TypedTableBindings_.erase(It);
+		else
+			++It;
+	}
+}
+
+void Database::ReplayWalBindTypedTable(const std::string &TableName, const std::string &TypeName) {
+	std::scoped_lock Guard(DbMutex_);
+	TypedTableBindings_[TableName] = TypeName;
 }
 
 namespace {
@@ -3926,6 +4085,10 @@ bool Database::LoadSnapshotFromDiskPathSynchronously(std::filesystem::path Path)
 	std::string EncryptedData((std::istreambuf_iterator<char>(File)), std::istreambuf_iterator<char>());
 	std::string CompressedData = DecryptData(EncryptedData);
 	std::string RawData = DecompressData(CompressedData);
+	std::unordered_map<std::string, ObjectTypeSchema> LoadedObjectTypes;
+	std::unordered_map<std::string, std::string> LoadedTypedBindings;
+	if(!StripAndParseObjectTypeSnapshotTrailer(RawData, LoadedObjectTypes, LoadedTypedBindings))
+		return false;
 	std::vector<GraphSpec> LoadedGraphs;
 	if(!StripAndParseGraphCatalogSnapshotTrailer(RawData, LoadedGraphs))
 		return false;
@@ -3977,6 +4140,8 @@ bool Database::LoadSnapshotFromDiskPathSynchronously(std::filesystem::path Path)
 		Roles_.clear();
 		RoleAcls_.clear();
 		UserRoles_.clear();
+		ObjectTypes_.clear();
+		TypedTableBindings_.clear();
 		for(size_t i = 0; i < SchemaCount; ++i) {
 			std::string TableName;
 			Input >> TableName;
@@ -4047,6 +4212,8 @@ bool Database::LoadSnapshotFromDiskPathSynchronously(std::filesystem::path Path)
 		CurrentUser_.reset();
 		InstallGraphCatalogAssumeLocked(*this, std::move(LoadedGraphs));
 		InstallEmbeddingCatalogAssumeLocked(*this, std::move(LoadedEmbeddings));
+		ObjectTypes_ = std::move(LoadedObjectTypes);
+		TypedTableBindings_ = std::move(LoadedTypedBindings);
 	}
 	return true;
 }

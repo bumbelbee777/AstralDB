@@ -22,7 +22,7 @@ class Database;
 
 namespace SQL {
 enum class Opcode : uint8_t {
-    SELECT, INSERT, UPDATE, DELETE, CREATE_TABLE, DROP_TABLE,
+    SELECT, INSERT, UPDATE, DELETE, CREATE_TABLE, DROP_TABLE, CREATE_TYPE, DROP_TYPE,
     SET, WHERE, ORDER_BY, GROUP_BY, LIMIT, OFFSET,
     KEEP_ROWS, DEDUP_ROWS,
     /** Operands: dst, lhs, rhs, mode (CompoundSetOpKind as int64), ncol, outCols..., lhsCols..., rhsCols... */
@@ -46,7 +46,7 @@ enum class Opcode : uint8_t {
 	GRANT_ROLE_MEMBERSHIP, REVOKE_ROLE_MEMBERSHIP, GRANT_COLUMN, REVOKE_COLUMN,
 
     // Transaction control
-    BEGIN, COMMIT, ROLLBACK,
+    BEGIN, COMMIT, ROLLBACK, SET_TRANSACTION_ISOLATION,
     
     // New opcodes for advanced features
     // JOIN types
@@ -85,7 +85,7 @@ enum class Opcode : uint8_t {
     CREATE_INDEX, DROP_INDEX,
     
     // View operations
-    CREATE_VIEW, DROP_VIEW,
+    CREATE_VIEW, DROP_VIEW, COMMENT_ON, SHOW_TABLES, DESCRIBE_TABLE,
 
 	/** Operands: procedure name, body SQL string, if-not-exists flag (int64). Compiles body, caches \c .abc beside session DB. */
 	CREATE_PROCEDURE,
@@ -131,7 +131,8 @@ enum class Opcode : uint8_t {
 	 *  no_cycle (int64). Expands rows in hierarchical order (depth-first) in-place. */
 	CONNECT_BY_EXPAND,
     /** Operands: PARTITION count (int64, 0=no partition), PARTITION col names..., ORDER BY col, asc (int64), out col name,
-     *  kind (int64: 0–2 ordinals, 3–6 running SUM/MIN/MAX/AVG, 7–8 LAG/LEAD), source column, frame offset (int64),
+     *  kind (int64: 0-2 ordinals, 3-6 running SUM/MIN/MAX/AVG, 7-8 LAG/LEAD, 9-11 FIRST/LAST/NTH_VALUE,
+     *  12-13 PERCENT_RANK/CUME_DIST, 14 NTILE), source column, frame offset (int64),
      *  explicit ROWS flag (int64), and when set: start kind, start offset, end kind, end offset. Without an explicit
      *  frame, aggregates use \c ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW . Table taken from stack. */
     WINDOW_ROW_NUMBER,
@@ -233,6 +234,8 @@ struct Instruction {
         switch (Opcode_) {
             case Opcode::CREATE_TABLE:
             case Opcode::DROP_TABLE:
+            case Opcode::CREATE_TYPE:
+            case Opcode::DROP_TYPE:
             case Opcode::CREATE_VIEW:
             case Opcode::DROP_VIEW:
 			case Opcode::CREATE_PROCEDURE:
@@ -490,3 +493,4 @@ bool EvaluatePackedWhereDnf(const Database *Db,
 
 } 
 }
+

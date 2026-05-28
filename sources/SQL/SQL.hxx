@@ -74,6 +74,11 @@ struct TableConstraintDef {
     std::string CheckSql;
 };
 
+struct ObjectTypeFieldDef {
+	std::string Name;
+	std::string Type;
+};
+
 enum class AlterTableKind { AddColumn, DropColumn, RenameColumn, SetStorage };
 
 enum class SavepointStmtKind { Set, Release, RollbackTo };
@@ -157,6 +162,29 @@ struct InSubqueryPredAST : public ExpressionAST {
         : Negated(Neg), LhsColumn(std::move(LhsCol)), InnerTable(std::move(Tbl)),
           InnerValueColumn(std::move(InnerCol)), InnerWhere(std::move(W)) {}
     void EmitBytecode(BytecodeScratch& Instructions) const override;
+};
+
+enum class QuantifiedSubqueryKind : int8_t { Any = 0, All = 1 };
+
+/** RHS for `lhs <op> ANY/SOME/ALL (SELECT expr FROM T [WHERE ...])`. */
+struct QuantifiedSubqueryAST : public ExpressionAST {
+    QuantifiedSubqueryKind Kind = QuantifiedSubqueryKind::Any;
+    std::string InnerTable;
+    std::string InnerValueColumn;
+    std::unique_ptr<ExpressionAST> InnerWhere;
+    explicit QuantifiedSubqueryAST(QuantifiedSubqueryKind KindIn, std::string TableIn, std::string ValueColIn,
+                                   std::unique_ptr<ExpressionAST> WhereIn)
+        : Kind(KindIn), InnerTable(std::move(TableIn)), InnerValueColumn(std::move(ValueColIn)),
+          InnerWhere(std::move(WhereIn)) {}
+    void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
+/** Row constructor `(a, b, ...)` for tuple comparisons in predicates. */
+struct RowConstructorExprAST : public ExpressionAST {
+    std::vector<std::unique_ptr<ExpressionAST>> Elements;
+    explicit RowConstructorExprAST(std::vector<std::unique_ptr<ExpressionAST>> ElementsIn)
+        : Elements(std::move(ElementsIn)) {}
+    void EmitBytecode(BytecodeScratch &Instructions) const override;
 };
 
 enum class WindowFrameUnit : int8_t { Rows = 0, Range = 1 };
@@ -353,6 +381,9 @@ enum class ScalarSqlFn : int16_t {
 	ClassifyLogistic = 182,
 	ClassifyArgmax = 183,
 	ClassifyOneVsRest = 184,
+	Now = 1000,
+	CurrentDate = 1001,
+	CurrentTime = 1002,
 	NlpTokenize = 185,
 	NlpNgrams = 186,
 	NlpJaccard = 187,
@@ -425,6 +456,9 @@ enum class ScalarSqlFn : int16_t {
 	RootBisectStep = 254,
 	RootHalleyStep = 255,
 	SolveRoot = 256,
+	CurrentTimestamp = 1003,
+	AtTimeZone = 1004,
+	ConvertTimezone = 1005,
 };
 
 static_assert(sizeof(std::underlying_type_t<ScalarSqlFn>) >= 2,
@@ -569,23 +603,43 @@ struct TableAST : public ExpressionAST {
     void EmitBytecode(BytecodeScratch& Instructions) const override;
 };
 
+struct CreateTypeAST : public StatementAST {
+	std::string TypeName;
+	std::vector<ObjectTypeFieldDef> Fields;
+
+	CreateTypeAST(std::string TypeNameIn, std::vector<ObjectTypeFieldDef> FieldsIn)
+	    : TypeName(std::move(TypeNameIn)), Fields(std::move(FieldsIn)) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
+struct DropTypeAST : public StatementAST {
+	std::string TypeName;
+	bool IfExists = false;
+
+	DropTypeAST(std::string TypeNameIn, bool IfExistsIn) : TypeName(std::move(TypeNameIn)), IfExists(IfExistsIn) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
 struct CreateAST : public ExpressionAST {
     std::string TableName;
     std::vector<ColumnDefinition> Columns;
     std::vector<TableConstraintDef> TableConstraints;
     bool IfNotExists = false;
 	StorageLayout StoragePolicy = StorageLayout::Row;
+	/** Optional object type name for `CREATE TABLE ... OF type_name`. */
+	std::string OfTypeName;
 
     explicit CreateAST(std::string TableName, std::vector<ColumnDefinition> Columns, bool IfNotExists = false)
         : TableName(std::move(TableName)), Columns(std::move(Columns)), IfNotExists(IfNotExists) {}
     CreateAST(std::string TableName, std::vector<ColumnDefinition> Columns,
               std::vector<TableConstraintDef> TableConstraints, bool IfNotExists = false,
-              StorageLayout StoragePolicyIn = StorageLayout::Row)
+              StorageLayout StoragePolicyIn = StorageLayout::Row, std::string OfTypeNameIn = {})
         : TableName(std::move(TableName))
         , Columns(std::move(Columns))
         , TableConstraints(std::move(TableConstraints))
         , IfNotExists(IfNotExists)
-        , StoragePolicy(StoragePolicyIn) {}
+        , StoragePolicy(StoragePolicyIn)
+	    , OfTypeName(std::move(OfTypeNameIn)) {}
     void EmitBytecode(BytecodeScratch& Instructions) const override;
 };
 
@@ -637,12 +691,22 @@ struct DropAST : public StatementAST {
 enum class TransactionType {
     BEGIN,
     COMMIT,
-    ROLLBACK
+    ROLLBACK,
+    SET_TRANSACTION
+};
+
+enum class TransactionIsolationLevel : int8_t {
+    Unspecified = 0,
+    ReadCommitted = 1,
+    RepeatableRead = 2,
+    Serializable = 3
 };
 
 class TransactionAST : public StatementAST {
 public:
     explicit TransactionAST(TransactionType Type) : Type_(Type) {}
+    TransactionAST(TransactionType Type, TransactionIsolationLevel Iso, bool SessionScope = false)
+        : Type_(Type), Isolation_(Iso), SessionScope_(SessionScope) {}
     
     void EmitBytecode(BytecodeScratch& Instructions) const override {
         switch (Type_) {
@@ -655,11 +719,18 @@ public:
             case TransactionType::ROLLBACK:
                 Instructions.push_back(MakeInstruction(Opcode::ROLLBACK));
                 break;
+            case TransactionType::SET_TRANSACTION:
+                Instructions.push_back(
+                    MakeInstruction(Opcode::SET_TRANSACTION_ISOLATION, static_cast<int64_t>(Isolation_),
+                                    static_cast<int64_t>(SessionScope_ ? 1 : 0)));
+                break;
         }
     }
     
 private:
     TransactionType Type_;
+    TransactionIsolationLevel Isolation_ = TransactionIsolationLevel::Unspecified;
+    bool SessionScope_ = false;
 };
 
 enum class GroupAggMode { None, CountStar, CountDistinct };
@@ -681,6 +752,7 @@ enum class SqlJoinKind { Inner, Left, Right, Full, Cross };
 struct JoinClause {
     SqlJoinKind Kind = SqlJoinKind::Inner;
     std::string RightTable;
+    bool IsLateral = false;
     /** Equality JOIN: left row[key] compares to right row[key] for each pair. */
     std::vector<std::pair<std::string, std::string>> OnPairs;
 };
@@ -694,7 +766,13 @@ enum class WindowFnKind : int8_t {
     Max = 5,
     Avg = 6,
     Lag = 7,
-    Lead = 8
+    Lead = 8,
+    FirstValue = 9,
+    LastValue = 10,
+    NthValue = 11,
+    PercentRank = 12,
+    CumeDist = 13,
+    Ntile = 14
 };
 
 enum class WindowFrameBoundKind : int8_t {
@@ -870,6 +948,35 @@ enum class CompoundSetOpKind : int8_t {
 };
 
 /** UNION / INTERSECT / EXCEPT: each arm is a full SELECT through HAVING (no ORDER/LIMIT on arms). */
+
+
+struct CommentOnAST : public StatementAST {
+    enum class TargetKind : int8_t { Table = 0, Column = 1 };
+    TargetKind Kind = TargetKind::Table;
+    std::string TableName;
+    std::string ColumnName;
+    std::string Comment;
+
+    void EmitBytecode(BytecodeScratch& Instructions) const override {
+        Instructions.push_back(
+            MakeInstruction(Opcode::COMMENT_ON, static_cast<int64_t>(Kind), TableName, ColumnName, Comment));
+    }
+};
+
+struct ShowTablesAST : public StatementAST {
+    void EmitBytecode(BytecodeScratch& Instructions) const override {
+        Instructions.push_back(MakeInstruction(Opcode::SHOW_TABLES));
+    }
+};
+
+struct DescribeTableAST : public StatementAST {
+    std::string TableName;
+    explicit DescribeTableAST(std::string Table) : TableName(std::move(Table)) {}
+    void EmitBytecode(BytecodeScratch& Instructions) const override {
+        Instructions.push_back(MakeInstruction(Opcode::DESCRIBE_TABLE, TableName));
+    }
+};
+
 struct CompoundSelectAST : public StatementAST {
     std::vector<std::unique_ptr<SelectAST>> Arms;
     std::vector<CompoundSetOpKind> Ops;
@@ -1567,6 +1674,7 @@ class Parser {
     ASTNode ParseRevokeStatement();
     ASTNode ParseTransactionStatement();
     ASTNode ParseDropStatement();
+	std::vector<ObjectTypeFieldDef> ParseObjectTypeFieldList();
 	std::unique_ptr<StatementAST> ParseLoadStatement();
 	std::unique_ptr<StatementAST> ParseVacuumStatement();
 	std::unique_ptr<StatementAST> ParseRepackStatement();
@@ -1575,6 +1683,10 @@ class Parser {
     ASTNode ParseReleaseSavepointStatement();
 	std::unique_ptr<StatementAST> ParseDataExchangeStatement();
     ASTNode ParseRollbackStatement();
+    ASTNode ParseCommentStatement();
+    ASTNode ParseSetStatement();
+    ASTNode ParseShowStatement();
+    ASTNode ParseDescribeStatement();
     std::string ParseDataType(std::vector<std::string> *DialectConstraints = nullptr);
     std::unique_ptr<ScalarFuncExprAST> TryParseConcatProjection();
     std::unique_ptr<CaseExprAST> ParseDecodeExpression();

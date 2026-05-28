@@ -1,0 +1,14 @@
+project: astraldb-capi
+language: cpp
+standard: c++23
+compiler: clang++
+project_type: library
+project_dirs: []
+supplementary_sources:
+  - astraldb_c.cxx
+output: ../../bin/libastraldb_c.a
+compiler_flags:
+  global: "-Wall -Wextra -Werror -fstack-protector-strong -fpie -Isources -Ithird_party -Iinclude"
+  common: "-Os"
+  cpp: "-std=c++23 -ffunction-sections -fdata-sections"
+  ld: "-Lbin -lastraldb_core -Wl,--gc-sections"

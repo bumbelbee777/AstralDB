@@ -12,6 +12,7 @@
 #include <vector>
 #include <string_view>
 #include <cstring>
+#include <ctime>
 
 namespace AstralDB {
 
@@ -127,6 +128,11 @@ void WriteAheadLog::FlushBufferedUnlocked() {
 void WriteAheadLog::AppendLine(std::string_view Line) {
 	std::lock_guard<AstralDB::Mutex> Lk(Mut_);
 	const std::string Enc = EncryptRecordToLine(Line);
+	if(SegmentMeta_.SegmentStartMarker.empty())
+		SegmentMeta_.SegmentStartMarker = std::to_string(static_cast<unsigned long long>(std::time(nullptr)));
+	SegmentMeta_.SegmentEndMarker = std::to_string(static_cast<unsigned long long>(std::time(nullptr)));
+	for(unsigned char C : Enc)
+		SegmentMeta_.ApproxChecksum = (SegmentMeta_.ApproxChecksum * 1315423911ull) ^ static_cast<uint64_t>(C);
 	std::size_t Add = Enc.size() + 1;
 	if(!BufferedLines_.empty()) {
 		std::size_t Pending = 0;
@@ -169,6 +175,9 @@ void WriteAheadLog::Replay(Database &Db) {
 	Flush();
 	if(!Exists())
 		return;
+	SegmentMeta_.SegmentStartMarker.clear();
+	SegmentMeta_.SegmentEndMarker.clear();
+	SegmentMeta_.ApproxChecksum = 0;
 	std::ifstream In(WalPath_, std::ios::binary);
 	if(!In)
 		FailWal("Cannot read write-ahead log for replay: " + WalPath_.string());
@@ -178,6 +187,11 @@ void WriteAheadLog::Replay(Database &Db) {
 			WalLine.pop_back();
 		if(WalLine.empty())
 			continue;
+		if(SegmentMeta_.SegmentStartMarker.empty())
+			SegmentMeta_.SegmentStartMarker = std::to_string(static_cast<unsigned long long>(std::time(nullptr)));
+		SegmentMeta_.SegmentEndMarker = std::to_string(static_cast<unsigned long long>(std::time(nullptr)));
+		for(unsigned char C : WalLine)
+			SegmentMeta_.ApproxChecksum = (SegmentMeta_.ApproxChecksum * 1315423911ull) ^ static_cast<uint64_t>(C);
 		if(WalLine.size() >= 3 && WalLine[0] == 'W' && WalLine[1] == '1' && WalLine[2] == '|') {
 			const std::string Blob = WalDecodeSqlBody(std::string_view(WalLine).substr(3));
 			if(Blob.size() < 24)
@@ -369,6 +383,27 @@ void WriteAheadLog::Replay(Database &Db) {
 			if(Tok.size() < 2)
 				FailWal("Corrupt WAL line: DROP SEQUENCE (SD) record incomplete - delete or repair " + WalPath_.string());
 			Db.ReplayWalDropSequence(WalDecodeSqlBody(Tok[1]));
+		} else if(Tok[0] == "TY") {
+			if(Tok.size() < 3)
+				FailWal("Corrupt WAL line: CREATE TYPE (TY) record incomplete - delete or repair " + WalPath_.string());
+			const std::string TypeName = WalDecodeSqlBody(Tok[1]);
+			const size_t Nf = static_cast<size_t>(std::stoull(Tok[2]));
+			if(Tok.size() != 3 + (2 * Nf))
+				FailWal("Corrupt WAL line: CREATE TYPE (TY) field count mismatch - delete or repair " +
+				        WalPath_.string());
+			Database::ObjectTypeSchema Fields;
+			for(size_t I = 0; I < Nf; ++I)
+				Fields.push_back({WalDecodeSqlBody(Tok[3 + I * 2]), WalDecodeSqlBody(Tok[3 + I * 2 + 1])});
+			Db.ReplayWalCreateType(TypeName, std::move(Fields));
+		} else if(Tok[0] == "TDY") {
+			if(Tok.size() < 2)
+				FailWal("Corrupt WAL line: DROP TYPE (TDY) record incomplete - delete or repair " + WalPath_.string());
+			Db.ReplayWalDropType(WalDecodeSqlBody(Tok[1]));
+		} else if(Tok[0] == "BT") {
+			if(Tok.size() < 3)
+				FailWal("Corrupt WAL line: BIND TYPED TABLE (BT) record incomplete - delete or repair " +
+				        WalPath_.string());
+			Db.ReplayWalBindTypedTable(WalDecodeSqlBody(Tok[1]), WalDecodeSqlBody(Tok[2]));
 		} else if(Tok[0] == "CR") {
 			if(Tok.size() < 2)
 				FailWal("Corrupt WAL line: CREATE ROLE (CR) record incomplete - delete or repair " + WalPath_.string());

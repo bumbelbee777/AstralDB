@@ -1,0 +1,15 @@
+project: astraldb-tests
+language: cpp
+standard: c++23
+compiler: clang++
+project_type: executable
+project_dirs: []
+supplementary_sources:
+  - TestMain.cxx
+  - AstralDB.Tests.cxx
+output: ../bin/run_tests
+compiler_flags:
+  global: "-Wall -Wextra -Werror -fstack-protector-strong -fpie -Isources -Ithird_party -Itests -Iinclude"
+  common: "-Os"
+  cpp: "-std=c++23 -ffunction-sections -fdata-sections"
+  ld: "-Lbin -lastraldb_c -lastraldb_core -Wl,--stack,8388608 -Wl,--gc-sections"

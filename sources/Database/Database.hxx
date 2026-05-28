@@ -105,6 +105,12 @@ class Database {
 	                                                                 const std::string &VectorColumn);
 
 public:
+	struct ObjectTypeField {
+		std::string Name;
+		std::string Type;
+	};
+	using ObjectTypeSchema = std::vector<ObjectTypeField>;
+
 	struct Column {
 		std::string Name;
 		bool IsPrimaryKey = false;
@@ -176,6 +182,9 @@ private:
 
     std::unordered_map<std::string, std::unordered_map<std::string, Permissions>> Acls_;
 	std::unordered_map<std::string, std::unordered_map<std::string, Permissions>> RoleAcls_;
+	std::unordered_map<std::string, ObjectTypeSchema> ObjectTypes_;
+	std::unordered_map<std::string, std::string> TypedTableBindings_;
+
 	std::unordered_map<std::string, std::vector<std::string>> UserRoles_;
 	std::unordered_set<std::string> Roles_;
 	mutable AuditLog AuditLog_;
@@ -210,6 +219,9 @@ private:
 	void AppendWalAfterForeignKey(const std::string &TableName, const ForeignKey &Key);
 	void AppendWalAfterCreateSequence(const std::string &Name, int64_t Start, int64_t Increment);
 	void AppendWalAfterDropSequence(const std::string &Name);
+	void AppendWalAfterCreateType(const std::string &TypeName, const ObjectTypeSchema &Fields);
+	void AppendWalAfterDropType(const std::string &TypeName);
+	void AppendWalAfterBindTypedTable(const std::string &TableName, const std::string &TypeName);
 
 	std::string NextSequenceValueAssumeLocked(const std::string &Name);
 	void ResolveRowSequenceLiteralsAssumeLocked(Item &Row);
@@ -252,6 +264,11 @@ private:
     void SyncToFileUnlocked();
 
 public:
+	void CreateObjectType(const std::string &TypeName, ObjectTypeSchema Fields);
+	void DropObjectType(const std::string &TypeName, bool IfExists);
+	std::optional<ObjectTypeSchema> ResolveObjectTypeFields(const std::string &TypeName) const;
+	void BindTypedTableToObjectType(const std::string &TableName, const std::string &TypeName);
+
     TablesMap Tables_;
     std::filesystem::path DbPath_;
 
@@ -491,6 +508,9 @@ public:
 	void ReplayWalAddForeignKey(const std::string &TableName, ForeignKey Key);
 	void ReplayWalCreateSequence(const std::string &Name, int64_t Start, int64_t Increment);
 	void ReplayWalDropSequence(const std::string &Name);
+	void ReplayWalCreateType(const std::string &TypeName, ObjectTypeSchema Fields);
+	void ReplayWalDropType(const std::string &TypeName);
+	void ReplayWalBindTypedTable(const std::string &TableName, const std::string &TypeName);
 	void ReplayWalGraphRegister(GraphSpec Spec);
 	void ReplayWalGraphDrop(const std::string &Name);
 	void ReplayWalGraphProjection(const GraphProjectionRequest &Req);

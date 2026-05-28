@@ -65,8 +65,9 @@ add_library(astraldb_core STATIC
 
 target_include_directories(astraldb_core
     PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/sources
-        ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/sources>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party>
+        $<INSTALL_INTERFACE:include>
 )
 
 if(MSVC)
@@ -83,17 +84,29 @@ endif()
 
 astraldb_apply_target_options(astraldb_core)
 
+add_library(astraldb_c STATIC
+    sources/API/astraldb_c.cxx
+)
+target_link_libraries(astraldb_c PUBLIC astraldb_core)
+target_include_directories(astraldb_c
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+)
+astraldb_apply_target_options(astraldb_c)
+
 add_executable(astraldb
     sources/Program.cxx
 )
 target_link_libraries(astraldb PRIVATE astraldb_core)
+target_link_libraries(astraldb PRIVATE astraldb_c)
 astraldb_apply_target_options(astraldb)
 
 add_executable(astraldb_tests
     tests/TestMain.cxx
     tests/AstralDB.Tests.cxx
 )
-target_link_libraries(astraldb_tests PRIVATE astraldb_core)
+target_link_libraries(astraldb_tests PRIVATE astraldb_core astraldb_c)
 target_include_directories(astraldb_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 set_target_properties(astraldb_tests PROPERTIES OUTPUT_NAME run_tests)
 astraldb_apply_target_options(astraldb_tests)
@@ -103,3 +116,34 @@ add_test(NAME astraldb_fast_tests COMMAND $<TARGET_FILE:astraldb_tests>)
 set_tests_properties(astraldb_fast_tests PROPERTIES LABELS "fast")
 add_test(NAME astraldb_perf_tests COMMAND $<TARGET_FILE:astraldb_tests> --test-suite=perf)
 set_tests_properties(astraldb_perf_tests PROPERTIES LABELS "perf")
+
+include(CMakePackageConfigHelpers)
+
+install(TARGETS astraldb_core astraldb_c astraldb astraldb_tests
+    EXPORT AstralDBTargets
+    ARCHIVE DESTINATION lib
+    LIBRARY DESTINATION lib
+    RUNTIME DESTINATION bin
+)
+install(FILES include/astraldb/astraldb.h DESTINATION include/astraldb)
+
+install(EXPORT AstralDBTargets
+    FILE AstralDBTargets.cmake
+    NAMESPACE AstralDB::
+    DESTINATION lib/cmake/AstralDB
+)
+
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/AstralDBConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/AstralDBConfig.cmake"
+"include(\"${CMAKE_CURRENT_LIST_DIR}/AstralDBTargets.cmake\")\n")
+
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/AstralDBConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/AstralDBConfigVersion.cmake"
+    DESTINATION lib/cmake/AstralDB
+)
