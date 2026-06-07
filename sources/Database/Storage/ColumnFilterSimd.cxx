@@ -208,10 +208,10 @@ void FilterI64Sve(const int64_t *Values, std::size_t Count, FilterCompareOp Op, 
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
 void AppendMaskNeon2(std::size_t Offset, uint64x2_t Mask, std::vector<std::size_t> &Out) {
-	for(int B = 0; B < 2; ++B) {
-		if(vgetq_lane_u64(Mask, B) != 0)
-			Out.push_back(Offset + static_cast<std::size_t>(B));
-	}
+	if(vgetq_lane_u64(Mask, 0) != 0)
+		Out.push_back(Offset);
+	if(vgetq_lane_u64(Mask, 1) != 0)
+		Out.push_back(Offset + 1);
 }
 
 uint64x2_t CompareMaskNeonI64(int64x2_t V, int64x2_t Need, FilterCompareOp Op) {
@@ -219,7 +219,7 @@ uint64x2_t CompareMaskNeonI64(int64x2_t V, int64x2_t Need, FilterCompareOp Op) {
 	case FilterCompareOp::Eq:
 		return vreinterpretq_u64_s64(vceqq_s64(V, Need));
 	case FilterCompareOp::Ne:
-		return vreinterpretq_u64_s64(vmvnq_s64(vceqq_s64(V, Need)));
+		return vreinterpretq_u64_s64(veorq_s64(vceqq_s64(V, Need), vdupq_n_s64(-1)));
 	case FilterCompareOp::Gt:
 		return vreinterpretq_u64_s64(vcgtq_s64(V, Need));
 	case FilterCompareOp::Ge:

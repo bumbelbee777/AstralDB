@@ -1,7 +1,8 @@
 #pragma once
 
+#include <IO/EnvUtil.hxx>
+
 #include <chrono>
-#include <cstdlib>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -34,7 +35,7 @@ public:
 
 private:
 	static bool Enabled() noexcept {
-		const char *P = std::getenv("ASTRALDB_PROFILE_OUTPUT");
+		const char *P = EnvGet("ASTRALDB_PROFILE_OUTPUT");
 		return P != nullptr && P[0] != '\0';
 	}
 

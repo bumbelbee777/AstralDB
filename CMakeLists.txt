@@ -11,15 +11,8 @@ set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 option(ASTRALDB_WARNINGS_AS_ERRORS "Treat warnings as errors" ON)
 option(ASTRALDB_IO_URING "Enable Linux io_uring for column shard reads (requires liburing)" OFF)
 
-include(CheckIPOSupported)
-check_ipo_supported(RESULT _astraldb_ipo_supported OUTPUT _astraldb_ipo_error)
-
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/AstralDBCompileOptions.cmake)
 astraldb_configure_release_dist()
-
-if(ASTRALDB_LTO AND _astraldb_ipo_supported)
-	set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
-endif()
 
 add_library(astraldb_core STATIC
     sources/Database/Database.cxx
