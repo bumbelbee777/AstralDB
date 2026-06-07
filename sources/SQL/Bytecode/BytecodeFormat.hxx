@@ -1,6 +1,6 @@
 #pragma once
 
-#include <SQL/Bytecode.hxx>
+#include <SQL/Bytecode/Bytecode.hxx>
 #include <cstdint>
 #include <filesystem>
 #include <string>

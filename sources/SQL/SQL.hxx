@@ -1,12 +1,15 @@
 #pragma once
 
 #include <IO/Logger.hxx>
-#include <Database/Dataset.hxx>
-#include <Database/User.hxx>
-#include <Database/HybridStorageScheduler.hxx>
-#include <SQL/Bytecode.hxx>
-#include <SQL/ProcedureParser.hxx>
-#include <SQL/BytecodeTriggers.hxx>
+#include <Database/Storage/Dataset.hxx>
+#include <Database/Security/User.hxx>
+#include <Database/Storage/HybridStorageScheduler.hxx>
+#include <SQL/Bytecode/Bytecode.hxx>
+#include <Database/Execution/PlanTypes.hxx>
+#include <SQL/Fusion/FusionPlanTypes.hxx>
+#include <SQL/Shape/ShapeCompositionTypes.hxx>
+#include <SQL/Procedures/ProcedureParser.hxx>
+#include <SQL/Procedures/BytecodeTriggers.hxx>
 #include <DS/Tree.hxx>
 #include <DS/BPlusTree.hxx>
 #include <DS/RadixTree.hxx>
@@ -145,8 +148,14 @@ struct ExistsPredAST : public ExpressionAST {
     bool Negated = false;
     std::string InnerTable;
     std::unique_ptr<ExpressionAST> InnerWhere;
+	/** Set by SemiJoinRewriter: hash semi-join on outer/inner key columns. */
+	std::string SemiJoinOuterKey;
+	std::string SemiJoinInnerKey;
     ExistsPredAST(bool Neg, std::string Tbl, std::unique_ptr<ExpressionAST> W)
         : Negated(Neg), InnerTable(std::move(Tbl)), InnerWhere(std::move(W)) {}
+	[[nodiscard]] bool SemiJoinRewritten() const {
+		return !SemiJoinOuterKey.empty() && !SemiJoinInnerKey.empty();
+	}
     void EmitBytecode(BytecodeScratch& Instructions) const override;
 };
 
@@ -193,307 +202,13 @@ enum class WindowFrameUnit : int8_t { Rows = 0, Range = 1 };
 enum class SqlCastTarget : int8_t { Text = 0, Integer = 1, Real = 2, Boolean = 3, Advanced = 4 };
 
 /** Built-in scalar functions allowed in SELECT projections (evaluated via \c Opcode::SCALAR_FUNC_EVAL ). */
-enum class ScalarSqlFn : int16_t {
-	Upper = 0,
-	Lower = 1,
-	CharLength = 2,
-	/** SQL-99 \c SUBSTRING(expr FROM start [FOR length]) or three-argument comma form; two args = suffix from start. */
-	SubstringFromFor = 3,
-	PositionIn = 4,
-	TrimBoth = 5,
-	TrimLeading = 6,
-	TrimTrailing = 7,
-	ConcatVariadic = 8,
-	ExtractYear = 9,
-	ExtractMonth = 10,
-	ExtractDay = 11,
-	DateAddDays = 12,
-	DateSubDays = 13,
-	DateDiffDays = 14,
-	Grouping = 15,
-	ExtractHour = 16,
-	ExtractMinute = 17,
-	ExtractSecond = 18,
-	ExtractEpoch = 19,
-	TimeBucketSeconds = 20,
-	DateTrunc = 21,
-	TimestampDiffSeconds = 22,
-	DateAddSeconds = 23,
-	StructField = 24,
-	MapGet = 25,
-	ComplexReal = 26,
-	ComplexImag = 27,
-	ComplexMul = 28,
-	VectorDot = 29,
-	VectorAdd = 30,
-	VectorNorm = 31,
-	MatrixVec = 32,
-	Abs = 33,
-	Sqrt = 34,
-	Cbrt = 35,
-	Exp = 36,
-	Ln = 37,
-	Log10 = 38,
-	Log2 = 39,
-	Sin = 40,
-	Cos = 41,
-	Tan = 42,
-	Asin = 43,
-	Acos = 44,
-	Atan = 45,
-	Sinh = 46,
-	Cosh = 47,
-	Tanh = 48,
-	Floor = 49,
-	Ceil = 50,
-	Round = 51,
-	Trunc = 52,
-	Sign = 53,
-	Degrees = 54,
-	Radians = 55,
-	Pow = 56,
-	Atan2 = 57,
-	Mod = 58,
-	Hypot = 59,
-	Lerp = 60,
-	Clamp = 61,
-	Mean = 62,
-	VarPop = 63,
-	VarSamp = 64,
-	StdPop = 65,
-	StdSamp = 66,
-	Median = 67,
-	Entropy = 68,
-	NormL1 = 69,
-	NormL2 = 70,
-	ListSum = 71,
-	Corr = 72,
-	CovPop = 73,
-	CovSamp = 74,
-	Sigmoid = 75,
-	Relu = 76,
-	Softmax = 77,
-	MinMaxScale = 78,
-	ZScore = 79,
-	ListLen = 80,
-	ListGet = 81,
-	ListAppend = 82,
-	ListConcat = 83,
-	ListContains = 84,
-	ListSlice = 85,
-	Logistic = 86,
-	Logit = 87,
-	Softplus = 88,
-	LeakyRelu = 89,
-	MseLoss = 90,
-	MaeLoss = 91,
-	RmseLoss = 92,
-	BceLoss = 93,
-	HingeLoss = 94,
-	HuberLoss = 95,
-	CeLoss = 96,
-	Random = 97,
-	RandomNormal = 98,
-	RandomInt = 99,
-	SetSeed = 100,
-	CosineSim = 101,
-	EuclideanDist = 102,
-	ManhattanDist = 103,
-	MatVec = 104,
-	ListSort = 105,
-	ListSortDesc = 106,
-	ListReverse = 107,
-	JsonExtract = 108,
-	JsonContains = 109,
-	JsonMerge = 110,
-	JsonArrayLength = 111,
-	JsonKeys = 112,
-	NullIf = 113,
-	Greatest = 114,
-	Least = 115,
-	TextContains = 116,
-	TextMatch = 117,
-	GroupingId = 118,
-	XmlExtract = 119,
-	XmlSerialize = 120,
-	XmlValid = 121,
-	TextRank = 122,
-	VectorTopK = 123,
-	Fft = 124,
-	Ifft = 125,
-	Dct = 126,
-	Idct = 127,
-	Conv1d = 128,
-	Conv1dSame = 129,
-	Laplacian1d = 130,
-	AdGradAdd = 131,
-	AdGradMulLhs = 132,
-	AdGradMulRhs = 133,
-	AdGradRelu = 134,
-	AdGradSigmoid = 135,
-	AdGradConv1dIn = 136,
-	AdGradConv1dK = 137,
-	AdChain = 138,
-	AdHessian = 139,
-	AdHessianRelu = 140,
-	AdHessianSigmoid = 141,
-	AdHessianSquare = 142,
-	AdWirtingerMulLhs = 143,
-	AdWirtingerMulRhs = 144,
-	AdWirtingerAbs2 = 145,
-	AdWirtingerChain = 146,
-	AdWirtingerDz = 147,
-	AdWirtingerDzBar = 148,
-	OdeEuler = 149,
-	OdeRk4 = 150,
-	SdeEuler = 151,
-	SdeGbm = 152,
-	SdeOu = 153,
-	PdeHeatStep = 154,
-	PdePoissonStep = 155,
-	OdeHeun = 156,
-	OdeMidpoint = 157,
-	OdeImplicitEuler = 158,
-	SdeMilstein = 159,
-	PdeAdvectionStep = 160,
-	PdeWaveStep = 161,
-	SolveOde = 162,
-	StPoint = 163,
-	StX = 164,
-	StY = 165,
-	StAsText = 166,
-	StDistance = 167,
-	StDistanceSpherical = 168,
-	StWithinBbox = 169,
-	TsCompress = 170,
-	TsDecompress = 171,
-	TsCompressSeries = 172,
-	StPointZ = 173,
-	StElevation = 174,
-	StDemSample = 175,
-	StTerrainSlope = 176,
-	/** \c LIST_TRANSFORM(list, x -> expr) — DuckDB-style list map with a lambda. */
-	ListTransform = 177,
-	OdeTrapezoid = 178,
-	OdeSemiImplicit = 179,
-	OdeCrankNicolson = 180,
-	ClassifyLinear = 181,
-	ClassifyLogistic = 182,
-	ClassifyArgmax = 183,
-	ClassifyOneVsRest = 184,
-	Now = 1000,
-	CurrentDate = 1001,
-	CurrentTime = 1002,
-	NlpTokenize = 185,
-	NlpNgrams = 186,
-	NlpJaccard = 187,
-	NlpEditDist = 188,
-	NlpStem = 189,
-	NlpEmbedBuild = 190,
-	NlpEmbedLookup = 191,
-	NlpEmbedBatch = 192,
-	NlpEmbedSerialize = 193,
-	NlpEmbedLoad = 194,
-	NlpEmbedFingerprint = 195,
-	NlpEmbedMean = 196,
-	StMeshDefine = 197,
-	StMeshImportGltf = 198,
-	StMeshExportGltf = 199,
-	StMeshSew = 200,
-	StMeshUnion = 201,
-	StMeshIntersection = 202,
-	StMeshDifference = 203,
-	StPolygon = 204,
-	StPolygonWkt = 205,
-	StGeomAsText = 206,
-	StGeomArea = 207,
-	StGeomPerimeter = 208,
-	StGeomCentroid = 209,
-	StGeomContains = 210,
-	StGeomWithin = 211,
-	StGeomIntersects = 212,
-	StGeomOverlaps = 213,
-	StGeomTouches = 214,
-	StGeomUnion = 215,
-	StGeomIntersection = 216,
-	StGeomDifference = 217,
-	StGeomSymDifference = 218,
-	StGeomBuffer = 219,
-	StGeomSimplify = 220,
-	StGeomConvexHull = 221,
-	StGeojsonImport = 222,
-	StGeojsonExport = 223,
-	StMeshVolume = 224,
-	StMeshSurfaceArea = 225,
-	StMeshCentroid = 226,
-	StMeshTranslate = 227,
-	StMeshScale = 228,
-	StMeshRotate = 229,
-	StMeshBounds = 230,
-	StMeshMerge = 231,
-	StGeomValidate = 232,
-	StGeomRepair = 233,
-	StMeshValidate = 234,
-	StMeshRepair = 235,
-	RegexpMatch = 236,
-	OdeRk3 = 237,
-	OdeAdamsBashforth2 = 238,
-	OdeMarch = 239,
-	SdeMarch = 240,
-	LinearJacobiStep = 241,
-	LinearGaussSeidelStep = 242,
-	LinearSorStep = 243,
-	LinearRichardsonStep = 244,
-	LinearCgSolve = 245,
-	SolveLinear = 246,
-	PdePoissonGsStep = 247,
-	PdePoissonSorStep = 248,
-	PdePoissonSolve = 249,
-	PdeHeatMarch = 250,
-	SolvePde = 251,
-	RootNewtonStep = 252,
-	RootSecantStep = 253,
-	RootBisectStep = 254,
-	RootHalleyStep = 255,
-	SolveRoot = 256,
-	AdGradTanh = 257,
-	AdGradMatVecIn = 258,
-	AdGradMatVecW = 259,
-	AdGradMsePred = 260,
-	MathSciModelBuild = 261,
-	MathSciModelSerialize = 262,
-	MathSciModelImport = 263,
-	MathSciModelLoad = 264,
-	MathSciModelFingerprint = 265,
-	Predict = 266,
-	AdHessianTanh = 267,
-	PinnFdCentral = 268,
-	DeqIntegrate = 269,
-	DeqAdapt = 270,
-	DeqLinspace = 271,
-	MctsSearch = 272,
-	MctsUctPick = 273,
-	BayesBetaPost = 274,
-	BayesNormalPost = 275,
-	BayesGridPost = 276,
-	BayesLogEvidence = 277,
-	NfpMacroStep = 278,
-	NfpMacroMarch = 279,
-	NfpMacroMoments = 280,
-	CurrentTimestamp = 1003,
-	AtTimeZone = 1004,
-	ConvertTimezone = 1005,
-};
-
-static_assert(sizeof(std::underlying_type_t<ScalarSqlFn>) >= 2,
-              "ScalarSqlFn must use at least int16 (builtins exceed 127)");
 
 /** VM / bytecode tag for \c ScalarSqlFn (always non-negative \c int64 ). */
 inline constexpr int64_t ScalarSqlFnTag(ScalarSqlFn Fn) noexcept {
 	return static_cast<int64_t>(static_cast<std::underlying_type_t<ScalarSqlFn>>(Fn));
 }
 
-enum class SecondaryIndexKind : int8_t { Fts = 0, Vector = 1 };
+enum class SecondaryIndexKind : int8_t { Fts = 0, Vector = 1, BTree = 2 };
 
 struct MatchRecognizeDefine {
 	std::string Symbol;
@@ -757,59 +472,16 @@ private:
     bool SessionScope_ = false;
 };
 
-enum class GroupAggMode { None, CountStar, CountDistinct };
-
-/** OLAP modifier after \c GROUP BY column list (\c WITH ROLLUP / \c WITH CUBE). */
-enum class GroupOlapModifier { None, Rollup, Cube, GroupingSets };
-
-/** GROUP BY aggregates beyond COUNT(*); codegen packs into Opcode::GROUP_BY extended layout. */
-enum class GroupCombAggKind : int { Sum = 0, Min = 1, Max = 2, Avg = 3 };
-
-struct GroupCombAgg {
-    GroupCombAggKind Kind = GroupCombAggKind::Sum;
-    std::string SourceColumn;
-    std::string OutputColumn;
-};
-
 enum class SqlJoinKind { Inner, Left, Right, Full, Cross };
 
 struct JoinClause {
     SqlJoinKind Kind = SqlJoinKind::Inner;
     std::string RightTable;
+    /** SQL alias after the joined table (e.g. \c o in \c JOIN orders o); empty means use \c RightTable as key. */
+    std::string RightAlias;
     bool IsLateral = false;
     /** Equality JOIN: left row[key] compares to right row[key] for each pair. */
     std::vector<std::pair<std::string, std::string>> OnPairs;
-};
-
-enum class WindowFnKind : int8_t {
-    RowNumber = 0,
-    Rank = 1,
-    DenseRank = 2,
-    Sum = 3,
-    Min = 4,
-    Max = 5,
-    Avg = 6,
-    Lag = 7,
-    Lead = 8,
-    FirstValue = 9,
-    LastValue = 10,
-    NthValue = 11,
-    PercentRank = 12,
-    CumeDist = 13,
-    Ntile = 14
-};
-
-enum class WindowFrameBoundKind : int8_t {
-    UnboundedPreceding = 0,
-    Preceding = 1,
-    CurrentRow = 2,
-    Following = 3,
-    UnboundedFollowing = 4
-};
-
-struct WindowFrameBound {
-    WindowFrameBoundKind Kind = WindowFrameBoundKind::CurrentRow;
-    int64_t Offset = 0;
 };
 
 struct WindowSpec {
@@ -842,7 +514,7 @@ public:
               std::string Table,
               std::unique_ptr<ExpressionAST> WhereClause = nullptr,
               std::unique_ptr<ExpressionAST> HavingClause = nullptr,
-              std::vector<std::pair<std::string, bool>> OrderByColumns = {},
+              std::vector<OrderBySpec> OrderByColumns = {},
               int64_t Limit = -1,
               int64_t Offset = 0,
               bool Distinct = false,
@@ -891,12 +563,15 @@ public:
 
     /** FROM table (after parser CTE substitution). Used by WITH materialization. */
     const std::string &SourceTableName() const { return Table_; }
+    /** FROM alias when written (e.g. \c c); empty means the relation is keyed by \c SourceTableName() only. */
+    const std::string &SourceTableAlias() const { return SourceTableAlias_; }
+    void SetSourceTableAlias(std::string Alias) { SourceTableAlias_ = std::move(Alias); }
     const std::vector<std::string> &GroupKeys() const { return GroupByColumns_; }
     GroupAggMode AggKind() const { return AggMode_; }
     const std::optional<std::string> &CountDistinctColumn() const { return CountDistinctColumn_; }
     const std::vector<WindowSpec> &WindowSpecs() const { return WindowSpecs_; }
     bool DistinctSelected() const { return Distinct_; }
-    const std::vector<std::pair<std::string, bool>> &OrderBySpecs() const { return OrderByColumns_; }
+    const std::vector<OrderBySpec> &OrderBySpecs() const { return OrderByColumns_; }
     int64_t SelectLimitValue() const { return Limit_; }
     int64_t SelectOffsetValue() const { return Offset_; }
     const ExpressionAST *WhereRoot() const { return WhereClause_.get(); }
@@ -916,11 +591,25 @@ public:
 	const std::optional<ConnectBySpec> &ConnectBy() const { return ConnectBy_; }
 	void SetConnectBy(std::optional<ConnectBySpec> Spec) { ConnectBy_ = std::move(Spec); }
 
+	void SetFusedPlan(FusionPlan Plan) { FusedPlan_ = std::move(Plan); }
+	bool HasFusedPlan() const { return FusedPlan_.has_value() && FusedPlan_->Kind != FusionKind::None; }
+	const FusionPlan &FusedPlan() const { return *FusedPlan_; }
+
+	void SetShapeComposition(QueryShapeComposition Comp) { ShapeComposition_ = std::move(Comp); }
+	bool HasShapeComposition() const { return ShapeComposition_.has_value(); }
+	const QueryShapeComposition &ShapeComposition() const { return *ShapeComposition_; }
+
+	void RewriteWhere(std::unique_ptr<ExpressionAST> W) { WhereClause_ = std::move(W); }
+	void RewriteSourceTable(std::string T) { Table_ = std::move(T); }
+	std::vector<JoinClause> &RewriteJoins() { return Joins_; }
+	std::vector<WindowSpec> &RewriteWindows() { return WindowSpecs_; }
+	std::vector<std::string> &RewriteProjectionColumns() { return Columns_; }
+
 	/** Output column name for \c COUNT(*) / \c COUNT(DISTINCT…) in this SELECT (empty when no count aggregate). */
 	const std::string &CountAggregateOutputColumn() const { return CountAggregateOutputColumn_; }
 
     /** Parser attaches trailing ORDER BY / LIMIT after the FROM…HAVING clause (single SELECT only). */
-    void ApplyQueryOrdering(std::vector<std::pair<std::string, bool>> OrderByColumns, int64_t Limit, int64_t Offset) {
+    void ApplyQueryOrdering(std::vector<OrderBySpec> OrderByColumns, int64_t Limit, int64_t Offset) {
         OrderByColumns_ = std::move(OrderByColumns);
         if(Limit >= 0)
             Limit_ = Limit;
@@ -937,9 +626,10 @@ public:
 private:
     std::vector<std::string> Columns_;
     std::string Table_;
+    std::string SourceTableAlias_;
     std::unique_ptr<ExpressionAST> WhereClause_;
     std::unique_ptr<ExpressionAST> HavingClause_;
-    std::vector<std::pair<std::string, bool>> OrderByColumns_;
+    std::vector<OrderBySpec> OrderByColumns_;
     int64_t Limit_;
     int64_t Offset_;
     bool Distinct_;
@@ -960,6 +650,8 @@ private:
 	std::optional<std::string> AsOfTimestamp_;
 	std::optional<MatchRecognizeSpec> MatchRecognize_;
 	std::optional<ConnectBySpec> ConnectBy_;
+	std::optional<FusionPlan> FusedPlan_;
+	std::optional<QueryShapeComposition> ShapeComposition_;
 };
 
 enum class CompoundSetOpKind : int8_t {
@@ -1004,11 +696,18 @@ struct DescribeTableAST : public StatementAST {
 struct CompoundSelectAST : public StatementAST {
     std::vector<std::unique_ptr<SelectAST>> Arms;
     std::vector<CompoundSetOpKind> Ops;
-    std::vector<std::pair<std::string, bool>> OrderByColumns;
+    std::vector<OrderBySpec> OrderByColumns;
     int64_t Limit = -1;
     int64_t Offset = 0;
 
+    void SetShapeComposition(QueryShapeComposition Comp) { ShapeComposition_ = std::move(Comp); }
+    bool HasShapeComposition() const { return ShapeComposition_.has_value(); }
+    const QueryShapeComposition &ShapeComposition() const { return *ShapeComposition_; }
+
     void EmitBytecode(BytecodeScratch &Instructions) const override;
+
+private:
+    std::optional<QueryShapeComposition> ShapeComposition_;
 };
 
 struct CreateViewAST : public StatementAST {
@@ -1045,18 +744,22 @@ struct CreateProcedureAST : public StatementAST {
 	std::string SourceDialect_;
 	std::vector<ProcedureExceptionWhen> ExceptionHandlers_;
 	std::string ControlFlowJson_;
+	/** In-process structured control flow (avoids JSON roundtrip during CREATE PROCEDURE). */
+	std::optional<LoweredProcedureBody> StructuredBody_;
 
 	CreateProcedureAST(std::string Name_, std::string BodySql_, bool IfNotExists_ = false, bool OrReplace_ = false,
 	                    std::string SourceDialect_ = {},
 	                    std::vector<ProcedureExceptionWhen> ExceptionHandlers_ = {},
-	                    std::string ControlFlowJson_ = {})
+	                    std::string ControlFlowJson_ = {},
+	                    std::optional<LoweredProcedureBody> StructuredBody_ = std::nullopt)
 	    : ProcedureName(std::move(Name_)),
 	      BodySql_(std::move(BodySql_)),
 	      IfNotExists(IfNotExists_),
 	      OrReplace(OrReplace_),
 	      SourceDialect_(std::move(SourceDialect_)),
 	      ExceptionHandlers_(std::move(ExceptionHandlers_)),
-	      ControlFlowJson_(std::move(ControlFlowJson_)) {}
+	      ControlFlowJson_(std::move(ControlFlowJson_)),
+	      StructuredBody_(std::move(StructuredBody_)) {}
 
 	void EmitBytecode(BytecodeScratch &Instructions) const override;
 };
@@ -1117,12 +820,26 @@ struct AlterTriggerAST : public StatementAST {
 	void EmitBytecode(BytecodeScratch &Instructions) const override;
 };
 
+enum class RecursiveCtePattern : int8_t {
+	Generic = 0,
+	ParentChild = 1,
+	LinearAdjacency = 2,
+	CategoryExpansion = 3
+};
+
 struct CteClause {
 	std::string Alias;
 	std::string PhysicalTable;
 	std::unique_ptr<SelectAST> Anchor;
 	/** Non-null for \c WITH RECURSIVE … anchor \c UNION ALL recursive_step . */
 	std::unique_ptr<SelectAST> RecursiveStep;
+	/** Filled by RecursiveCteOptimizer before codegen. */
+	RecursiveCtePattern Pattern = RecursiveCtePattern::Generic;
+	bool PreferBfs = false;
+	bool PreferHierarchyScan = false;
+	int64_t LinearAdjacencyStep = 0;
+	std::string HierarchyIdCol;
+	std::string HierarchyParentCol;
 
 	bool IsRecursive() const { return RecursiveStep != nullptr; }
 };
@@ -1257,7 +974,7 @@ struct BinaryOpAST : public ExpressionAST {
 
 /** Builtin aggregate call allowed only in \c HAVING ; lowered to grouped output column names at codegen. */
 struct FuncCallExprAST : public ExpressionAST {
-	enum class Kind { CountStar, CountDistinct, Sum, Min, Max, Avg };
+	enum class Kind { CountStar, CountDistinct, Sum, Min, Max, Avg, StdDevPop, StdDevSamp, Median, ApproxQuantile, Mode };
 	Kind BuiltinKind = Kind::CountStar;
 	/** \c COUNT(DISTINCT col) or \c SUM/MIN/MAX/AVG column; empty for \c COUNT(*) . */
 	std::string ArgColumn;
@@ -1393,6 +1110,47 @@ struct LoadDatasetAST : public StatementAST {
 	void EmitBytecode(BytecodeScratch &Instructions) const override;
 };
 
+	struct PragmaAST : public StatementAST {
+	enum class Kind : std::uint8_t {
+		Profile,
+		Region,
+		VectorBatchSize,
+		JoinStrategy,
+		ZoneMapAdaptive,
+		LazyMaterialization,
+		Vm,
+		OptLevel,
+		VerifyFastPath,
+		Explain,
+		DumpProfile,
+		ResetProfile,
+		UsePrecomputed,
+		QueryCheckpointOnSignal,
+		QueryCheckpointInterval,
+		ResumeQueryCheckpoint,
+		JitEnabled,
+		ForeignKeys,
+		OptConfidenceFloor,
+		CompatAck
+	};
+	Kind Kind_ = Kind::Profile;
+	std::string Value;
+	int64_t IntValue = 0;
+
+	PragmaAST(Kind K, std::string Val = std::string(), int64_t IntVal = 0)
+	    : Kind_(K), Value(std::move(Val)), IntValue(IntVal) {}
+	void EmitBytecode(BytecodeScratch & /*Instructions*/) const override {}
+};
+
+struct ExplainSelectAST : public StatementAST {
+	bool Analyze = false;
+	std::unique_ptr<StatementAST> Inner;
+
+	ExplainSelectAST(bool AnalyzeIn, std::unique_ptr<StatementAST> InnerIn)
+	    : Analyze(AnalyzeIn), Inner(std::move(InnerIn)) {}
+	void EmitBytecode(BytecodeScratch &Instructions) const override;
+};
+
 struct VacuumAST : public StatementAST {
 	std::string TableName;
 
@@ -1484,6 +1242,16 @@ struct GraphTraverseAST : public StatementAST {
 	void EmitBytecode(BytecodeScratch &Instructions) const override;
 };
 
+struct GraphMatchPatternSegment {
+	std::string EdgeLabel;
+	int64_t MinHops = 1;
+	int64_t MaxHops = 1;
+	bool Reverse = false;
+	std::string TargetVertexVar;
+	/** When true, segment ends on edge destination (product) vertex. */
+	bool EndOnProduct = false;
+};
+
 struct GraphMatchAST : public StatementAST {
 	std::string GraphName;
 	std::string EdgeLabelFilter;
@@ -1492,6 +1260,10 @@ struct GraphMatchAST : public StatementAST {
 	std::string AnchorVertexId;
 	bool Reverse = false;
 	std::string ResultTable;
+	std::vector<GraphMatchPatternSegment> Segments;
+	std::string VertexWhereVar;
+	std::string VertexWhereCol;
+	std::string VertexWhereValue;
 
 	GraphMatchAST(std::string Graph, std::string LabelFilter, int64_t MinH, int64_t MaxH, std::string Anchor,
 	              bool ReverseIn, std::string Result)
@@ -1528,7 +1300,7 @@ struct CreateIndexAST : public StatementAST {
 	std::string IndexName;
 	std::string TableName;
 	std::string ColumnName;
-	SecondaryIndexKind Kind = SecondaryIndexKind::Fts;
+	SecondaryIndexKind Kind = SecondaryIndexKind::BTree;
 	int64_t VectorMetricTag = 1;
 
 	CreateIndexAST(std::string Name, std::string Table, std::string Column, SecondaryIndexKind Kind,
@@ -1668,6 +1440,8 @@ class Parser {
     /** After consuming the SELECT keyword: one arm through HAVING (no ORDER BY / LIMIT). */
     std::unique_ptr<SelectAST> ParseSelectArmThroughHaving();
     std::unique_ptr<StatementAST> ParseWithStatement();
+    std::unique_ptr<StatementAST> ParsePragmaStatement();
+    std::unique_ptr<StatementAST> ParseExplainStatement();
     void ApplyCteSubstitution(std::string &TableName) const;
     std::unique_ptr<CaseExprAST> ParseSearchedCaseExpression();
     std::unique_ptr<CaseExprAST> ParseCoalesceExpression();
@@ -1722,6 +1496,8 @@ class Parser {
     std::vector<std::string> ParseColumnConstraintList();
     TableConstraintDef ParseTableConstraint();
     ASTNode ParseUnaryOrPostfixPredicate();
+    std::string ParseQualifiedSqlName();
+    bool TryParseWindowAggArgument(std::string &OutSourceColumn);
     void ParseWindowOverClause(WindowSpec &Ws);
 	void ParseSequenceOptions(int64_t &Start, int64_t &Increment);
 

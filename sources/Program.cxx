@@ -1,16 +1,26 @@
 #include <SQL/SQL.hxx>
-#include <SQL/BytecodeInterpreter.hxx>
-#include <SQL/Bytecode.hxx>
-#include <SQL/BytecodeFormat.hxx>
-#include <SQL/BytecodeInspect.hxx>
-#include <SQL/BytecodeDebug.hxx>
-#include <SQL/BytecodeProcedures.hxx>
-#include <SQL/BytecodeTriggers.hxx>
+#include <SQL/Bytecode/BytecodeInterpreter.hxx>
+#include <SQL/Profiler/SqlPipeline.hxx>
+#include <SQL/Profiler/QueryProfiler.hxx>
+#include <SQL/Bytecode/FastPathGuard.hxx>
+#include <SQL/Bytecode/Bytecode.hxx>
+#include <SQL/Bytecode/BytecodeFormat.hxx>
+#include <SQL/Bytecode/BytecodeInspect.hxx>
+#include <SQL/Bytecode/BytecodeDebug.hxx>
+#include <SQL/Bytecode/QueryCheckpoint.hxx>
+#include <SQL/Shape/QueryShapeRouter.hxx>
+#include <SQL/Procedures/BytecodeProcedures.hxx>
+#include <SQL/Procedures/BytecodeTriggers.hxx>
 #include <IO/Logger.hxx>
 #include <IO/Error.hxx>
+#include <IO/ErrMsg.hxx>
+#include <IO/Job.hxx>
 #include <Database/Database.hxx>
+#include <Database/Storage/StarJoinCubeAnalytic.hxx>
 #include <astraldb/AstralDB.h>
+#include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <iomanip>
 #include <filesystem>
@@ -19,26 +29,108 @@
 #include <memory>
 #include <optional>
 #include <random>
+#include <sstream>
 #include <string>
 #include <system_error>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <csignal>
+#else
+#define NOMINMAX
+#include <windows.h>
+#endif
+
+static bool gCliCheckpointOnSignal = false;
+static std::optional<std::filesystem::path> gCliResumeCheckpointPath;
+
+#if !defined(_WIN32)
+static void QueryCheckpointSignalHandler(int) {
+	AstralDB::SQL::gRequestQueryCheckpoint.store(true, std::memory_order_release);
+}
+#else
+static BOOL WINAPI QueryCheckpointConsoleHandler(DWORD CtrlType) {
+	if(CtrlType == CTRL_C_EVENT || CtrlType == CTRL_BREAK_EVENT) {
+		AstralDB::SQL::gRequestQueryCheckpoint.store(true, std::memory_order_release);
+		return TRUE;
+	}
+	return FALSE;
+}
+#endif
+
+static void InstallQueryCheckpointSignalHandlers() {
+	if(!gCliCheckpointOnSignal)
+		return;
+#if !defined(_WIN32)
+	std::signal(SIGINT, QueryCheckpointSignalHandler);
+	std::signal(SIGTERM, QueryCheckpointSignalHandler);
+#else
+	SetConsoleCtrlHandler(QueryCheckpointConsoleHandler, TRUE);
+#endif
+}
 
 // Helper function to read file contents
 std::string ReadFile(const std::string& Path) {
 	std::ifstream File(Path, std::ios::binary);
 	if (!File) {
 		throw std::runtime_error(
-		    AstralDB::Err::Prefixed("CLI", "Cannot open query file (check path and permissions): " + Path));
+		    AstralDB::Err::Prefixed("CLI", std::string(AstralDB::ErrMsg::CliNoFile) + Path));
 	}
 	std::string Contents((std::istreambuf_iterator<char>(File)), std::istreambuf_iterator<char>());
 	if (Contents.empty()) {
 		throw std::runtime_error(
-		    AstralDB::Err::Prefixed("CLI", "Query file is empty: " + Path));
+		    AstralDB::Err::Prefixed("CLI", std::string(AstralDB::ErrMsg::CliEmptyFile) + Path));
 	}
 	if (Contents.size() >= 3 && static_cast<unsigned char>(Contents[0]) == 0xEF && static_cast<unsigned char>(Contents[1]) == 0xBB &&
 	    static_cast<unsigned char>(Contents[2]) == 0xBF)
 		Contents.erase(0, 3);
 	return Contents;
+}
+
+static void PrintTimeSqlLine(AstralDB::Logger *Log, const std::string &Line) {
+	std::cerr << Line << std::flush;
+	std::cout << Line << std::flush;
+	if(Log)
+		Log->Info(Line);
+	if(const char *Path = std::getenv("ASTRALDB_TIME_SQL_OUT")) {
+		if(FILE *F = std::fopen(Path, "a")) {
+			std::fwrite(Line.data(), 1, Line.size(), F);
+			std::fclose(F);
+		}
+	}
+}
+
+static void FinalizeTimeSqlProfile(AstralDB::SQL::BytecodeInterpreter &Interpreter, const double CompileMs,
+                                   const double ExecMs) {
+	auto &Cfg = Interpreter.SessionConfig();
+	if(Cfg.ProfileName)
+		AstralDB::SQL::QueryProfiler::Instance().BeginQuery(*Cfg.ProfileName);
+	AstralDB::SQL::QueryProfile Profile;
+	Profile.Name = Cfg.ProfileName.value_or("time-sql");
+	Profile.Region = Cfg.RegionName.value_or("");
+	Profile.CompileTime = std::chrono::duration_cast<std::chrono::nanoseconds>(
+	    std::chrono::duration<double, std::milli>(CompileMs));
+	Profile.ExecuteTime =
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double, std::milli>(ExecMs));
+	const auto Stats = Interpreter.LastTimeSqlStats();
+	Profile.ScannedRows = Stats.RowsScanned;
+	Profile.ResultRows = Stats.ResultRows;
+	Profile.VmUsed = AstralDB::SQL::VmChoiceLabel(Cfg.Vm);
+	Profile.Verified = !Stats.IntegrityFailed;
+	AstralDB::SQL::QueryProfiler::Instance().EndQuery(Profile);
+	if(Cfg.ProfileDumpPath) {
+		AstralDB::SQL::QueryProfiler::Instance().DumpToJSON(*Cfg.ProfileDumpPath);
+		const auto &Regions = AstralDB::SQL::QueryProfiler::Instance().RegionTimings();
+		if(!Regions.empty()) {
+			std::ostringstream O;
+			O << "[time-sql-profile] dump=" << *Cfg.ProfileDumpPath;
+			for(const auto &[Name, Ns] : Regions)
+				O << " " << Name << "_ms=" << std::fixed << std::setprecision(3)
+				  << (static_cast<double>(Ns.count()) / 1'000'000.0);
+			O << "\n";
+			PrintTimeSqlLine(nullptr, O.str());
+		}
+	}
 }
 
 struct CliBytecodeOptions {
@@ -49,6 +141,52 @@ struct CliBytecodeOptions {
 	std::optional<std::string> BytecodeAspect;
 	bool CompileWithStringPool = false;
 };
+
+static int CliTimeSqlWarmup = 0;
+static int CliTimeSqlRuns = 1;
+static bool CliTimeSqlDurable = false;
+static std::optional<std::string> CliTimeSqlSetupPath;
+
+static void KickWalIoOverlap(AstralDB::Database *Db) {
+	if(Db)
+		Db->FlushWalToDisk();
+}
+
+static double QuiesceWalIoMs(AstralDB::Database *Db) {
+	if(!Db)
+		return 0.0;
+	using Clock = std::chrono::steady_clock;
+	using Ms = std::chrono::duration<double, std::milli>;
+	const auto T0 = Clock::now();
+	Db->QuiesceAsyncFsync();
+	return Ms(Clock::now() - T0).count();
+}
+
+static void AppendWalTimingFields(std::ostringstream &O, double WalQuiesceMs, double SetupCompileMs,
+                                  double QueryCompileMs) {
+	if(SetupCompileMs > 0.0 || QueryCompileMs > 0.0) {
+		if(SetupCompileMs > 0.0)
+			O << " setup_compile_ms=" << SetupCompileMs;
+		if(QueryCompileMs > 0.0)
+			O << " query_compile_ms=" << QueryCompileMs;
+	}
+	if(CliTimeSqlDurable || WalQuiesceMs > 0.0)
+		O << " wal_quiesce_ms=" << WalQuiesceMs;
+	if(CliTimeSqlDurable)
+		O << " durable=1";
+}
+
+static void CommitDurableDatabase(AstralDB::SQL::BytecodeInterpreter &Interpreter) {
+	if(!CliTimeSqlDurable)
+		return;
+	AstralDB::Database *Db = Interpreter.MutatingDatabase();
+	if(!Db)
+		return;
+	Db->SetSkipExitSyncOnDestroy(false);
+	Db->FlushWalToDisk();
+	Db->QuiesceAsyncFsync();
+	Db->SyncToFile();
+}
 
 static bool CliArgIs(const std::string &Arg, std::initializer_list<const char *> Names) {
 	for(const char *N : Names)
@@ -76,7 +214,7 @@ static void PrintBytecodeHelpLines() {
 	std::cout << "  --proc-info NAME (-pi)            Metadata + bytecode summary\n";
 	std::cout << "  --proc-call NAME (-px)            Execute registered .abc\n";
 	std::cout << "  --proc-relations (-pg)            Procedure <-> .abc relation graph\n";
-	std::cout << "  SQL: CREATE PROCEDURE n AS (…); CALL n; DROP PROCEDURE n;\n";
+	std::cout << "  SQL: CREATE PROCEDURE n AS (…); PL/pgSQL, PL/SQL, T-SQL bodies; CALL n; DROP PROCEDURE n;\n";
 	std::cout << "  Triggers (catalog + astraldb_triggers_cache/*.abc):\n";
 	std::cout << "  --trig-list (-tl)                 List triggers\n";
 	std::cout << "  --trig-info NAME (-ti)            Trigger metadata\n";
@@ -87,7 +225,7 @@ static void PrintBytecodeHelpLines() {
 
 
 static std::filesystem::path ResolveTrigCatalog(const std::filesystem::path &SessionDb) {
-	return AstralDB::SQL::DefaultTriggerCatalogPath(SessionDb);
+	return AstralDB::DefaultTriggerCatalogPath(SessionDb);
 }
 
 static std::filesystem::path ResolveProcCatalog(const std::filesystem::path &SessionDb,
@@ -204,6 +342,23 @@ static void ApplyCliGlobalFlags(int Argc, char** Argv, bool& Verbose, std::strin
 				*AuditFileOut = std::filesystem::path(Argv[++I]);
 			else
 				throw std::runtime_error("No path provided after --audit-file");
+		} else if(Arg == "--time-sql-warmup") {
+			if(I + 1 < Argc)
+				CliTimeSqlWarmup = std::max(0, std::atoi(Argv[++I]));
+			else
+				throw std::runtime_error("No count provided after --time-sql-warmup");
+		} else if(Arg == "--time-sql-runs") {
+			if(I + 1 < Argc)
+				CliTimeSqlRuns = std::max(1, std::atoi(Argv[++I]));
+			else
+				throw std::runtime_error("No count provided after --time-sql-runs");
+		} else if(Arg == "--time-sql-setup") {
+			if(I + 1 < Argc)
+				CliTimeSqlSetupPath = Argv[++I];
+			else
+				throw std::runtime_error("No file provided after --time-sql-setup");
+		} else if(Arg == "--time-sql-durable") {
+			CliTimeSqlDurable = true;
 		} else if(BcOpts && CliArgIs(Arg, {"--trace-bytecode", "-tb"}))
 			BcOpts->TraceExecution = true;
 		else if(BcOpts && CliArgIs(Arg, {"--compile-pool", "-cp"}))
@@ -218,13 +373,32 @@ static void ApplyCliGlobalFlags(int Argc, char** Argv, bool& Verbose, std::strin
 				BcOpts->Breakpoints.push_back(static_cast<std::size_t>(std::stoull(Argv[++I])));
 			else
 				throw std::runtime_error("No instruction index after --breakpoint / -bp");
-		} else if(BcOpts && CliArgIs(Arg, {"--proc-catalog", "-pc"})) {
+		} else if(Arg == "--proc-catalog" || Arg == "-pc") {
 			if(I + 1 < Argc)
 				BcOpts->ProcCatalog = std::filesystem::path(Argv[++I]);
 			else
 				throw std::runtime_error("No path after --proc-catalog / -pc");
+		} else if(Arg == "--checkpoint-on-signal") {
+			gCliCheckpointOnSignal = true;
+		} else if(Arg == "--resume-checkpoint") {
+			if(I + 1 < Argc && Argv[I + 1][0] != '-')
+				gCliResumeCheckpointPath = std::filesystem::path(Argv[++I]);
+			else
+				gCliResumeCheckpointPath = std::filesystem::path{};
 		}
 	}
+}
+
+static void MaybeResumeQueryCheckpoint(AstralDB::SQL::BytecodeInterpreter &Interpreter,
+                                       const AstralDB::SQL::Bytecode &Code) {
+	if(!gCliResumeCheckpointPath.has_value())
+		return;
+	const std::filesystem::path Path =
+	    gCliResumeCheckpointPath->empty()
+	        ? AstralDB::SQL::DefaultQueryCheckpointPath(Interpreter.DatabasePath())
+	        : *gCliResumeCheckpointPath;
+	if(const auto Loaded = AstralDB::SQL::LoadQueryCheckpoint(Path))
+		(void)AstralDB::SQL::ResumeQueryCheckpoint(Interpreter, Code, *Loaded);
 }
 
 static void ApplyCliAuditLog(AstralDB::Database *Db, const std::optional<std::filesystem::path> &AuditPath) {
@@ -362,6 +536,10 @@ void RunREPL(AstralDB::Logger& Logger, const std::filesystem::path& SessionDbPat
 }
 
 int main(int Argc, char** Argv) {
+	struct JobSystemGuard {
+		JobSystemGuard() { AstralDB::JobSystem::Instance().Initialize(); }
+		~JobSystemGuard() { AstralDB::JobSystem::Instance().Shutdown(); }
+	} JobGuard;
 	bool Verbose = false;
 	std::string LogFile = "astraldb.log";
 	std::string CompileOut = "out.abc";
@@ -381,6 +559,7 @@ int main(int Argc, char** Argv) {
 
 		Logger = std::make_unique<AstralDB::Logger>(LogFile, Verbose);
 		AstralDB::SQL::SetParserDiagnostics(Verbose);
+		InstallQueryCheckpointSignalHandlers();
 
 		std::filesystem::path SessionDbPath =
 		    DbFromCli ? CliDbPath : MakeSessionDatabasePath(MemoryOnly);
@@ -409,6 +588,13 @@ int main(int Argc, char** Argv) {
 				std::cout << "      --audit-file FILE   Append security audit events to FILE\n";
 				std::cout << "  -s FILE                 Evaluate, compile, and run query file\n";
 				std::cout << "  --time-sql FILE        Run query file; print parse / execute wall times (stderr)\n";
+				std::cout << "      --time-sql-warmup N  With --time-sql-runs: untimed execute passes\n";
+				std::cout << "      --time-sql-runs N    Compile once; time N executes (median reported)\n";
+				std::cout << "      --time-sql-setup FILE  Run setup once (untimed); --time-sql FILE is timed query only\n";
+				std::cout << "      --time-sql-durable     Quiesce async WAL fsync after timed query; report wal_quiesce_ms\n";
+				std::cout << "      --time-sql-suite FILE  After --time-sql-setup: timed queries (lines: LABEL\\tPATH)\n";
+				std::cout << "      --checkpoint-on-signal   Save encrypted .query.ckpt on SIGINT (POSIX) / Ctrl+C\n";
+				std::cout << "      --resume-checkpoint [PATH]  Resume from query checkpoint (default: DB.query.ckpt)\n";
 				std::cout << "  -m, --mmap              Session DB under OS temp (no astral.db in cwd)\n";
 				std::cout << "      --database PATH     Use PATH as persistence file (instead of cwd astral.db / temp)\n";
 				std::cout << "  -U, --user NAME         Authenticate as NAME for this process (see -P / env)\n";
@@ -460,11 +646,13 @@ int main(int Argc, char** Argv) {
 					++I;
 				continue;
 			}
-			if(Arg == "--time-sql") {
+			if(Arg == "--time-sql-warmup" || Arg == "--time-sql-runs" || Arg == "--time-sql-setup") {
 				if(I + 1 < Argc)
 					++I;
 				continue;
 			}
+			if(Arg == "--time-sql-durable")
+				continue;
 			if(Arg == "-O0" || Arg == "-O1" || Arg == "-O2" || Arg == "-O3" || Arg == "-O4")
 				continue;
 			if(CliArgIs(Arg, {"--trace-bytecode", "-tb", "--compile-pool", "-cp"}))
@@ -515,7 +703,7 @@ int main(int Argc, char** Argv) {
 			}
 
 			if(CliArgIs(Arg, {"--trig-relations", "-tg"})) {
-				auto Catalog = AstralDB::SQL::LoadTriggerCatalog(ResolveTrigCatalog(SessionDbPath));
+				auto Catalog = AstralDB::LoadTriggerCatalog(ResolveTrigCatalog(SessionDbPath));
 				if(Catalog.CatalogPath.empty())
 					Catalog.CatalogPath = ResolveTrigCatalog(SessionDbPath);
 				AstralDB::SQL::RebuildTriggerRelations(Catalog);
@@ -523,15 +711,15 @@ int main(int Argc, char** Argv) {
 				return 0;
 			}
 			if(CliArgIs(Arg, {"--trig-list", "-tl"})) {
-				const auto Catalog = AstralDB::SQL::LoadTriggerCatalog(ResolveTrigCatalog(SessionDbPath));
+				const auto Catalog = AstralDB::LoadTriggerCatalog(ResolveTrigCatalog(SessionDbPath));
 				if(Catalog.Triggers.empty()) {
 					std::cout << "(no triggers registered)\n";
 					return 0;
 				}
 				for(const auto &E : Catalog.Triggers) {
 					std::cout << E.Name << "\t" << E.TableName << "\t"
-					          << AstralDB::SQL::TriggerTimingTag(E.Timing) << "\t"
-					          << AstralDB::SQL::TriggerEventTag(E.Event) << "\t"
+					          << AstralDB::TriggerTimingTag(E.Timing) << "\t"
+					          << AstralDB::TriggerEventTag(E.Event) << "\t"
 					          << (E.Enabled ? "enabled" : "disabled") << "\n";
 				}
 				return 0;
@@ -539,8 +727,8 @@ int main(int Argc, char** Argv) {
 			if(CliArgIs(Arg, {"--trig-info", "-ti"})) {
 				if(I + 1 < Argc) {
 					const std::string Name = Argv[++I];
-					const auto Catalog = AstralDB::SQL::LoadTriggerCatalog(ResolveTrigCatalog(SessionDbPath));
-					const auto Entry = AstralDB::SQL::FindTrigger(Catalog, Name);
+					const auto Catalog = AstralDB::LoadTriggerCatalog(ResolveTrigCatalog(SessionDbPath));
+					const auto Entry = AstralDB::FindTrigger(Catalog, Name);
 					if(!Entry)
 						throw std::runtime_error("Trigger not found: " + Name);
 					std::cout << AstralDB::SQL::FormatTriggerEntrySummary(*Entry);
@@ -549,7 +737,7 @@ int main(int Argc, char** Argv) {
 				throw std::runtime_error("No name after --trig-info / -ti");
 			}
 			if(CliArgIs(Arg, {"--trig-fires", "-tf"})) {
-				const auto Catalog = AstralDB::SQL::LoadTriggerCatalog(ResolveTrigCatalog(SessionDbPath));
+				const auto Catalog = AstralDB::LoadTriggerCatalog(ResolveTrigCatalog(SessionDbPath));
 				std::cout << AstralDB::SQL::FormatTriggerFireLog(Catalog);
 				return 0;
 			}
@@ -718,12 +906,7 @@ int main(int Argc, char** Argv) {
 					Interpreter.EnsurePrimaryDatabaseOpened();
 					ApplyCliSessionAuth(Interpreter.PrimaryDatabase(), CliUser, CliPassword);
 					ApplyCliAuditLog(Interpreter.PrimaryDatabase(), CliAuditFile);
-					AstralDB::SQL::Parser Parser(Query);
-					AstralDB::SQL::Bytecode Code =
-					    AstralDB::SQL::BuildBytecode(Logger.get(), OptLevel, Interpreter.PrimaryDatabase());
-					Interpreter.Execute(Code);
-					if(Verbose)
-						std::cout << "Executed bytecode:\n" << AstralDB::SQL::DisassemblePretty(Code) << "\n";
+					AstralDB::SQL::RunSqlScript(Interpreter, Query, Logger.get(), OptLevel);
 					return 0;
 				}
 				throw std::runtime_error("No query provided after -q/--query");
@@ -748,7 +931,10 @@ int main(int Argc, char** Argv) {
 					AstralDB::SQL::Parser Parser(Query);
 					AstralDB::SQL::Bytecode Code =
 					    AstralDB::SQL::BuildBytecode(Logger.get(), OptLevel, Interpreter.PrimaryDatabase());
+					MaybeResumeQueryCheckpoint(Interpreter, Code);
 					Interpreter.Execute(Code);
+					if(Interpreter.PrimaryDatabase())
+						AstralDB::DrainJoinFactStarPrecomputeJobs(*Interpreter.PrimaryDatabase());
 					if(Verbose)
 						std::cout << "Executed bytecode:\n" << AstralDB::SQL::DisassemblePretty(Code) << "\n";
 					return 0;
@@ -760,25 +946,302 @@ int main(int Argc, char** Argv) {
 					using Clock = std::chrono::steady_clock;
 					using Ms = std::chrono::duration<double, std::milli>;
 					const std::string Query = ReadFile(Argv[++I]);
-					const auto TParse0 = Clock::now();
-					AstralDB::SQL::BytecodeInterpreter Interpreter(Logger.get());
-					Interpreter.DatabasePath(SessionDbPath);
-					Interpreter.EnsurePrimaryDatabaseOpened();
-					ApplyCliSessionAuth(Interpreter.PrimaryDatabase(), CliUser, CliPassword);
-					ApplyCliAuditLog(Interpreter.PrimaryDatabase(), CliAuditFile);
-					AstralDB::SQL::Parser Parser(Query);
-					AstralDB::SQL::Bytecode Code =
-					    AstralDB::SQL::BuildBytecode(Logger.get(), OptLevel, Interpreter.PrimaryDatabase());
-					const auto TParse1 = Clock::now();
-					const auto TExec0 = Clock::now();
-					Interpreter.Execute(Code);
-					const auto TExec1 = Clock::now();
-					std::cerr << "[time-sql] parse+compile_ms=" << std::fixed << std::setprecision(3)
-					          << Ms(TParse1 - TParse0).count() << " execute_ms=" << Ms(TExec1 - TExec0).count()
-					          << " total_ms=" << Ms(TExec1 - TParse0).count() << "\n";
-					return 0;
+					const int Warmup = CliTimeSqlWarmup;
+					const int Runs = CliTimeSqlRuns;
+					const bool BenchMode = (Warmup > 0 || Runs > 1);
+					const bool SplitSetup = CliTimeSqlSetupPath.has_value();
+
+					AstralDB::SQL::BytecodeInterpreter CompileInterpreter(Logger.get());
+					if(CompileInterpreter.SessionConfig().ProfileDumpPath)
+						AstralDB::SQL::QueryProfiler::Instance().Reset();
+					CompileInterpreter.DatabasePath(SessionDbPath);
+					CompileInterpreter.EnsurePrimaryDatabaseOpened();
+					ApplyCliSessionAuth(CompileInterpreter.PrimaryDatabase(), CliUser, CliPassword);
+					ApplyCliAuditLog(CompileInterpreter.PrimaryDatabase(), CliAuditFile);
+					std::optional<AstralDB::SQL::Bytecode> SetupCode;
+					std::optional<AstralDB::SQL::Bytecode> QueryCode;
+					double SetupCompileMs = 0.0;
+					double QueryCompileMs = 0.0;
+					AstralDB::Database *SchemaDb = CompileInterpreter.PrimaryDatabase();
+					if(SplitSetup) {
+						const auto TSetup0 = Clock::now();
+						AstralDB::SQL::Parser SetupParser(ReadFile(*CliTimeSqlSetupPath));
+						SetupCode =
+						    AstralDB::SQL::BuildBytecode(Logger.get(), OptLevel, SchemaDb);
+						SetupCompileMs = Ms(Clock::now() - TSetup0).count();
+					} else {
+						const auto TQuery0 = Clock::now();
+						AstralDB::SQL::Parser Parser(Query);
+						QueryCode =
+						    AstralDB::SQL::BuildBytecode(Logger.get(), OptLevel, SchemaDb);
+						QueryCompileMs = Ms(Clock::now() - TQuery0).count();
+					}
+					CompileInterpreter.ResetExecutionSession(std::nullopt, false);
+
+					auto CompileQueryOverlapped = [&](AstralDB::SQL::BytecodeInterpreter &Interp) -> const AstralDB::SQL::Bytecode & {
+						if(QueryCode)
+							return *QueryCode;
+						KickWalIoOverlap(Interp.PrimaryDatabase());
+						const auto TQuery0 = Clock::now();
+						AstralDB::SQL::Parser Parser(Query);
+						QueryCode =
+						    AstralDB::SQL::BuildBytecode(Logger.get(), OptLevel, Interp.MutatingDatabase());
+						QueryCompileMs = Ms(Clock::now() - TQuery0).count();
+						return *QueryCode;
+					};
+
+					auto RunExecuteOnPath = [&](AstralDB::SQL::BytecodeInterpreter &Interpreter,
+					                              const std::filesystem::path &DbPath,
+					                              const AstralDB::SQL::Bytecode &RunCode, double &OutExecMs,
+					                              const bool TimeExecute, const bool ResetSession,
+					                              const bool WipeOnDisk) {
+						if(ResetSession)
+							Interpreter.ResetExecutionSession(DbPath, WipeOnDisk);
+						else {
+							Interpreter.ResetVmState();
+							Interpreter.ResetTimeSqlStats();
+							if(!Interpreter.PrimaryDatabase()) {
+								Interpreter.DatabasePath(DbPath);
+								Interpreter.EnsurePrimaryDatabaseOpened();
+							}
+						}
+						ApplyCliSessionAuth(Interpreter.MutatingDatabase(), CliUser, CliPassword);
+						ApplyCliAuditLog(Interpreter.MutatingDatabase(), CliAuditFile);
+						if(!TimeExecute) {
+							MaybeResumeQueryCheckpoint(Interpreter, RunCode);
+							Interpreter.Execute(RunCode);
+							OutExecMs = 0.0;
+							return;
+						}
+						const auto TExec0 = Clock::now();
+						MaybeResumeQueryCheckpoint(Interpreter, RunCode);
+						Interpreter.Execute(RunCode);
+						const auto TExec1 = Clock::now();
+						OutExecMs = Ms(TExec1 - TExec0).count();
+					};
+
+					auto MakeRunDbPath = [&]() -> std::filesystem::path {
+						if(DbFromCli)
+							return SessionDbPath;
+						if(MemoryOnly)
+							return MakeSessionDatabasePath(true);
+						return std::filesystem::path("astral.db");
+					};
+
+					const bool PersistCliDb = DbFromCli && !SplitSetup;
+
+					if(!BenchMode) {
+						std::vector<EphemeralSessionDatabase> EphemeralHold;
+						const std::filesystem::path DbPath = MakeRunDbPath();
+						if(MemoryOnly && !DbFromCli) {
+							EphemeralSessionDatabase Ep;
+							Ep.Path = DbPath;
+							Ep.Remove = true;
+							EphemeralHold.push_back(std::move(Ep));
+						}
+						AstralDB::SQL::BytecodeInterpreter Interpreter(Logger.get());
+						double ExecMs = 0.0;
+						if(SetupCode) {
+							double Discard = 0.0;
+							RunExecuteOnPath(Interpreter, DbPath, *SetupCode, Discard, false, true, true);
+							if(Interpreter.PrimaryDatabase())
+								AstralDB::DrainJoinFactStarPrecomputeJobs(*Interpreter.PrimaryDatabase());
+						}
+						const AstralDB::SQL::Bytecode &Code = CompileQueryOverlapped(Interpreter);
+						RunExecuteOnPath(Interpreter, DbPath, Code, ExecMs, true,
+						                 SetupCode.has_value() ? false : !PersistCliDb,
+						                 SetupCode.has_value() ? false : !PersistCliDb);
+						double WalQuiesceMs = 0.0;
+						if(CliTimeSqlDurable)
+							WalQuiesceMs = QuiesceWalIoMs(Interpreter.PrimaryDatabase());
+						CommitDurableDatabase(Interpreter);
+						const double CompileMs = SetupCompileMs + QueryCompileMs;
+						auto Stats = Interpreter.LastTimeSqlStats();
+						AstralDB::SQL::ValidateTimeSqlIntegrity(Stats, ExecMs);
+						{
+							std::ostringstream O;
+							O << std::fixed << std::setprecision(3);
+							O << "[time-sql] parse+compile_ms=" << CompileMs << " execute_ms=" << ExecMs
+							  << " total_ms=" << (CompileMs + ExecMs) << " scanned_rows=" << Stats.RowsScanned
+							  << " result_rows=" << Stats.ResultRows;
+							if(Stats.FastPathFlags != 0)
+								O << " fast_path_flags=" << Stats.FastPathFlags;
+							AstralDB::SQL::AppendShapeTelemetryFields(O, Stats);
+							if(Stats.MinRowsScannedExpected > 0)
+								O << " min_scanned_expected=" << Stats.MinRowsScannedExpected;
+							if(Stats.IntegrityFailed)
+								O << " integrity_fail=1 msg=" << Stats.IntegrityMessage;
+							AppendWalTimingFields(O, WalQuiesceMs, SetupCompileMs, QueryCompileMs);
+							O << "\n";
+							PrintTimeSqlLine(Logger.get(), O.str());
+						}
+						FinalizeTimeSqlProfile(Interpreter, SetupCompileMs + QueryCompileMs, ExecMs);
+						return Stats.IntegrityFailed ? 2 : 0;
+					}
+
+					std::vector<EphemeralSessionDatabase> EphemeralHold;
+					AstralDB::SQL::BytecodeInterpreter BenchInterpreter(Logger.get());
+					bool EphemeralBound = false;
+					auto BindEphemeral = [&](const std::filesystem::path &DbPath) {
+						if(MemoryOnly && !DbFromCli && !EphemeralBound) {
+							EphemeralSessionDatabase Ep;
+							Ep.Path = DbPath;
+							Ep.Remove = true;
+							EphemeralHold.push_back(std::move(Ep));
+							EphemeralBound = true;
+						}
+					};
+					const std::filesystem::path BenchDbPath = MakeRunDbPath();
+					BindEphemeral(BenchDbPath);
+					if(SetupCode) {
+						double Discard = 0.0;
+						RunExecuteOnPath(BenchInterpreter, BenchDbPath, *SetupCode, Discard, false, true, true);
+						if(BenchInterpreter.PrimaryDatabase())
+							AstralDB::DrainJoinFactStarPrecomputeJobs(*BenchInterpreter.PrimaryDatabase());
+					}
+					const AstralDB::SQL::Bytecode &Code = CompileQueryOverlapped(BenchInterpreter);
+					auto RunBenchExecute = [&](double &OutExecMs, const bool TimeExecute) {
+						if(SetupCode)
+							RunExecuteOnPath(BenchInterpreter, BenchDbPath, Code, OutExecMs, TimeExecute, false, false);
+						else
+							RunExecuteOnPath(BenchInterpreter, BenchDbPath, Code, OutExecMs, TimeExecute, !PersistCliDb,
+							                 !PersistCliDb);
+					};
+
+					for(int W = 0; W < Warmup; ++W) {
+						double Discard = 0.0;
+						RunBenchExecute(Discard, false);
+					}
+					std::vector<double> Samples;
+					Samples.reserve(static_cast<size_t>(Runs));
+					for(int R = 0; R < Runs; ++R) {
+						AstralDB::SQL::QueryProfiler::Instance().ClearRegionTimings();
+						double ExecMs = 0.0;
+						RunBenchExecute(ExecMs, true);
+						Samples.push_back(ExecMs);
+					}
+					std::sort(Samples.begin(), Samples.end());
+					const double ExecMedian = Samples[Samples.size() / 2];
+					const double ExecMin = Samples.front();
+					const double ExecMax = Samples.back();
+					auto Stats = BenchInterpreter.LastTimeSqlStats();
+					AstralDB::SQL::ValidateTimeSqlIntegrity(Stats, ExecMedian);
+					double WalQuiesceMs = 0.0;
+					if(CliTimeSqlDurable)
+						WalQuiesceMs = QuiesceWalIoMs(BenchInterpreter.PrimaryDatabase());
+					CommitDurableDatabase(BenchInterpreter);
+					const double CompileMs = SetupCompileMs + QueryCompileMs;
+					{
+						std::ostringstream O;
+						O << std::fixed << std::setprecision(3);
+						O << "[time-sql] parse+compile_ms=" << CompileMs << " execute_median_ms=" << ExecMedian
+						  << " execute_min_ms=" << ExecMin << " execute_max_ms=" << ExecMax
+						  << " execute_ms=" << ExecMedian << " total_ms=" << (CompileMs + ExecMedian)
+						  << " runs=" << Runs << " scanned_rows=" << Stats.RowsScanned
+						  << " result_rows=" << Stats.ResultRows;
+						if(Stats.FastPathFlags != 0)
+							O << " fast_path_flags=" << Stats.FastPathFlags;
+						AstralDB::SQL::AppendShapeTelemetryFields(O, Stats);
+						if(Stats.MinRowsScannedExpected > 0)
+							O << " min_scanned_expected=" << Stats.MinRowsScannedExpected;
+						if(Stats.IntegrityFailed)
+							O << " integrity_fail=1 msg=" << Stats.IntegrityMessage;
+						AppendWalTimingFields(O, WalQuiesceMs, SetupCompileMs, QueryCompileMs);
+						O << "\n";
+						PrintTimeSqlLine(Logger.get(), O.str());
+					}
+					FinalizeTimeSqlProfile(BenchInterpreter, CompileMs, ExecMedian);
+					return Stats.IntegrityFailed ? 2 : 0;
 				}
 				throw std::runtime_error("No file provided after --time-sql");
+			}
+			if(Arg == "--time-sql-suite") {
+				if(I + 1 >= Argc)
+					throw std::runtime_error("No file provided after --time-sql-suite");
+				if(!CliTimeSqlSetupPath.has_value())
+					throw std::runtime_error("--time-sql-suite requires --time-sql-setup FILE");
+				using Clock = std::chrono::steady_clock;
+				using Ms = std::chrono::duration<double, std::milli>;
+				const std::string SuiteText = ReadFile(Argv[++I]);
+				std::vector<std::pair<std::string, std::filesystem::path>> Entries;
+				std::istringstream SuiteStream(SuiteText);
+				for(std::string Line; std::getline(SuiteStream, Line);) {
+					while(!Line.empty() && (Line.back() == '\r' || Line.back() == '\n' || Line.back() == ' '))
+						Line.pop_back();
+					if(Line.empty() || Line[0] == '#')
+						continue;
+					const std::size_t Tab = Line.find('\t');
+					if(Tab == std::string::npos)
+						continue;
+					Entries.emplace_back(Line.substr(0, Tab), std::filesystem::path(Line.substr(Tab + 1)));
+				}
+				if(Entries.empty())
+					throw std::runtime_error("--time-sql-suite manifest is empty");
+				std::vector<EphemeralSessionDatabase> EphemeralHold;
+				const std::filesystem::path DbPath =
+				    MemoryOnly && !DbFromCli ? MakeSessionDatabasePath(true) : SessionDbPath;
+				if(MemoryOnly && !DbFromCli) {
+					EphemeralSessionDatabase Ep;
+					Ep.Path = DbPath;
+					Ep.Remove = true;
+					EphemeralHold.push_back(std::move(Ep));
+				}
+				AstralDB::SQL::BytecodeInterpreter Interpreter(Logger.get());
+				Interpreter.DatabasePath(DbPath);
+				Interpreter.EnsurePrimaryDatabaseOpened();
+				ApplyCliSessionAuth(Interpreter.PrimaryDatabase(), CliUser, CliPassword);
+				ApplyCliAuditLog(Interpreter.PrimaryDatabase(), CliAuditFile);
+				AstralDB::SQL::Parser SetupParser(ReadFile(*CliTimeSqlSetupPath));
+				const AstralDB::SQL::Bytecode SetupCode =
+				    AstralDB::SQL::BuildBytecode(Logger.get(), OptLevel, Interpreter.PrimaryDatabase());
+				Interpreter.ResetExecutionSession(DbPath, true);
+				ApplyCliSessionAuth(Interpreter.MutatingDatabase(), CliUser, CliPassword);
+				ApplyCliAuditLog(Interpreter.MutatingDatabase(), CliAuditFile);
+				Interpreter.Execute(SetupCode);
+				if(Interpreter.PrimaryDatabase())
+					AstralDB::DrainJoinFactStarPrecomputeJobs(*Interpreter.PrimaryDatabase());
+				KickWalIoOverlap(Interpreter.PrimaryDatabase());
+				int FailRc = 0;
+				for(const auto &[Label, QueryPath] : Entries) {
+					const auto TParse0 = Clock::now();
+					AstralDB::SQL::Parser Parser(ReadFile(QueryPath.string()));
+					AstralDB::SQL::Bytecode Code =
+					    AstralDB::SQL::BuildBytecode(Logger.get(), OptLevel, Interpreter.MutatingDatabase());
+					const auto TParse1 = Clock::now();
+					const double CompileMs = Ms(TParse1 - TParse0).count();
+					Interpreter.ResetVmState();
+					Interpreter.ResetTimeSqlStats();
+					const auto TExec0 = Clock::now();
+					MaybeResumeQueryCheckpoint(Interpreter, Code);
+					Interpreter.Execute(Code);
+					const auto TExec1 = Clock::now();
+					const double ExecMs = Ms(TExec1 - TExec0).count();
+					double WalQuiesceMs = 0.0;
+					if(CliTimeSqlDurable)
+						WalQuiesceMs = QuiesceWalIoMs(Interpreter.PrimaryDatabase());
+					CommitDurableDatabase(Interpreter);
+					auto Stats = Interpreter.LastTimeSqlStats();
+					AstralDB::SQL::ValidateTimeSqlIntegrity(Stats, ExecMs);
+					{
+						std::ostringstream O;
+						O << std::fixed << std::setprecision(3);
+						O << "[time-sql] query=" << Label << " parse+compile_ms=" << CompileMs
+						  << " query_compile_ms=" << CompileMs << " execute_ms=" << ExecMs
+						  << " total_ms=" << (CompileMs + ExecMs)
+						  << " scanned_rows=" << Stats.RowsScanned << " result_rows=" << Stats.ResultRows;
+						if(Stats.FastPathFlags != 0)
+							O << " fast_path_flags=" << Stats.FastPathFlags;
+						AstralDB::SQL::AppendShapeTelemetryFields(O, Stats);
+						if(Stats.IntegrityFailed)
+							O << " integrity_fail=1 msg=" << Stats.IntegrityMessage;
+						AppendWalTimingFields(O, WalQuiesceMs, 0.0, CompileMs);
+						O << "\n";
+						PrintTimeSqlLine(Logger.get(), O.str());
+					}
+					if(Stats.IntegrityFailed)
+						FailRc = 2;
+				}
+				return FailRc;
 			}
 			if(Arg == "-r" || Arg == "--repl") {
 				RunREPL(*Logger, SessionDbPath, OptLevel, CliUser, CliPassword, CliAuditFile);
@@ -829,6 +1292,7 @@ int main(int Argc, char** Argv) {
 				AstralDB::SQL::Parser Parser(Query);
 				AstralDB::SQL::Bytecode Code =
 				    AstralDB::SQL::BuildBytecode(Logger.get(), OptLevel, Interpreter.PrimaryDatabase());
+				MaybeResumeQueryCheckpoint(Interpreter, Code);
 				Interpreter.Execute(Code);
 				if(Verbose)
 					std::cout << "Executed bytecode:\n" << AstralDB::SQL::DisassemblePretty(Code) << "\n";

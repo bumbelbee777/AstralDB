@@ -1,4 +1,5 @@
-# Build AstralDB with CMake; run fast-labelled ctest, torture_test.sql CLI smoke, and Quasar pytest.
+# Build AstralDB with CMake; run fast-labelled ctest, torture_test.sql CLI smoke,
+# neutroniumbomb 1B rows/table full-scale benchmark, and Quasar pytest.
 name: CI
 
 on:
@@ -34,6 +35,7 @@ jobs:
             test: ctest --test-dir build-ci -L fast --output-on-failure
             cli: build-ci/astraldb
             artifact: astraldb-linux-amd64
+            size_check: true
 
           - name: Linux (Clang)
             os: ubuntu-24.04
@@ -42,10 +44,12 @@ jobs:
               -G Ninja
               -DCMAKE_BUILD_TYPE=Release
               -DCMAKE_CXX_COMPILER=clang++-18
+              -DASTRALDB_RELEASE_PROFILE=size
             build: cmake --build build-ci
             test: ctest --test-dir build-ci -L fast --output-on-failure
             cli: build-ci/astraldb
             artifact: astraldb-linux-amd64-clang
+            size_check: false
 
           - name: macOS (Clang)
             os: macos-14
@@ -53,10 +57,12 @@ jobs:
               cmake -S . -B build-ci
               -G Ninja
               -DCMAKE_BUILD_TYPE=Release
+              -DASTRALDB_RELEASE_PROFILE=size
             build: cmake --build build-ci
             test: ctest --test-dir build-ci -L fast --output-on-failure
             cli: build-ci/astraldb
             artifact: astraldb-macos-arm64
+            size_check: false
 
           - name: Windows (Clang)
             os: windows-latest
@@ -70,6 +76,7 @@ jobs:
             test: ctest --test-dir build-ci -L fast --output-on-failure
             cli: build-ci/astraldb.exe
             artifact: astraldb-windows-amd64
+            size_check: false
 
           - name: Linux (GCC speed + SIMD)
             os: ubuntu-24.04
@@ -84,6 +91,7 @@ jobs:
             test: ctest --test-dir build-ci -L fast --output-on-failure
             cli: build-ci/astraldb
             artifact: astraldb-linux-amd64-speed
+            size_check: false
 
     steps:
       - name: Checkout
@@ -108,6 +116,45 @@ jobs:
 
       - name: Build
         run: ${{ matrix.build }}
+
+      - name: Unpacked binary size check
+        if: matrix.size_check == true
+        shell: bash
+        run: |
+          set -euo pipefail
+          CLI="${{ matrix.cli }}"
+          SIZE=$(stat -c%s "$CLI")
+          echo "Unpacked size: $SIZE bytes"
+          MAX=2800000
+          if [ "$SIZE" -ge "$MAX" ]; then
+            echo "Binary too large: $SIZE >= $MAX" >&2
+            exit 1
+          fi
+
+      - name: Setup UPX
+        if: matrix.size_check == true
+        uses: ./.github/actions/setup-upx
+
+      - name: UPX packed size check
+        if: matrix.size_check == true
+        shell: bash
+        run: |
+          set -euo pipefail
+          CLI="${{ matrix.cli }}"
+          OUT=$(bash scripts/measure_binary_size.sh "$CLI")
+          echo "$OUT"
+          PACKED=$(echo "$OUT" | awk -F= '/^upx_bytes=/{print $2}')
+          if [ -n "$PACKED" ]; then
+            echo "UPX packed size: $PACKED bytes"
+            MAX_PACKED=1300000
+            if [ "$PACKED" -ge "$MAX_PACKED" ]; then
+              echo "UPX-packed binary too large: $PACKED >= $MAX_PACKED" >&2
+              exit 1
+            fi
+          else
+            echo "UPX pack ratio unavailable (measurement failed)" >&2
+            exit 1
+          fi
 
       - name: Test
         run: ${{ matrix.test }}
@@ -145,6 +192,50 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
           python -m pytest quasar/tests -q
+
+  neutroniumbomb-bench:
+    name: neutroniumbomb benchmark (1B rows/table)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++
+
+      - name: Configure (speed + AVX2)
+        run: >-
+          cmake -S . -B build-ci
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CXX_COMPILER=g++
+          -DASTRALDB_RELEASE_PROFILE=speed
+          -DASTRALDB_SIMD=avx2
+
+      - name: Build
+        run: cmake --build build-ci
+
+      - name: Run neutroniumbomb full benchmark (1B rows/table)
+        run: |
+          set -euo pipefail
+          python3 scripts/benchmark_neutroniumbomb_full.py \
+            --astral build-ci/astraldb \
+            --rows 1000000000 \
+            --full-scale \
+            --queries 10,11 \
+            | tee neutroniumbomb-ci.log
+
+      - name: Upload benchmark log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neutroniumbomb-ci-log
+          path: neutroniumbomb-ci.log
+          if-no-files-found: warn
 
   quasar-wheel:
     name: quasar-wheel

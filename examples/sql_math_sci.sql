@@ -36,7 +36,7 @@ SELECT
 	RANDOM() AS u
 FROM lab;
 
--- Signal processing (SIMD) and autograd primitives (see docs/MathSciSignal.md).
+-- Signal processing (SIMD) and autograd primitives (see docs/MathSciCore.md).
 SELECT
 	FFT('L[4]:1,0,1,0') AS spectrum,
 	CONV_FULL('L[3]:1,2,3', 'L[2]:1,1') AS conv_full,
@@ -47,7 +47,7 @@ SELECT
 	PINN_FD_CENTRAL('0.6', '0.4', '0.1') AS fd_central
 FROM lab;
 
--- MLP model binary + PREDICT (see docs/MathSciModel.md).
+-- MLP model binary + PREDICT (see docs/MathSciMl.md).
 SELECT
 	MATHSCI_MODEL_BUILD('L[2]:sigmoid,linear', 'LW[2]:T[2,2]:1,0,0,1;T[1,2]:1,1') AS mlp_blob,
 	PREDICT(
@@ -56,7 +56,7 @@ SELECT
 	) AS mlp_out
 FROM lab;
 
--- Hessian, Wirtinger AD, and ODE/SDE/PDE steppers (see docs/MathSciAutograd.md, docs/MathSciSolves.md).
+-- Hessian, Wirtinger AD, and ODE/SDE/PDE steppers (see docs/MathSciCore.md).
 SELECT
 	AD_HESSIAN_SIGMOID('L[2]:0.5,0.6', 'L[2]:1,1') AS hess_sig,
 	AD_WIRTINGER_DZ('L[4]:1,0,1,0') AS wdz,
@@ -76,7 +76,7 @@ SELECT
 	ODE_MARCH('EULER', 'L[1]:1', 'L[1]:0.5', 'L[1]:0', 'L[1]:0', 'L[1]:0', '0.1', 2) AS euler_march
 FROM lab;
 
--- Classifiers, NLP, and embeddings (see docs/MathSciClassify.md, MathSciNlp.md, MathSciEmbeddings.md).
+-- Classifiers, NLP, and embeddings (see docs/MathSciMl.md).
 SELECT
 	NLP_TOKENIZE('hello world') AS toks,
 	NLP_NGRAMS('hello world', 2) AS bigrams,
@@ -92,7 +92,7 @@ SELECT
 	COSINE_SIM('CV[2]:1,0,0,1', 'CV[2]:0,1,1,0') AS c_ortho
 FROM lab;
 
--- Catalog-backed complex embeddings (see docs/MathSciEmbeddings.md).
+-- Catalog-backed complex embeddings (see docs/MathSciMl.md).
 CREATE TABLE emb_src (tok TEXT, vec TEXT);
 INSERT INTO emb_src VALUES
 	('alpha', 'CV[2]:1,0,0,1'),

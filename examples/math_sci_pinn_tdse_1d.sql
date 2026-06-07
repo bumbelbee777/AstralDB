@@ -1,4 +1,4 @@
--- 1-D time-dependent Schrodinger PINN toy (docs/MathSciPinn.md).
+-- 1-D time-dependent Schrodinger PINN toy (docs/MathSciMl.md).
 -- Uses PREDICT(), MATHSCI_MODEL_* binary I/O, and enriched autograd builtins.
 
 DROP TABLE IF EXISTS pinn_tdse_model;

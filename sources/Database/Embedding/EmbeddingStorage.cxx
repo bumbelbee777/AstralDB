@@ -1,8 +1,8 @@
-#include <Database/EmbeddingStorage.hxx>
+#include <Database/Embedding/EmbeddingStorage.hxx>
 
 #include <Database/Database.hxx>
-#include <Database/MathSciComplex.hxx>
-#include <Database/MathSciEmbeddings.hxx>
+#include <Database/MathSci/MathSciComplex.hxx>
+#include <Database/MathSci/MathSciEmbeddings.hxx>
 #include <IO/Error.hxx>
 
 #include <algorithm>
@@ -194,7 +194,7 @@ void AppendEmbeddingCatalogSnapshotTrailer(
 bool StripAndParseEmbeddingCatalogSnapshotTrailer(std::string &RawData,
                                                   std::vector<EmbeddingCatalogEntry> &OutEntries) {
 	OutEntries.clear();
-	const size_t Mp = RawData.find(kEmbeddingSnapshotMarkerSv.data(), 0, kEmbeddingSnapshotMarkerSv.size());
+	const size_t Mp = RawData.rfind(kEmbeddingSnapshotMarkerSv);
 	if(Mp == std::string_view::npos)
 		return true;
 	std::string_view Tail(RawData.data() + Mp + kEmbeddingSnapshotMarkerSv.size(),

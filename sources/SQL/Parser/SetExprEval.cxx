@@ -1,4 +1,4 @@
-#include <SQL/SetExprEval.hxx>
+#include <SQL/Parser/SetExprEval.hxx>
 #include <IO/Error.hxx>
 #include <cctype>
 #include <cmath>
@@ -251,3 +251,11 @@ std::optional<std::string> EvalSerializedSetValueExpr(std::string_view Blob, con
 }
 
 } // namespace AstralDB::SQL
+
+namespace AstralDB {
+
+std::optional<std::string> EvalSerializedSetValueExpr(std::string_view Blob, const RowEvalContext &Ctx) {
+	return SQL::EvalSerializedSetValueExpr(Blob, Ctx);
+}
+
+} // namespace AstralDB

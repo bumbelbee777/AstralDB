@@ -1,8 +1,8 @@
 #pragma once
 
-#include <SQL/BytecodeFormat.hxx>
-#include <SQL/Bytecode.hxx>
-#include <SQL/ProcedureParser.hxx>
+#include <SQL/Bytecode/BytecodeFormat.hxx>
+#include <SQL/Bytecode/Bytecode.hxx>
+#include <SQL/Procedures/ProcedureParser.hxx>
 #include <IO/Logger.hxx>
 #include <filesystem>
 #include <optional>
@@ -75,9 +75,20 @@ CompiledBytecode CompileProcedureBody(Logger *Logger, OptimizationLevel OptLevel
                                       std::string_view BodySql,
                                       const std::vector<ProcedureExceptionWhen> &ExceptionHandlers = {});
 
+/** Compact APCF binary blob (preferred for WAL / bytecode operands). */
+std::string EncodeProcedureControlBinary(const LoweredProcedureBody &Body);
+
+LoweredProcedureBody DecodeProcedureControl(std::string_view Blob, std::string_view FallbackLinearSql = {});
+
+/** Legacy JSON encoding (tests / external tools). */
 std::string EncodeProcedureControlJson(const LoweredProcedureBody &Body);
 
 LoweredProcedureBody DecodeProcedureControlJson(std::string_view Json, std::string_view FallbackLinearSql = {});
+
+/** Stash structured procedure body for the next \c CacheProcedureFromSql (avoids JSON roundtrip). */
+void StashLoweredProcedureBody(std::string_view Name, LoweredProcedureBody Body);
+
+std::optional<LoweredProcedureBody> TakeStashedLoweredProcedureBody(std::string_view Name);
 
 std::string EncodeExceptionHandlersJson(const std::vector<ProcedureExceptionWhen> &Handlers);
 

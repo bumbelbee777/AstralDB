@@ -2,8 +2,10 @@
 
 #include <IO/Limits.hxx>
 #include <Database/Database.hxx>
-#include <Database/ColumnarStorage.hxx>
-#include <SQL/Bytecode.hxx>
+#include <Database/Storage/ColumnarStorage.hxx>
+#include <SQL/Bytecode/Bytecode.hxx>
+#include <SQL/Profiler/SqlSessionConfig.hxx>
+#include <SQL/Shape/ShapeTelemetryTypes.hxx>
 #include <cstdint>
 #include <vector>
 #include <iostream>
@@ -14,6 +16,7 @@
 #include <unordered_map>
 #include <filesystem>
 #include <vector>
+#include <optional>
 
 namespace AstralDB {
 namespace SQL {
@@ -38,15 +41,36 @@ class BytecodeInterpreter {
 	std::filesystem::path DatabasePath_{"astral.db"};
 	Logger *Logger_ = nullptr;
 	std::unordered_map<std::string, std::string> Savepoints_;
+	std::unordered_map<std::string, Database::DatabaseWorkingSnapshot> MemSavepoints_;
 	/** When executing deduplicated bytecode, immediate strings are resolved via this pool for PUSH_POOL. */
 	const std::vector<std::string> *StringOperandPool_ = nullptr;
 	/** Monotonic interpreter steps for this execution slice (RESET clears). */
 	std::size_t StepsExecuted_ = 0;
+
+public:
+	struct TimeSqlStats {
+		std::uint64_t RowsScanned = 0;
+		std::uint64_t ResultRows = 0;
+		/** Minimum scanned rows fast paths must touch (0 = no check). */
+		std::uint64_t MinRowsScannedExpected = 0;
+		/** Minimum result rows expected when data should match predicates. */
+		std::uint64_t MinResultRowsExpected = 0;
+		std::uint32_t FastPathFlags = 0;
+		ShapeTelemetry ShapeStats{};
+		bool IntegrityFailed = false;
+		std::string IntegrityMessage;
+	};
+
+private:
+	TimeSqlStats LastTimeSqlStats_{};
+
+public:
 	VmDebugSession *DebugSession_ = nullptr;
 	std::optional<StorageLayout> SessionStorageHint_;
 	/** Extra SELECT columns pushed by the most recent \c COLUMNS_EXPAND in this query. */
 	size_t ColumnsExpandExtra_ = 0;
 	int64_t SessionIsolation_ = 0;
+	SqlSessionConfig SessionConfig_{SqlSessionConfig::FromEnvironment()};
 	std::unordered_map<std::string, std::string> TableComments_;
 	std::unordered_map<std::string, std::unordered_map<std::string, std::string>> ColumnComments_;
 
@@ -86,7 +110,14 @@ public:
 	void ClearSessionStorageHint() { SessionStorageHint_.reset(); }
 	const std::optional<StorageLayout> &SessionStorageHint() const { return SessionStorageHint_; }
 
+	SqlSessionConfig &SessionConfig() { return SessionConfig_; }
+	const SqlSessionConfig &SessionConfig() const { return SessionConfig_; }
+
 	std::size_t StepsExecuted() const { return StepsExecuted_; }
+
+	void ResetTimeSqlStats() { LastTimeSqlStats_ = {}; }
+	const TimeSqlStats &LastTimeSqlStats() const { return LastTimeSqlStats_; }
+	TimeSqlStats &MutableTimeSqlStats() { return LastTimeSqlStats_; }
 
 	void DatabasePath(std::filesystem::path Path) { DatabasePath_ = std::move(Path); }
 	const std::filesystem::path &DatabasePath() const { return DatabasePath_; }
@@ -102,19 +133,20 @@ public:
 	void RunNestedBytecode(const Bytecode &Code, const std::vector<std::string> *StringPool = nullptr);
 
 	bool Step(const Bytecode &Code);
+	bool StepBulk(const Bytecode &Code, const Instruction &Inst);
 
-	void Reset() {
-		CleanupStack();
-		Ic = 0;
-		Sp = 0;
-		Bp = 0;
-		Flags = 0;
-		Registers_.assign(Registers_.size(), 0);
-		StepsExecuted_ = 0;
-		SessionStorageHint_.reset();
-	}
+	/** Clear VM stack/registers only (retains open database session). */
+	void ResetVmState();
+
+	/** Alias for \ref ResetVmState. */
+	void Reset() { ResetVmState(); }
+
+	/** Drop database handles and optional new path before another \c Execute of a full script. */
+	void ResetExecutionSession(std::optional<std::filesystem::path> NewDatabasePath = std::nullopt,
+	                          bool WipeOnDisk = true);
 
 	uintptr_t CurrentInstruction() const { return Ic; }
+	void SeekInstruction(std::size_t Ip) { Ic = Ip; }
 
 	uintptr_t StackBase() const { return Bp; }
 

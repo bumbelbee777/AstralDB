@@ -1,12 +1,12 @@
-#include <Database/AdvancedTypes.hxx>
-#include <Database/MathSci.hxx>
+#include <Database/Types/AdvancedTypes.hxx>
+#include <Database/MathSci/MathSci.hxx>
 #include <SQL/SQL.hxx>
-#include <SQL/DialectCompat.hxx>
-#include <SQL/ProcedureParser.hxx>
-#include <SQL/BytecodeProcedures.hxx>
-#include <SQL/BytecodeTriggers.hxx>
-#include <Database/HybridStorageScheduler.hxx>
-#include <Database/User.hxx>
+#include <SQL/Parser/DialectCompat.hxx>
+#include <SQL/Procedures/ProcedureParser.hxx>
+#include <SQL/Procedures/BytecodeProcedures.hxx>
+#include <SQL/Procedures/BytecodeTriggers.hxx>
+#include <Database/Storage/HybridStorageScheduler.hxx>
+#include <Database/Security/User.hxx>
 #include <IO/Error.hxx>
 #include <IO/Limits.hxx>
 #include <algorithm>
@@ -46,10 +46,28 @@ namespace {
 		       (Tok->Type == TokenType::IDENTIFIER || Tok->Type == TokenType::KEYWORD);
 	}
 
+	bool StmtEndIsWord(std::string_view Query, std::size_t Pos, std::string_view Word) {
+		if(Pos + Word.size() > Query.size())
+			return false;
+		for(std::size_t I = 0; I < Word.size(); ++I) {
+			const char A = Query[Pos + I];
+			const char B = Word[I];
+			if(std::toupper(static_cast<unsigned char>(A)) != std::toupper(static_cast<unsigned char>(B)))
+				return false;
+		}
+		const auto IsIdent = [](char C) { return std::isalnum(static_cast<unsigned char>(C)) || C == '_'; };
+		if(Pos > 0 && IsIdent(Query[Pos - 1]))
+			return false;
+		if(Pos + Word.size() < Query.size() && IsIdent(Query[Pos + Word.size()]))
+			return false;
+		return true;
+	}
+
 	/** Byte offset of the statement-ending \c ; at top level (or \c Query.size() if none). */
 	std::size_t StatementEndBeforeSemicolon(std::string_view Query, std::size_t BeginByte) {
 		std::size_t P = BeginByte;
 		int ParenDepth = 0;
+		int BeginDepth = 0;
 		while(P < Query.size()) {
 			const unsigned char C = static_cast<unsigned char>(Query[P]);
 			if(C == '\'' || C == '"') {
@@ -93,7 +111,42 @@ namespace {
 				++P;
 				continue;
 			}
-			if(C == ';' && ParenDepth == 0)
+			if(ParenDepth == 0 && std::isalpha(static_cast<unsigned char>(C))) {
+				if(StmtEndIsWord(Query, P, "BEGIN")) {
+					++BeginDepth;
+					P += 5;
+					continue;
+				}
+				if(StmtEndIsWord(Query, P, "END") && BeginDepth > 0) {
+					std::size_t J = P + 3;
+					while(J < Query.size() && std::isspace(static_cast<unsigned char>(Query[J])))
+						++J;
+					if(J + 1 < Query.size() && StmtEndIsWord(Query, J, "IF")) {
+						P = J + 2;
+						continue;
+					}
+					if(J + 3 < Query.size() && StmtEndIsWord(Query, J, "LOOP")) {
+						P = J + 4;
+						continue;
+					}
+					if(J + 3 < Query.size() && StmtEndIsWord(Query, J, "CASE")) {
+						P = J + 4;
+						continue;
+					}
+					if(J + 3 < Query.size() && StmtEndIsWord(Query, J, "TRY")) {
+						P = J + 3;
+						continue;
+					}
+					if(J + 4 < Query.size() && StmtEndIsWord(Query, J, "CATCH")) {
+						P = J + 5;
+						continue;
+					}
+					--BeginDepth;
+					P = J;
+					continue;
+				}
+			}
+			if(C == ';' && ParenDepth == 0 && BeginDepth == 0)
 				return P;
 			++P;
 		}
@@ -179,6 +232,10 @@ namespace {
 		}
 		return {std::move(Root), -1};
 	}
+bool IsSelectAliasToken(const std::optional<Token> &Tok) noexcept {
+	return Tok && (Tok->Type == TokenType::IDENTIFIER || Tok->Type == TokenType::KEYWORD);
+}
+
 } // namespace
 
 bool ParserDiagnosticsEnabled() {
@@ -294,7 +351,7 @@ bool Parser::IsKeyword(const std::string &TokenValue) {
         "IF", "EXISTS",
         "IS", "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME", "NOW",
         "EXPORT", "IMPORT", "CONVERT", "DATABASE", "FORMAT", "FILE", "LOAD", "DATASET", "EMBEDDING", "INTO",
-        "WITH", "RECURSIVE", "UNION", "ALL", "INTERSECT", "EXCEPT",
+        "WITH", "RECURSIVE", "UNION", "ALL", "INTERSECT", "EXCEPT", "PRAGMA", "EXPLAIN", "ANALYZE",
         "MERGE", "USING", "MATCHED", "CONFLICT", "DO", "NOTHING", "EXCLUDED",
 		"RETURNING",
         "ROLLUP", "CUBE", "GROUPING", "SETS", "GROUPING_ID",
@@ -304,7 +361,7 @@ bool Parser::IsKeyword(const std::string &TokenValue) {
         "INNER", "LEFT", "RIGHT", "FULL", "OUTER", "CROSS", "JOIN", "ON", "LATERAL",
         "SUM", "MIN", "MAX", "AVG",
         "CASE", "WHEN", "THEN", "ELSE", "END", "CAST", "COALESCE",
-        "SUBSTRING", "POSITION", "CHAR_LENGTH", "CHARACTER_LENGTH", "TRIM", "CONCAT", "EXTRACT",
+        "SUBSTRING", "POSITION", "LENGTH", "CHAR_LENGTH", "CHARACTER_LENGTH", "TRIM", "CONCAT", "EXTRACT",
         "DATE_ADD", "DATE_SUB", "DATE_DIFF", "DATE_TRUNC", "TIME_BUCKET", "TIMESTAMP_DIFF",
         "FOR", "BOTH", "LEADING", "TRAILING",
         "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "EPOCH",
@@ -322,6 +379,7 @@ bool Parser::IsKeyword(const std::string &TokenValue) {
         "JSON_EXTRACT", "JSON_CONTAINS", "JSON_MERGE", "JSON_ARRAY_LENGTH", "JSON_KEYS",
         "JSON_VALUE", "JSON_QUERY", "JSON_EXISTS",
         "XML_EXTRACT", "XML_SERIALIZE", "XML_VALID", "XMLQUERY", "XMLEXISTS",
+        "REGEXP_EXTRACT", "REGEXP_SUBSTR",
         "TEXT_RANK", "VECTOR_TOPK", "NULLIF", "GREATEST",
         "LEAST", "FFT", "IFFT", "DCT", "IDCT", "CONV_FULL", "CONV1D", "CONV_SAME", "CONV1D_SAME", "LAPLACIAN",
         "LAPLACIAN1D", "AD_GRAD_ADD",
@@ -330,7 +388,11 @@ bool Parser::IsKeyword(const std::string &TokenValue) {
         "AD_GRAD_CONV1D_K", "AD_CHAIN", "AD_HESSIAN", "AD_HESSIAN_RELU", "AD_HESSIAN_SIGMOID", "AD_HESSIAN_SQUARE",
         "AD_HESSIAN_TANH", "PINN_FD_CENTRAL",
         "AD_WIRTINGER_MUL_LHS", "AD_WIRTINGER_MUL_RHS", "AD_WIRTINGER_ABS2", "AD_WIRTINGER_CHAIN", "AD_WIRTINGER_DZ",
-        "AD_WIRTINGER_DZBAR", "ODE_EULER", "ODE_RK4", "ODE_HEUN", "ODE_MIDPOINT", "ODE_IMPLICIT_EULER",
+        "AD_WIRTINGER_DZBAR", "AD_GRAPH_BUILD", "AD_GRAPH_FUSE", "AD_GRAPH_FORWARD", "AD_GRAPH_CACHE",
+        "AD_GRAPH_BACKWARD", "AD_GRAPH_NODE_COUNT",
+        "ML_QUANTIZE_INT8", "ML_DEQUANTIZE_INT8", "ML_QUANTIZE_MODEL", "ML_DEQUANTIZE_MODEL",
+        "ML_MIXED_PREC", "ML_PRUNE", "ML_PRUNE_MODEL", "ML_POSENC", "ML_POSENC_SEQUENCE", "ML_POSENC_ADD",
+        "ML_MIXED_PREC_MODEL", "ML_PREDICT_QUANT", "ML_DTYPE", "ML_CAST", "ML_POSENC_C", "ODE_EULER", "ODE_RK4", "ODE_HEUN", "ODE_MIDPOINT", "ODE_IMPLICIT_EULER",
         "SOLVE_ODE", "SDE_EULER", "SDE_GBM", "SDE_OU", "SDE_MILSTEIN", "PDE_HEAT_STEP", "PDE_POISSON_STEP",
         "PDE_ADVECTION_STEP", "PDE_WAVE_STEP", "ODE_TRAPEZOID", "ODE_SEMI_IMPLICIT", "ODE_CRANK_NICOLSON",
         "ODE_RK3", "ODE_ADAMS_BASHFORTH2", "ODE_MARCH", "SDE_MARCH",
@@ -342,7 +404,11 @@ bool Parser::IsKeyword(const std::string &TokenValue) {
         "NLP_EMBED_BUILD", "NLP_EMBED_LOOKUP", "NLP_EMBED_BATCH", "NLP_EMBED_SERIALIZE", "NLP_EMBED_LOAD",
         "NLP_EMBED_FINGERPRINT", "NLP_EMBED_MEAN",
         "MATHSCI_MODEL_BUILD", "MATHSCI_MODEL_SERIALIZE", "MATHSCI_MODEL_IMPORT", "MATHSCI_MODEL_LOAD",
-        "MATHSCI_MODEL_FINGERPRINT", "PREDICT", "DEQ_INTEGRATE", "DEQ_ADAPT", "DEQ_LINSPACE",
+        "MATHSCI_MODEL_FINGERPRINT", "PREDICT", "OPTIMIZER_STEP",
+        "HEAT_KERNEL_GRAPH_STEP", "HEAT_KERNEL_GRAPH_MARCH", "HEAT_KERNEL_GRAPH_APPLY",
+        "HEAT_KERNEL_1D", "HEAT_KERNEL_2D", "HEAT_KERNEL_GRAD_1D",
+        "IMG_LOAD", "IMG_GRAY", "IMG_RESIZE", "IMG_PATCHES", "IMG_HOG_LITE", "IMG_FLATTEN",
+        "DEQ_INTEGRATE", "DEQ_ADAPT", "DEQ_LINSPACE",
         "MCTS_SEARCH", "MCTS_UCT_PICK", "BAYES_BETA_POST", "BAYES_NORMAL_POST", "BAYES_GRID_POST", "BAYES_LOG_EVIDENCE",
         "NFP_MACRO_STEP", "NFP_MACRO_MARCH", "NFP_MACRO_MOMENTS",
         "ST_POINT", "ST_X", "ST_Y", "ST_AS_TEXT", "ST_DISTANCE",
@@ -687,9 +753,18 @@ ASTNode Parser::ParsePrimary() {
         return std::make_unique<QuantifiedSubqueryAST>(Qk, std::move(Tbl), std::move(InnerCol), std::move(Where));
     }
     if(CurrentToken()->Type == TokenType::IDENTIFIER || CurrentToken()->Type == TokenType::KEYWORD) {
-        std::unique_ptr<ExpressionAST> Col = std::make_unique<ColumnRefAST>(CurrentToken()->Value);
+        std::string N = CurrentToken()->Value;
         AdvanceToken();
-        return Col;
+        if(CurrentToken() && CurrentToken()->Value == ".") {
+            AdvanceToken();
+            auto Col = CurrentToken();
+            if(!Col || (Col->Type != TokenType::IDENTIFIER && Col->Type != TokenType::KEYWORD))
+                ParseFail("Expected column name after '.' in predicate");
+            std::string Cn = Col->Value;
+            AdvanceToken();
+            return std::make_unique<ColumnRefAST>(N + "." + Cn);
+        }
+        return std::make_unique<ColumnRefAST>(std::move(N));
     }
     auto Literal = std::make_unique<LiteralAST>(CurrentToken()->Value);
     AdvanceToken();
@@ -742,6 +817,14 @@ ASTNode Parser::TryParseAggregateFuncPrimary() {
 		ParseFail("Expected column name inside aggregate in HAVING");
 	std::string Arg = ArgTk->Value;
 	AdvanceToken();
+	if(CurrentToken() && CurrentToken()->Value == ".") {
+		AdvanceToken();
+		auto ArgTk2 = CurrentToken();
+		if(!ArgTk2 || ArgTk2->Type != TokenType::IDENTIFIER)
+			ParseFail("Expected column name after '.' in aggregate in HAVING");
+		Arg = ArgTk2->Value;
+		AdvanceToken();
+	}
 	if(!CurrentToken() || CurrentToken()->Value != ")")
 		ParseFail("Expected ')' closing aggregate in HAVING");
 	AdvanceToken();
@@ -1516,24 +1599,26 @@ ASTNode Parser::ParseCreateIndexStatement() {
 	if(!CurrentToken() || CurrentToken()->Value != ")")
 		ParseFail("Expected ')' after index column.");
 	AdvanceToken();
-	if(!MatchKeyword("USING"))
-		ParseFail("Expected USING FTS or USING VECTOR in CREATE INDEX.");
-	SecondaryIndexKind Kind = SecondaryIndexKind::Fts;
+	SecondaryIndexKind Kind = SecondaryIndexKind::BTree;
 	int64_t MetricTag = 1;
-	if(MatchKeyword("FTS"))
-		Kind = SecondaryIndexKind::Fts;
-	else if(MatchKeyword("VECTOR")) {
-		Kind = SecondaryIndexKind::Vector;
-		if(MatchKeyword("METRIC")) {
-			if(MatchKeyword("L2"))
-				MetricTag = 0;
-			else if(MatchKeyword("COSINE"))
-				MetricTag = 1;
-			else
-				ParseFail("VECTOR METRIC expects COSINE or L2.");
-		}
-	} else
-		ParseFail("Expected FTS or VECTOR after USING.");
+	if(MatchKeyword("USING")) {
+		if(MatchKeyword("FTS"))
+			Kind = SecondaryIndexKind::Fts;
+		else if(MatchKeyword("BTREE"))
+			Kind = SecondaryIndexKind::BTree;
+		else if(MatchKeyword("VECTOR")) {
+			Kind = SecondaryIndexKind::Vector;
+			if(MatchKeyword("METRIC")) {
+				if(MatchKeyword("L2"))
+					MetricTag = 0;
+				else if(MatchKeyword("COSINE"))
+					MetricTag = 1;
+				else
+					ParseFail("VECTOR METRIC expects COSINE or L2.");
+			}
+		} else
+			ParseFail("Expected BTREE, FTS, or VECTOR after USING.");
+	}
 	(void)IfNotExists;
 	return std::make_unique<CreateIndexAST>(std::move(IdxName), std::move(TableName), std::move(ColumnName), Kind,
 	                                        MetricTag);
@@ -1596,14 +1681,23 @@ ASTNode Parser::ParseCreateStatement() {
 	bool OrReplace = false;
 	const std::size_t BeforeOr = CurrentIndex_;
 	if(MatchKeyword("OR")) {
-		if(!MatchKeyword("REPLACE"))
-			ParseFail("Expected REPLACE in CREATE OR REPLACE clause.");
-		const auto AfterReplace = CurrentToken();
-		if(AfterReplace && AfterReplace->Type == TokenType::KEYWORD
-		   && (AfterReplace->Value == "PROCEDURE" || AfterReplace->Value == "FUNCTION"))
-			OrReplace = true;
-		else
-			CurrentIndex_ = BeforeOr;
+		if(MatchKeyword("ALTER")) {
+			const auto AfterAlter = CurrentToken();
+			if(AfterAlter && AfterAlter->Type == TokenType::KEYWORD
+			   && (AfterAlter->Value == "PROCEDURE" || AfterAlter->Value == "PROC" || AfterAlter->Value == "FUNCTION"))
+				OrReplace = true;
+			else
+				CurrentIndex_ = BeforeOr;
+		} else if(MatchKeyword("REPLACE")) {
+			const auto AfterReplace = CurrentToken();
+			if(AfterReplace && AfterReplace->Type == TokenType::KEYWORD
+			   && (AfterReplace->Value == "PROCEDURE" || AfterReplace->Value == "PROC" || AfterReplace->Value == "FUNCTION"))
+				OrReplace = true;
+			else
+				CurrentIndex_ = BeforeOr;
+		} else {
+			ParseFail("Expected REPLACE or ALTER in CREATE OR clause.");
+		}
 	}
 	if(MatchKeyword("INDEX"))
 		return ParseCreateIndexStatement();
@@ -1621,7 +1715,8 @@ ASTNode Parser::ParseCreateStatement() {
 	if(MatchKeyword("VIEW"))
 		return ParseCreateViewStatement();
 	const auto NextTok = CurrentToken();
-	const bool IsProcedure = NextTok && NextTok->Type == TokenType::KEYWORD && NextTok->Value == "PROCEDURE";
+	const bool IsProcedure = NextTok && NextTok->Type == TokenType::KEYWORD
+	                         && (NextTok->Value == "PROCEDURE" || NextTok->Value == "PROC");
 	const bool IsFunction = NextTok && NextTok->Type == TokenType::KEYWORD && NextTok->Value == "FUNCTION";
 	if(MatchKeyword("TRIGGER"))
 		return ParseCreateTriggerStatement(OrReplace);
@@ -1634,11 +1729,10 @@ ASTNode Parser::ParseCreateStatement() {
 			AdvanceThroughStatementSemicolon(StmtStart);
 			return std::make_unique<CreateProcedureAST>(
 			    std::move(R.ProcedureName), std::move(R.LoweredBodySql), R.IfNotExists, R.OrReplace,
-			    std::move(R.DialectTag), std::move(R.Body_.ExceptionHandlers),
-			    EncodeProcedureControlJson(R.Body_));
+			    std::move(R.DialectTag), std::move(R.Body_.ExceptionHandlers), std::string{}, std::move(R.Body_));
 		}
 		if(IsFunction)
-			ParseFail("CREATE FUNCTION requires PL/pgSQL dialect syntax (LANGUAGE plpgsql AS $$ … $$).");
+			ParseFail("CREATE FUNCTION requires PL/pgSQL or LANGUAGE SQL syntax (LANGUAGE plpgsql|sql AS $$ … $$).");
 		AdvanceToken();
 		return ParseCreateProcedureStatement(OrReplace);
 	}
@@ -1930,30 +2024,29 @@ ASTNode Parser::ParseCreateProcedureStatement(bool OrReplace) {
 		ParseFail("Expected AS after CREATE PROCEDURE name.");
 	if(!MatchToken(TokenType::PUNCTUATION, "("))
 		ParseFail("Expected '(' after AS in CREATE PROCEDURE (body is a parenthesized statement list).");
-	const std::size_t Byte0 = Tokens_[CurrentIndex_].Begin;
-	while(true) {
+	const std::size_t Byte0 = CurrentIndex_ < Tokens_.size() ? Tokens_[CurrentIndex_].Begin : Query_.size();
+	int ParenDepth = 1;
+	while(ParenDepth > 0) {
 		auto Ahead = CurrentToken();
 		if(!Ahead)
 			ParseFail("Unexpected EOF in CREATE PROCEDURE body.");
-		if(Ahead->Type == TokenType::PUNCTUATION && Ahead->Value == ")") {
-			AdvanceToken();
-			break;
+		if(Ahead->Type == TokenType::PUNCTUATION && Ahead->Value == "(")
+			++ParenDepth;
+		else if(Ahead->Type == TokenType::PUNCTUATION && Ahead->Value == ")") {
+			--ParenDepth;
+			if(ParenDepth == 0) {
+				AdvanceToken();
+				break;
+			}
 		}
-		if(Ahead->Type == TokenType::PUNCTUATION && Ahead->Value == ";") {
-			AdvanceToken();
-			continue;
-		}
-		if(!ParseStatement())
-			ParseFail("Expected SQL statement inside CREATE PROCEDURE body.");
+		AdvanceToken();
 	}
-	const std::size_t BodyEnd = Byte0 > 0 ? Byte0 : 0;
 	std::string BodySql;
 	if(CurrentIndex_ > 0) {
 		const std::size_t CloseParen = Tokens_[CurrentIndex_ - 1].Begin;
 		if(CloseParen > Byte0)
 			BodySql = Query_.substr(Byte0, CloseParen - Byte0);
 	}
-	(void)BodyEnd;
 	return std::make_unique<CreateProcedureAST>(std::move(Pn), std::move(BodySql), IfNotExists, OrReplace);
 }
 
@@ -2455,11 +2548,9 @@ std::unique_ptr<SelectAST> Parser::ParseSelectArmThroughHaving() {
                 ParseFail("Expected '(' after window function name");
             AdvanceToken();
             if(Ws.Kind == WindowFnKind::Lag || Ws.Kind == WindowFnKind::Lead) {
-                auto ColTk = CurrentToken();
-                if(!ColTk || ColTk->Type != TokenType::IDENTIFIER)
-                    ParseFail("LAG/LEAD expect a column name inside ()");
-                Ws.SourceColumn = ColTk->Value;
-                AdvanceToken();
+                if(!TryParseWindowAggArgument(Ws.SourceColumn)) {
+                    Ws.SourceColumn = ParseQualifiedSqlName();
+                }
                 Ws.FrameOffset = 1;
                 if(CurrentToken() && CurrentToken()->Value == ",") {
                     AdvanceToken();
@@ -2548,7 +2639,7 @@ std::unique_ptr<SelectAST> Parser::ParseSelectArmThroughHaving() {
                     std::string("ntile");
             if(MatchKeyword("AS")) {
                 auto At = CurrentToken();
-                if(!At)
+                if(!IsSelectAliasToken(At))
                     ParseFail("Expected alias after AS for window function");
                 OutCol = At->Value;
                 AdvanceToken();
@@ -2753,7 +2844,7 @@ std::unique_ptr<SelectAST> Parser::ParseSelectArmThroughHaving() {
             std::string Alias;
             if(MatchKeyword("AS")) {
                 auto At = CurrentToken();
-                if(!At || At->Type != TokenType::IDENTIFIER)
+                if(!IsSelectAliasToken(At))
                     ParseFail("Expected identifier alias after AS for scalar function");
                 Alias = At->Value;
                 AdvanceToken();
@@ -2777,14 +2868,34 @@ std::unique_ptr<SelectAST> Parser::ParseSelectArmThroughHaving() {
         const bool LooksLikeAvg =
             (TokenOpt->Type == TokenType::KEYWORD && TokenOpt->Value == "AVG") ||
             (TokenOpt->Type == TokenType::IDENTIFIER && FoldUpperAscii(TokenOpt->Value) == "AVG");
-        if(LooksLikeSum || LooksLikeMin || LooksLikeMax || LooksLikeAvg) {
+        auto FoldId = [&]() { return FoldUpperAscii(TokenOpt->Value); };
+        const std::string Folded = FoldId();
+        const bool LooksLikeStdDev =
+            Folded == "STDDEV" || Folded == "STDDEV_POP" || Folded == "STDDEV_SAMP";
+        const bool LooksLikeMedian = Folded == "MEDIAN";
+        const bool LooksLikeMode = Folded == "MODE";
+        const bool LooksLikeQuantile =
+            Folded == "APPROX_QUANTILE" || Folded == "PERCENTILE_CONT";
+        if(LooksLikeSum || LooksLikeMin || LooksLikeMax || LooksLikeAvg || LooksLikeStdDev ||
+           LooksLikeMedian || LooksLikeMode || LooksLikeQuantile) {
             GroupCombAggKind Ak = GroupCombAggKind::Sum;
+            double Quantile = 0.5;
             if(LooksLikeMin)
                 Ak = GroupCombAggKind::Min;
             else if(LooksLikeMax)
                 Ak = GroupCombAggKind::Max;
             else if(LooksLikeAvg)
                 Ak = GroupCombAggKind::Avg;
+            else if(LooksLikeMedian)
+                Ak = GroupCombAggKind::Median;
+            else if(LooksLikeMode)
+                Ak = GroupCombAggKind::Mode;
+            else if(LooksLikeQuantile)
+                Ak = GroupCombAggKind::ApproxQuantile;
+            else if(Folded == "STDDEV_SAMP")
+                Ak = GroupCombAggKind::StdDevSamp;
+            else if(LooksLikeStdDev)
+                Ak = GroupCombAggKind::StdDevPop;
             AdvanceToken();
             if(!CurrentToken() || CurrentToken()->Value != "(")
                 ParseFail("Expected '(' after aggregate function");
@@ -2792,8 +2903,26 @@ std::unique_ptr<SelectAST> Parser::ParseSelectArmThroughHaving() {
             auto ColTk = CurrentToken();
             if(!ColTk || ColTk->Type != TokenType::IDENTIFIER)
                 ParseFail("Expected column identifier in aggregate");
-            const std::string SrcCol = ColTk->Value;
+            std::string SrcCol = ColTk->Value;
             AdvanceToken();
+            if(CurrentToken() && CurrentToken()->Value == ".") {
+                AdvanceToken();
+                auto ColTk2 = CurrentToken();
+                if(!ColTk2 || ColTk2->Type != TokenType::IDENTIFIER)
+                    ParseFail("Expected column name after '.' in aggregate");
+                SrcCol = ColTk2->Value;
+                AdvanceToken();
+            }
+            if(Ak == GroupCombAggKind::ApproxQuantile) {
+                if(CurrentToken() && CurrentToken()->Value == ",") {
+                    AdvanceToken();
+                    auto Qt = CurrentToken();
+                    if(!Qt || Qt->Type != TokenType::LITERAL)
+                        ParseFail("APPROX_QUANTILE expects numeric quantile");
+                    Quantile = std::stod(Qt->Value);
+                    AdvanceToken();
+                }
+            }
             if(!CurrentToken() || CurrentToken()->Value != ")")
                 ParseFail("Expected ')' after aggregate argument");
             AdvanceToken();
@@ -2802,7 +2931,13 @@ std::unique_ptr<SelectAST> Parser::ParseSelectArmThroughHaving() {
                     std::string("sum_") + SrcCol :
                 Ak == GroupCombAggKind::Min ?
                     std::string("min_") + SrcCol :
-                Ak == GroupCombAggKind::Max ? std::string("max_") + SrcCol : std::string("avg_") + SrcCol;
+                Ak == GroupCombAggKind::Max ? std::string("max_") + SrcCol :
+                Ak == GroupCombAggKind::Avg ? std::string("avg_") + SrcCol :
+                Ak == GroupCombAggKind::Median ? std::string("median_") + SrcCol :
+                Ak == GroupCombAggKind::Mode ? std::string("mode_") + SrcCol :
+                Ak == GroupCombAggKind::ApproxQuantile ? std::string("quantile_") + SrcCol :
+                Ak == GroupCombAggKind::StdDevSamp ? std::string("stddev_samp_") + SrcCol :
+                                                     std::string("stddev_pop_") + SrcCol;
             if(CurrentToken() && CurrentToken()->Type == TokenType::KEYWORD && CurrentToken()->Value == "OVER") {
                 WindowSpec Ws;
                 Ws.Kind = Ak == GroupCombAggKind::Sum ?
@@ -2836,7 +2971,7 @@ std::unique_ptr<SelectAST> Parser::ParseSelectArmThroughHaving() {
                 OutCol = AliasTok->Value;
                 AdvanceToken();
             }
-            CombinedAggs.push_back(GroupCombAgg{Ak, SrcCol, OutCol});
+            CombinedAggs.push_back(GroupCombAgg{Ak, SrcCol, OutCol, Quantile});
             Columns.push_back(OutCol);
             ProjectionExprs.push_back(nullptr);
             if(auto NextToken = CurrentToken(); NextToken && NextToken->Value == ",")
@@ -2932,6 +3067,7 @@ std::unique_ptr<SelectAST> Parser::ParseSelectArmThroughHaving() {
             } else
                 CurrentIndex_ = Save;
         }
+        std::string FromAlias;
         if(auto AliasTok = CurrentToken();
             AliasTok && AliasTok->Type == TokenType::IDENTIFIER &&
             AliasTok->Value != "WHERE" && AliasTok->Value != "ORDER" && AliasTok->Value != "LIMIT" &&
@@ -2939,8 +3075,10 @@ std::unique_ptr<SelectAST> Parser::ParseSelectArmThroughHaving() {
             AliasTok->Value != "INNER" && AliasTok->Value != "LEFT" && AliasTok->Value != "RIGHT" &&
             AliasTok->Value != "FULL" && AliasTok->Value != "OUTER" && AliasTok->Value != "CROSS" &&
             AliasTok->Value != "JOIN" && AliasTok->Value != "UNION" && AliasTok->Value != "INTERSECT" &&
-            AliasTok->Value != "EXCEPT" && AliasTok->Value != "MATCH" && AliasTok->Value != "FOR")
+            AliasTok->Value != "EXCEPT" && AliasTok->Value != "MATCH" && AliasTok->Value != "FOR") {
+            FromAlias = AliasTok->Value;
             AdvanceToken();
+        }
 
         std::vector<JoinClause> Joins;
         while(CurrentToken() && CurrentToken()->Value == ",") {
@@ -2962,6 +3100,7 @@ std::unique_ptr<SelectAST> Parser::ParseSelectArmThroughHaving() {
                At->Value != "FULL" && At->Value != "OUTER" && At->Value != "CROSS" &&
                At->Value != "JOIN" && At->Value != "UNION" && At->Value != "INTERSECT" &&
                At->Value != "EXCEPT") {
+                Jc.RightAlias = At->Value;
                 AdvanceToken();
             }
             Joins.push_back(std::move(Jc));
@@ -3048,6 +3187,7 @@ std::unique_ptr<SelectAST> Parser::ParseSelectArmThroughHaving() {
                At->Value != "RIGHT" && At->Value != "FULL" && At->Value != "OUTER" &&
                At->Value != "CROSS" && At->Value != "JOIN" && At->Value != "ON" &&
                At->Value != "UNION" && At->Value != "INTERSECT" && At->Value != "EXCEPT") {
+                Jc.RightAlias = At->Value;
                 AdvanceToken();
             }
             if(JK != SqlJoinKind::Cross) {
@@ -3210,6 +3350,78 @@ std::unique_ptr<SelectAST> Parser::ParseSelectArmThroughHaving() {
                     break;
                 if(ColTk->Type != TokenType::IDENTIFIER && ColTk->Type != TokenType::KEYWORD)
                     ParseFail("GROUP BY expects a column name");
+                if(ColTk->Value == "CUBE") {
+                    AdvanceToken();
+                    if(!CurrentToken() || CurrentToken()->Value != "(") {
+                        GroupByCols.push_back("CUBE");
+                        if(auto Ct = CurrentToken(); Ct && Ct->Value == ",")
+                            AdvanceToken();
+                        else
+                            break;
+                        continue;
+                    }
+                    AdvanceToken();
+                    OlapMod = GroupOlapModifier::Cube;
+                    GroupByCols.clear();
+                    while(auto CubeCol = CurrentToken()) {
+                        if(CubeCol->Value == ")") {
+                            AdvanceToken();
+                            break;
+                        }
+                        if(CubeCol->Type != TokenType::IDENTIFIER && CubeCol->Type != TokenType::KEYWORD)
+                            ParseFail("GROUP BY CUBE expects column names");
+                        std::string GKey = CubeCol->Value;
+                        AdvanceToken();
+                        if(CurrentToken() && CurrentToken()->Value == ".") {
+                            AdvanceToken();
+                            auto Id2 = CurrentToken();
+                            if(!Id2 || Id2->Type != TokenType::IDENTIFIER)
+                                ParseFail("Expected column name after '.' in GROUP BY CUBE");
+                            GKey = Id2->Value;
+                            AdvanceToken();
+                        }
+                        GroupByCols.push_back(std::move(GKey));
+                        if(CurrentToken() && CurrentToken()->Value == ",")
+                            AdvanceToken();
+                    }
+                    break;
+                }
+                if(ColTk->Value == "ROLLUP") {
+                    AdvanceToken();
+                    if(!CurrentToken() || CurrentToken()->Value != "(") {
+                        GroupByCols.push_back("ROLLUP");
+                        if(auto Ct = CurrentToken(); Ct && Ct->Value == ",")
+                            AdvanceToken();
+                        else
+                            break;
+                        continue;
+                    }
+                    AdvanceToken();
+                    OlapMod = GroupOlapModifier::Rollup;
+                    GroupByCols.clear();
+                    while(auto RollCol = CurrentToken()) {
+                        if(RollCol->Value == ")") {
+                            AdvanceToken();
+                            break;
+                        }
+                        if(RollCol->Type != TokenType::IDENTIFIER && RollCol->Type != TokenType::KEYWORD)
+                            ParseFail("GROUP BY ROLLUP expects column names");
+                        std::string GKey = RollCol->Value;
+                        AdvanceToken();
+                        if(CurrentToken() && CurrentToken()->Value == ".") {
+                            AdvanceToken();
+                            auto Id2 = CurrentToken();
+                            if(!Id2 || Id2->Type != TokenType::IDENTIFIER)
+                                ParseFail("Expected column name after '.' in GROUP BY ROLLUP");
+                            GKey = Id2->Value;
+                            AdvanceToken();
+                        }
+                        GroupByCols.push_back(std::move(GKey));
+                        if(CurrentToken() && CurrentToken()->Value == ",")
+                            AdvanceToken();
+                    }
+                    break;
+                }
                 std::string GKey = ColTk->Value;
                 AdvanceToken();
                 if(CurrentToken() && CurrentToken()->Value == ".") {
@@ -3312,7 +3524,7 @@ std::unique_ptr<SelectAST> Parser::ParseSelectArmThroughHaving() {
             CountColArg = CountOutputColumnForAst;
         auto Sel = std::make_unique<SelectAST>(
             Columns, TableName, std::move(WhereClause), std::move(HavingClause),
-            std::vector<std::pair<std::string, bool>>{}, RowNumCap, 0, Distinct, std::move(GroupByCols), AggMode,
+            std::vector<OrderBySpec>{}, RowNumCap, 0, Distinct, std::move(GroupByCols), AggMode,
             CountDistinctCol, std::move(WindowSpecs), std::move(Joins), std::move(CombinedAggs),
             std::move(ProjectionExprs), CountColArg, OlapMod, std::move(GroupingSetsList));
 		if(auto Hint = ParseStorageHintFromQuery(Query_))
@@ -3323,6 +3535,8 @@ std::unique_ptr<SelectAST> Parser::ParseSelectArmThroughHaving() {
 			Sel->SetMatchRecognize(std::move(*MatchSpec));
 		if(ConnectByOpt)
 			Sel->SetConnectBy(std::move(*ConnectByOpt));
+		if(!FromAlias.empty())
+			Sel->SetSourceTableAlias(std::move(FromAlias));
 		return Sel;
     }
     ParseFail("Expected table name after FROM");
@@ -3585,8 +3799,7 @@ std::unique_ptr<ExpressionAST> Parser::ParseScalarPrimary() {
 				ParseFail("Expected column name after '.' in scalar expression");
 			std::string Cn = Col->Value;
 			AdvanceToken();
-			(void)N;
-			return std::make_unique<ColumnRefAST>(std::move(Cn));
+			return std::make_unique<ColumnRefAST>(N + "." + Cn);
 		}
 		return std::make_unique<ColumnRefAST>(std::move(N));
 	}
@@ -3763,7 +3976,7 @@ std::unique_ptr<ScalarFuncExprAST> Parser::TryParseScalarSqlBuiltinSelectExpr() 
 		if(!Ok)
 			return nullptr;
 	}
-	static const std::unordered_set<std::string> Starters = {"SUBSTRING", "UPPER", "LOWER", "CHAR_LENGTH",
+	static const std::unordered_set<std::string> Starters = {"SUBSTRING", "UPPER", "LOWER", "LENGTH", "CHAR_LENGTH",
 	    "CHARACTER_LENGTH", "POSITION", "TRIM", "CONCAT", "EXTRACT", "DATE_ADD", "DATE_SUB", "DATE_DIFF",
 	    "DATE_TRUNC", "TIME_BUCKET", "TIMESTAMP_DIFF", "CURRENT_TIMESTAMP", "AT_TIME_ZONE", "CONVERT_TZ",
 	    "STRUCT_FIELD", "MAP_GET", "COMPLEX_REAL", "COMPLEX_IMAG",
@@ -3836,12 +4049,13 @@ std::unique_ptr<ScalarFuncExprAST> Parser::TryParseScalarSqlBuiltinSelectExpr() 
 		return std::make_unique<ScalarFuncExprAST>(ScalarSqlFn::CurrentTimestamp, std::move(Args));
 	}
 
-	if(Name == "UPPER" || Name == "LOWER" || Name == "CHAR_LENGTH" || Name == "CHARACTER_LENGTH") {
+	if(Name == "UPPER" || Name == "LOWER" || Name == "LENGTH" || Name == "CHAR_LENGTH" ||
+	    Name == "CHARACTER_LENGTH") {
 		Args.push_back(ParseScalarExpression());
 		ScalarSqlFn K = ScalarSqlFn::Upper;
 		if(Name == "LOWER")
 			K = ScalarSqlFn::Lower;
-		else if(Name == "CHAR_LENGTH" || Name == "CHARACTER_LENGTH")
+		else if(Name == "LENGTH" || Name == "CHAR_LENGTH" || Name == "CHARACTER_LENGTH")
 			K = ScalarSqlFn::CharLength;
 		FinishClose();
 		return std::make_unique<ScalarFuncExprAST>(K, std::move(Args));
@@ -4110,7 +4324,7 @@ ASTNode Parser::ParseSelectStatement() {
         break;
     }
 
-    std::vector<std::pair<std::string, bool>> OrderByColumns;
+    std::vector<OrderBySpec> OrderByColumns;
     if(auto NextToken = CurrentToken(); NextToken && NextToken->Value == "ORDER") {
         AdvanceToken();
         if(auto ByToken = CurrentToken(); ByToken && ByToken->Value == "BY") {
@@ -4118,17 +4332,29 @@ ASTNode Parser::ParseSelectStatement() {
             while(auto ColumnToken = CurrentToken()) {
                 std::string ColumnName = ColumnToken->Value;
                 AdvanceToken();
-                bool Ascending = true;
+                OrderBySpec Spec;
+                Spec.Column = std::move(ColumnName);
+                Spec.Ascending = true;
+                Spec.NullsFirst = false;
                 if(auto OrderToken = CurrentToken(); OrderToken) {
                     if(OrderToken->Value == "ASC") {
-                        Ascending = true;
+                        Spec.Ascending = true;
                         AdvanceToken();
                     } else if(OrderToken->Value == "DESC") {
-                        Ascending = false;
+                        Spec.Ascending = false;
                         AdvanceToken();
                     }
                 }
-                OrderByColumns.emplace_back(ColumnName, Ascending);
+                if(auto NullTok = CurrentToken(); NullTok && NullTok->Value == "NULLS") {
+                    AdvanceToken();
+                    if(MatchKeyword("FIRST"))
+                        Spec.NullsFirst = true;
+                    else if(MatchKeyword("LAST"))
+                        Spec.NullsFirst = false;
+                    else
+                        ParseFail("Expected FIRST or LAST after NULLS");
+                }
+                OrderByColumns.push_back(std::move(Spec));
                 if(auto CommaToken = CurrentToken(); CommaToken && CommaToken->Value == ",") {
                     AdvanceToken();
                     continue;
@@ -4848,6 +5074,52 @@ ASTNode Parser::ParseRevokeStatement() {
 	return std::make_unique<RevokeAST>(std::move(Grantee), Perms, TableName, std::move(Columns), GranteeIsRole);
 }
 
+std::string Parser::ParseQualifiedSqlName() {
+	auto Id1 = CurrentToken();
+	if(!IsSqlSimpleNameToken(Id1))
+		ParseFail("Expected column name");
+	AdvanceToken();
+	if(CurrentToken() && CurrentToken()->Value == ".") {
+		AdvanceToken();
+		auto Id2 = CurrentToken();
+		if(!IsSqlSimpleNameToken(Id2))
+			ParseFail("Expected column after '.'");
+		AdvanceToken();
+		return Id2->Value;
+	}
+	return Id1->Value;
+}
+
+bool Parser::TryParseWindowAggArgument(std::string &OutSourceColumn) {
+	auto Tok = CurrentToken();
+	if(!Tok)
+		return false;
+	const bool LooksLikeSum =
+	    (Tok->Type == TokenType::KEYWORD && Tok->Value == "SUM") ||
+	    (Tok->Type == TokenType::IDENTIFIER && Tok->Value == "SUM");
+	const bool LooksLikeMin =
+	    (Tok->Type == TokenType::KEYWORD && Tok->Value == "MIN") ||
+	    (Tok->Type == TokenType::IDENTIFIER && Tok->Value == "MIN");
+	const bool LooksLikeMax =
+	    (Tok->Type == TokenType::KEYWORD && Tok->Value == "MAX") ||
+	    (Tok->Type == TokenType::IDENTIFIER && Tok->Value == "MAX");
+	const bool LooksLikeAvg =
+	    (Tok->Type == TokenType::KEYWORD && Tok->Value == "AVG") ||
+	    (Tok->Type == TokenType::IDENTIFIER && Tok->Value == "AVG");
+	const bool IsAgg = LooksLikeSum || LooksLikeMin || LooksLikeMax || LooksLikeAvg;
+	if(!IsAgg)
+		return false;
+	AdvanceToken();
+	if(!CurrentToken() || CurrentToken()->Value != "(")
+		return false;
+	AdvanceToken();
+	OutSourceColumn = ParseQualifiedSqlName();
+	if(!CurrentToken() || CurrentToken()->Value != ")")
+		ParseFail("Expected ')' after window aggregate argument");
+	AdvanceToken();
+	return true;
+}
+
 void Parser::ParseWindowOverClause(WindowSpec &Ws) {
     if(!MatchKeyword("OVER"))
         ParseFail("Expected OVER after window function");
@@ -4860,11 +5132,7 @@ void Parser::ParseWindowOverClause(WindowSpec &Ws) {
             ParseFail("Expected BY after PARTITION in window OVER clause");
         std::unordered_set<std::string> PartSeen;
         for(;;) {
-            auto Pc = CurrentToken();
-            if(!Pc || Pc->Type != TokenType::IDENTIFIER)
-                ParseFail(
-                    "Expected PARTITION BY column (use a plain column name — reserved words belong in ORDER BY)");
-            const std::string Pname = Pc->Value;
+            const std::string Pname = ParseQualifiedSqlName();
             if(PartSeen.count(Pname))
                 ParseFail("Duplicate column \"" + Pname + "\" in PARTITION BY");
             if(Ws.PartitionBy.size() >= Limits::MaxWindowPartitionColumns)
@@ -4873,7 +5141,6 @@ void Parser::ParseWindowOverClause(WindowSpec &Ws) {
                     "(see Limits::MaxWindowPartitionColumns)");
             PartSeen.insert(Pname);
             Ws.PartitionBy.push_back(Pname);
-            AdvanceToken();
             if(CurrentToken() && CurrentToken()->Value == ",") {
                 AdvanceToken();
                 continue;
@@ -4889,11 +5156,8 @@ void Parser::ParseWindowOverClause(WindowSpec &Ws) {
                                           "ORDER BY is invalid)");
     if(!MatchKeyword("BY"))
         ParseFail("WINDOW requires ORDER BY");
-    auto OCol = CurrentToken();
-    if(!OCol)
-        ParseFail("Expected column after ORDER BY in window");
-    Ws.OrderColumn = OCol->Value;
-    AdvanceToken();
+    if(!TryParseWindowAggArgument(Ws.OrderColumn))
+        Ws.OrderColumn = ParseQualifiedSqlName();
     Ws.OrderAscending = true;
     if(auto Ot = CurrentToken(); Ot && Ot->Value == "ASC") {
         Ws.OrderAscending = true;
@@ -4939,13 +5203,21 @@ void Parser::ParseWindowOverClause(WindowSpec &Ws) {
         return B;
     };
     if(MatchKeyword("ROWS")) {
-        if(!MatchKeyword("BETWEEN"))
-            ParseFail("Expected BETWEEN after ROWS in window frame");
         Ws.FrameUnit = WindowFrameUnit::Rows;
-        Ws.FrameStart = ParseFrameBound();
-        if(!MatchKeyword("AND"))
-            ParseFail("Expected AND between window frame bounds");
-        Ws.FrameEnd = ParseFrameBound();
+        if(MatchKeyword("BETWEEN")) {
+            Ws.FrameStart = ParseFrameBound();
+            if(!MatchKeyword("AND"))
+                ParseFail("Expected AND between window frame bounds");
+            Ws.FrameEnd = ParseFrameBound();
+        } else {
+            /** Shorthand: \c ROWS UNBOUNDED PRECEDING ≡ BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW. */
+            Ws.FrameStart = ParseFrameBound();
+            if(CurrentToken() && CurrentToken()->Value == "AND") {
+                AdvanceToken();
+                Ws.FrameEnd = ParseFrameBound();
+            } else
+                Ws.FrameEnd = WindowFrameBound{WindowFrameBoundKind::CurrentRow, 0};
+        }
         Ws.HasExplicitFrame = true;
     } else if(MatchKeyword("RANGE")) {
         if(!MatchKeyword("BETWEEN"))
@@ -5489,68 +5761,92 @@ std::unique_ptr<StatementAST> Parser::ParseGraphStatement() {
 		auto A = CurrentToken();
 		if(!A || A->Type != TokenType::IDENTIFIER)
 			ParseFail("GRAPH MATCH pattern expects vertex variable.");
+		(void)A;
 		AdvanceToken();
 		if(!MatchToken(TokenType::PUNCTUATION, ")"))
 			ParseFail("GRAPH MATCH pattern: expected ')' after source vertex.");
-		bool Reverse = false;
-		if(MatchToken(TokenType::PUNCTUATION, "<")) {
-			if(!MatchToken(TokenType::PUNCTUATION, "-"))
-				ParseFail("GRAPH MATCH pattern: expected '<-['.");
-			Reverse = true;
-		} else if(!MatchToken(TokenType::PUNCTUATION, "-"))
-			ParseFail("GRAPH MATCH pattern: expected '-[' or '<-['.");
-		if(!MatchToken(TokenType::PUNCTUATION, "["))
-			ParseFail("GRAPH MATCH pattern: expected '['.");
-		auto E = CurrentToken();
-		if(!E || E->Type != TokenType::IDENTIFIER)
-			ParseFail("GRAPH MATCH pattern expects edge variable.");
-		AdvanceToken();
-		int64_t MinHops = 1;
-		int64_t MaxHops = 1;
-		if(MatchToken(TokenType::PUNCTUATION, "*")) {
-			MinHops = 1;
-			MaxHops = static_cast<int64_t>(Limits::MaxGraphTraverseDepth);
-			auto Ht = CurrentToken();
-			if(Ht && Ht->Type == TokenType::LITERAL) {
-				const std::string &V = Ht->Value;
-				const size_t Dot = V.find("..");
-				if(Dot != std::string::npos) {
-					MinHops = std::stoll(V.substr(0, Dot));
-					MaxHops = std::stoll(V.substr(Dot + 2));
-				} else {
-					MinHops = std::stoll(V);
-					MaxHops = MinHops;
-				}
+		std::vector<GraphMatchPatternSegment> Segments;
+		std::string LabelFilter;
+		while(MatchToken(TokenType::PUNCTUATION, "-")) {
+			bool Reverse = false;
+			if(MatchToken(TokenType::PUNCTUATION, "<")) {
+				if(!MatchToken(TokenType::PUNCTUATION, "-"))
+					ParseFail("GRAPH MATCH pattern: expected '<-['.");
+				Reverse = true;
+			}
+			if(!MatchToken(TokenType::PUNCTUATION, "["))
+				ParseFail("GRAPH MATCH pattern: expected '['.");
+			if(MatchToken(TokenType::PUNCTUATION, ":")) {
+				auto Lbl = CurrentToken();
+				if(!Lbl || Lbl->Type != TokenType::IDENTIFIER)
+					ParseFail("GRAPH MATCH pattern expects edge label.");
+				LabelFilter = Lbl->Value;
 				AdvanceToken();
-				if(Dot == std::string::npos && MatchToken(TokenType::PUNCTUATION, ".") &&
-				   MatchToken(TokenType::PUNCTUATION, ".")) {
-					auto Ht2 = CurrentToken();
-					if(!Ht2 || Ht2->Type != TokenType::LITERAL)
-						ParseFail("GRAPH MATCH *m..n expects max hop literal.");
-					MaxHops = std::stoll(Ht2->Value);
+			} else {
+				auto E = CurrentToken();
+				if(E && E->Type == TokenType::IDENTIFIER) {
+					AdvanceToken();
+					if(MatchToken(TokenType::PUNCTUATION, ":")) {
+						auto Lbl = CurrentToken();
+						if(!Lbl || Lbl->Type != TokenType::IDENTIFIER)
+							ParseFail("GRAPH MATCH pattern expects edge label.");
+						LabelFilter = Lbl->Value;
+						AdvanceToken();
+					}
+				}
+			}
+			int64_t MinHops = 1;
+			int64_t MaxHops = 1;
+			if(MatchToken(TokenType::PUNCTUATION, "*")) {
+				MinHops = 1;
+				MaxHops = 5;
+				bool SawMin = false;
+				while(const auto Tok = CurrentToken()) {
+					if(Tok->Type == TokenType::PUNCTUATION && Tok->Value == "]")
+						break;
+					if(Tok->Type == TokenType::LITERAL) {
+						try {
+							const int64_t V = std::stoll(Tok->Value);
+							if(!SawMin) {
+								MinHops = V;
+								SawMin = true;
+							} else {
+								MaxHops = V;
+							}
+						} catch(...) {
+						}
+					}
 					AdvanceToken();
 				}
 			}
+			if(!MatchToken(TokenType::PUNCTUATION, "]"))
+				ParseFail("GRAPH MATCH pattern: expected ']' after edge.");
+			if(Reverse) {
+				if(!MatchToken(TokenType::PUNCTUATION, "-"))
+					ParseFail("GRAPH MATCH pattern: expected '-'.");
+			} else if(!MatchToken(TokenType::PUNCTUATION, "->")) {
+				if(!MatchToken(TokenType::PUNCTUATION, "-"))
+					ParseFail("GRAPH MATCH pattern: expected '->'.");
+				if(!MatchToken(TokenType::PUNCTUATION, ">"))
+					ParseFail("GRAPH MATCH pattern: expected '>'.");
+			}
+			if(!MatchToken(TokenType::PUNCTUATION, "("))
+				ParseFail("GRAPH MATCH pattern: expected '(' for target vertex.");
+			auto B = CurrentToken();
+			if(!B || B->Type != TokenType::IDENTIFIER)
+				ParseFail("GRAPH MATCH pattern expects target vertex variable.");
+			GraphMatchPatternSegment Seg;
+			Seg.MinHops = MinHops;
+			Seg.MaxHops = MaxHops;
+			Seg.Reverse = Reverse;
+			Seg.TargetVertexVar = B->Value;
+			Seg.EdgeLabel = LabelFilter;
+			Seg.EndOnProduct = (Segments.size() % 2) == 0;
+			AdvanceToken();
+			if(!MatchToken(TokenType::PUNCTUATION, ")"))
+				ParseFail("GRAPH MATCH pattern: expected ')' after target vertex.");
+			Segments.push_back(std::move(Seg));
 		}
-		if(!MatchToken(TokenType::PUNCTUATION, "]"))
-			ParseFail("GRAPH MATCH pattern: expected ']' after edge.");
-		if(Reverse) {
-			if(!MatchToken(TokenType::PUNCTUATION, "-"))
-				ParseFail("GRAPH MATCH pattern: expected '-'.");
-		} else {
-			if(!MatchToken(TokenType::PUNCTUATION, "-"))
-				ParseFail("GRAPH MATCH pattern: expected '->'.");
-			if(!MatchToken(TokenType::PUNCTUATION, ">"))
-				ParseFail("GRAPH MATCH pattern: expected '>'.");
-		}
-		if(!MatchToken(TokenType::PUNCTUATION, "("))
-			ParseFail("GRAPH MATCH pattern: expected '(' for target vertex.");
-		auto B = CurrentToken();
-		if(!B || B->Type != TokenType::IDENTIFIER)
-			ParseFail("GRAPH MATCH pattern expects target vertex variable.");
-		AdvanceToken();
-		if(!MatchToken(TokenType::PUNCTUATION, ")"))
-			ParseFail("GRAPH MATCH pattern: expected ')' after target vertex.");
 		std::string Anchor;
 		if(MatchKeyword("FROM")) {
 			auto St = CurrentToken();
@@ -5566,25 +5862,36 @@ std::unique_ptr<StatementAST> Parser::ParseGraphStatement() {
 			ParseFail("Expected graph name after IN.");
 		std::string GraphName = Gn->Value;
 		AdvanceToken();
-		std::string LabelFilter;
+		std::string VertexWhereVar;
+		std::string VertexWhereCol;
+		std::string VertexWhereValue;
 		if(MatchKeyword("WHERE")) {
 			auto Col = CurrentToken();
 			if(!Col || Col->Type != TokenType::IDENTIFIER)
-				ParseFail("GRAPH MATCH WHERE expects edge.label = 'value'.");
+				ParseFail("GRAPH MATCH WHERE expects predicate.");
+			const std::string VarName = Col->Value;
 			AdvanceToken();
 			if(!MatchToken(TokenType::PUNCTUATION, "."))
-				ParseFail("GRAPH MATCH WHERE expects edge.label = 'value'.");
+				ParseFail("GRAPH MATCH WHERE expects var.column = value.");
 			auto Lc = CurrentToken();
 			if(!Lc || Lc->Type != TokenType::IDENTIFIER)
-				ParseFail("GRAPH MATCH WHERE expects label column name.");
-			(void)Lc;
+				ParseFail("GRAPH MATCH WHERE expects column name.");
+			const std::string ColName = Lc->Value;
 			AdvanceToken();
 			if(!MatchToken(TokenType::PUNCTUATION, "="))
 				ParseFail("GRAPH MATCH WHERE expects '='.");
 			auto Lit = CurrentToken();
-			if(!Lit || Lit->Type != TokenType::LITERAL)
-				ParseFail("GRAPH MATCH WHERE expects string literal.");
-			LabelFilter = Lit->Value;
+			if(!Lit || (Lit->Type != TokenType::LITERAL && Lit->Type != TokenType::IDENTIFIER))
+				ParseFail("GRAPH MATCH WHERE expects literal.");
+			if(ColName == "label") {
+				LabelFilter = Lit->Value;
+			} else {
+				VertexWhereVar = VarName;
+				VertexWhereCol = ColName;
+				VertexWhereValue = Lit->Value;
+				if(Anchor.empty())
+					Anchor = Lit->Value;
+			}
 			AdvanceToken();
 		}
 		if(!MatchKeyword("INTO"))
@@ -5594,8 +5901,21 @@ std::unique_ptr<StatementAST> Parser::ParseGraphStatement() {
 			ParseFail("Expected result table name after INTO.");
 		std::string Result = Rt->Value;
 		AdvanceToken();
-		return std::make_unique<GraphMatchAST>(std::move(GraphName), std::move(LabelFilter), MinHops, MaxHops,
-		                                       std::move(Anchor), Reverse, std::move(Result));
+		int64_t MinHops = 1;
+		int64_t MaxHops = 1;
+		bool Reverse = false;
+		if(!Segments.empty()) {
+			MinHops = Segments.front().MinHops;
+			MaxHops = Segments.front().MaxHops;
+			Reverse = Segments.front().Reverse;
+		}
+		auto Out = std::make_unique<GraphMatchAST>(std::move(GraphName), std::move(LabelFilter), MinHops, MaxHops,
+		                                           std::move(Anchor), Reverse, std::move(Result));
+		Out->Segments = std::move(Segments);
+		Out->VertexWhereVar = std::move(VertexWhereVar);
+		Out->VertexWhereCol = std::move(VertexWhereCol);
+		Out->VertexWhereValue = std::move(VertexWhereValue);
+		return Out;
 	}
 	ParseFail("GRAPH statement must be TRAVERSE, MATCH, SHORTEST PATH, or PAGERANK.");
 }
@@ -5612,6 +5932,10 @@ std::unique_ptr<StatementAST> Parser::ParseStatement() {
 			return ParseCypherMatchStatement();
 		if(Token->Type == TokenType::KEYWORD && Token->Value == "GRAPH")
 			return ParseGraphStatement();
+        if(Token->Type == TokenType::KEYWORD && Token->Value == "PRAGMA")
+            return ParsePragmaStatement();
+        if(Token->Type == TokenType::KEYWORD && Token->Value == "EXPLAIN")
+            return ParseExplainStatement();
         if(Token->Type == TokenType::KEYWORD && Token->Value == "WITH")
             return ParseWithStatement();
         if(Token->Type == TokenType::KEYWORD && Token->Value == "LOAD")
@@ -5745,6 +6069,171 @@ ASTNode Parser::ParseCommentStatement() {
 	return Node;
 }
 
+namespace {
+
+std::string FoldPragmaName(std::string Name) {
+	for(char &C : Name)
+		C = static_cast<char>(std::tolower(static_cast<unsigned char>(C)));
+	return Name;
+}
+
+std::unique_ptr<PragmaAST> ResolvePragmaName(const std::string &NameLower, std::string Val, int64_t IntVal) {
+	if(NameLower == "enable_profiling" || NameLower == "profiling")
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::Profile, Val.empty() ? std::string("on") : Val);
+	if(NameLower == "disable_profiling")
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::Profile, "off");
+	if(NameLower == "enable_optimizer")
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::OptLevel, "2", 2);
+	if(NameLower == "disable_optimizer")
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::OptLevel, "0", 0);
+	if(NameLower == "explain_analyze")
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::Explain, "analyze");
+	if(NameLower == "profile" || NameLower == "astral_profile")
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::Profile, Val);
+	if(NameLower == "region" || NameLower == "astral_region")
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::Region, Val);
+	if(NameLower == "vector_batch_size") {
+		IntVal = Val.empty() ? 1024 : std::stoll(Val);
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::VectorBatchSize, Val, IntVal);
+	}
+	if(NameLower == "join_strategy")
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::JoinStrategy, Val);
+	if(NameLower == "zone_map_adaptive")
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::ZoneMapAdaptive, Val);
+	if(NameLower == "lazy_materialization")
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::LazyMaterialization, Val);
+	if(NameLower == "vm")
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::Vm, Val);
+	if(NameLower == "jit") {
+		const std::string L = FoldPragmaName(Val);
+		if(L == "on" || L == "1" || L == "true" || L == "yes")
+			return std::make_unique<PragmaAST>(PragmaAST::Kind::JitEnabled, "on");
+		if(L == "off" || L == "0" || L == "false" || L == "no")
+			return std::make_unique<PragmaAST>(PragmaAST::Kind::JitEnabled, "off");
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::Vm, "jit");
+	}
+	if(NameLower == "opt_level" || NameLower == "optimizer") {
+		IntVal = Val.empty() ? 2 : std::stoll(Val);
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::OptLevel, Val, IntVal);
+	}
+	if(NameLower == "verify_fast_path")
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::VerifyFastPath, Val);
+	if(NameLower == "explain")
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::Explain, Val);
+	if(NameLower == "dump_profile")
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::DumpProfile, Val);
+	if(NameLower == "reset_profile")
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::ResetProfile);
+	if(NameLower == "use_precomputed")
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::UsePrecomputed, Val);
+	if(NameLower == "query_checkpoint_on_signal")
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::QueryCheckpointOnSignal, Val);
+	if(NameLower == "query_checkpoint_interval") {
+		IntVal = Val.empty() ? 0 : std::stoll(Val);
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::QueryCheckpointInterval, Val, IntVal);
+	}
+	if(NameLower == "resume_query_checkpoint")
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::ResumeQueryCheckpoint, Val);
+	if(NameLower == "foreign_keys")
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::ForeignKeys, Val);
+	if(NameLower == "opt_confidence_floor" || NameLower == "confidence_floor") {
+		IntVal = 0;
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::OptConfidenceFloor, Val, IntVal);
+	}
+	if(NameLower == "enable_verification" || NameLower == "verify")
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::VerifyFastPath,
+		                                   Val.empty() ? std::string("on") : Val);
+	if(NameLower == "disable_verification")
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::VerifyFastPath, "off");
+	if(NameLower == "profile_output" || NameLower == "profiling_output")
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::DumpProfile, Val);
+	if(NameLower == "journal_mode" || NameLower == "synchronous" || NameLower == "cache_size" ||
+	   NameLower == "temp_store" || NameLower == "mmap_size" || NameLower == "memory_limit" ||
+	   NameLower == "wal_checkpoint" || NameLower == "checkpoint" || NameLower == "table_info" ||
+	   NameLower == "integrity_check" || NameLower == "enable_external_access" ||
+	   NameLower == "disabled_optimizers" || NameLower == "threads" || NameLower == "force_parallelism" ||
+	   NameLower == "preserve_insertion_order")
+		return std::make_unique<PragmaAST>(PragmaAST::Kind::CompatAck, NameLower, 0);
+	return nullptr;
+}
+
+} // namespace
+
+std::unique_ptr<StatementAST> Parser::ParsePragmaStatement() {
+	AdvanceToken();
+	const std::optional<Token> NameTok = CurrentToken();
+	if(!NameTok || (NameTok->Type != TokenType::IDENTIFIER && NameTok->Type != TokenType::KEYWORD))
+		ParseFail("PRAGMA expects a directive name");
+	std::string PragmaName = NameTok->Value;
+	AdvanceToken();
+	if(MatchToken(TokenType::PUNCTUATION, ".")) {
+		const std::optional<Token> QualTok = CurrentToken();
+		if(!QualTok || (QualTok->Type != TokenType::IDENTIFIER && QualTok->Type != TokenType::KEYWORD))
+			ParseFail("PRAGMA expects directive name after '.'");
+		PragmaName = QualTok->Value;
+		AdvanceToken();
+	}
+	const std::string NameLower = FoldPragmaName(PragmaName);
+
+	std::string Val;
+	int64_t IntVal = 0;
+	const auto ReadOnePragmaValue = [&]() -> bool {
+		if(MatchKeyword("NULL")) {
+			Val = "null";
+			return true;
+		}
+		if(MatchKeyword("ON") || MatchKeyword("OFF") || MatchKeyword("TRUE") || MatchKeyword("FALSE") ||
+		   MatchKeyword("YES") || MatchKeyword("NO")) {
+			if(CurrentIndex_ > 0)
+				Val = Tokens_[CurrentIndex_ - 1].Value;
+			return true;
+		}
+		if(MatchToken(TokenType::LITERAL)) {
+			if(CurrentIndex_ > 0)
+				Val = Tokens_[CurrentIndex_ - 1].Value;
+			return true;
+		}
+		if(const std::optional<Token> T = CurrentToken()) {
+			if(T->Type == TokenType::IDENTIFIER || T->Type == TokenType::KEYWORD) {
+				Val = T->Value;
+				AdvanceToken();
+				return true;
+			}
+		}
+		return false;
+	};
+
+	if(MatchToken(TokenType::PUNCTUATION, "=") || MatchToken(TokenType::PUNCTUATION, ":"))
+		(void)ReadOnePragmaValue();
+	else if(MatchToken(TokenType::PUNCTUATION, "(")) {
+		(void)ReadOnePragmaValue();
+		while(MatchToken(TokenType::PUNCTUATION, ","))
+			(void)ReadOnePragmaValue();
+		if(!MatchToken(TokenType::PUNCTUATION, ")"))
+			ParseFail("PRAGMA expects ')' after parenthesized value");
+	} else
+		(void)ReadOnePragmaValue();
+
+	if(auto Resolved = ResolvePragmaName(NameLower, Val, IntVal))
+		return Resolved;
+	ParseFail("Unknown PRAGMA: " + PragmaName);
+}
+
+std::unique_ptr<StatementAST> Parser::ParseExplainStatement() {
+	AdvanceToken();
+	const bool Analyze = MatchKeyword("ANALYZE");
+	std::unique_ptr<StatementAST> Inner;
+	if(const std::optional<Token> T = CurrentToken()) {
+		if(T->Type == TokenType::SELECT)
+			Inner = ParseSelectStatement();
+		else if(T->Type == TokenType::KEYWORD && T->Value == "WITH")
+			Inner = ParseWithStatement();
+	}
+	if(!Inner)
+		ParseFail("EXPLAIN expects SELECT or WITH … SELECT");
+	return std::make_unique<ExplainSelectAST>(Analyze, std::move(Inner));
+}
+
 ASTNode Parser::ParseSetStatement() {
 	AdvanceToken();
 	bool SessionScope = false;
@@ -5826,13 +6315,15 @@ std::unique_ptr<StatementAST> Parser::ParseDataExchangeStatement() {
 	auto ExpectFormatKeyword = [this]() -> std::string {
 		auto Tk = CurrentToken();
 		if(!Tk || (Tk->Type != TokenType::KEYWORD && Tk->Type != TokenType::IDENTIFIER))
-			ParseFail("Expected FORMAT name (CSV, JSON, TSV)");
+			ParseFail("Expected FORMAT name (CSV, JSON, TSV, XLSX)");
 		std::string F = Tk->Value;
 		AdvanceToken();
 		for(char &Ch : F)
 			Ch = static_cast<char>(std::toupper(static_cast<unsigned char>(Ch)));
-		if(F != "JSON" && F != "CSV" && F != "TSV")
-			ParseFail("FORMAT must be CSV, JSON, or TSV");
+		if(F == "EXCEL")
+			F = "XLSX";
+		if(F != "JSON" && F != "CSV" && F != "TSV" && F != "XLSX")
+			ParseFail("FORMAT must be CSV, JSON, TSV, or XLSX");
 		return F;
 	};
 	auto Head = CurrentToken();

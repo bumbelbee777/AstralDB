@@ -1,6 +1,6 @@
-#include <Database/TextIndex.hxx>
+#include <Database/Index/TextIndex.hxx>
 
-#include <SQL/TextSearch.hxx>
+#include <Database/Index/TextSearch.hxx>
 
 #include <algorithm>
 #include <iterator>
@@ -28,13 +28,13 @@ void TextIndex::Clear() {
 }
 
 void TextIndex::IndexRow(size_t RowId, std::string_view Text) {
-	const std::vector<std::string> Terms = SQL::TextSearch::DistinctTerms(Text);
+	const std::vector<std::string> Terms = TextSearch::DistinctTerms(Text);
 	for(const std::string &Term : Terms)
 		InsertPosting(Postings_[Term], RowId);
 }
 
 void TextIndex::RemoveRow(size_t RowId, std::string_view Text) {
-	const std::vector<std::string> Terms = SQL::TextSearch::DistinctTerms(Text);
+	const std::vector<std::string> Terms = TextSearch::DistinctTerms(Text);
 	for(const std::string &Term : Terms) {
 		auto It = Postings_.find(Term);
 		if(It != Postings_.end())
@@ -43,12 +43,12 @@ void TextIndex::RemoveRow(size_t RowId, std::string_view Text) {
 }
 
 std::vector<size_t> TextIndex::RowsMatchingQuery(std::string_view Query) const {
-	const std::vector<std::string> Branches = SQL::TextSearch::OrBranches(Query);
+	const std::vector<std::string> Branches = TextSearch::OrBranches(Query);
 	if(Branches.empty())
 		return {};
 	std::vector<size_t> Union;
 	for(const std::string &Branch : Branches) {
-		const std::vector<std::string> Terms = SQL::TextSearch::TokenizeQuery(Branch);
+		const std::vector<std::string> Terms = TextSearch::TokenizeQuery(Branch);
 		if(Terms.empty())
 			continue;
 		std::vector<size_t> Acc;

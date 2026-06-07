@@ -1,21 +1,49 @@
-#include <SQL/BytecodeProcedures.hxx>
-#include <SQL/BytecodeInspect.hxx>
+#include <SQL/Procedures/BytecodeProcedures.hxx>
+#include <SQL/Bytecode/BytecodeInspect.hxx>
 #include <SQL/SQL.hxx>
 #include <DS/JSON.hxx>
 #include <Database/Database.hxx>
 #include <IO/Error.hxx>
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <fstream>
 #include <functional>
-#include <functional>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace AstralDB {
 namespace SQL {
 
 static constexpr int kCatalogVersion = 1;
+
+namespace {
+
+std::mutex GProcedureBodyStashMu;
+std::unordered_map<std::string, LoweredProcedureBody> GProcedureBodyStash;
+
+} // namespace
+
+void StashLoweredProcedureBody(const std::string_view Name, LoweredProcedureBody Body) {
+	if(Name.empty())
+		return;
+	std::scoped_lock Guard(GProcedureBodyStashMu);
+	GProcedureBodyStash[std::string(Name)] = std::move(Body);
+}
+
+std::optional<LoweredProcedureBody> TakeStashedLoweredProcedureBody(const std::string_view Name) {
+	if(Name.empty())
+		return std::nullopt;
+	std::scoped_lock Guard(GProcedureBodyStashMu);
+	const auto It = GProcedureBodyStash.find(std::string(Name));
+	if(It == GProcedureBodyStash.end())
+		return std::nullopt;
+	LoweredProcedureBody Out = std::move(It->second);
+	GProcedureBodyStash.erase(It);
+	return Out;
+}
 
 std::string EncodeExceptionHandlersJson(const std::vector<ProcedureExceptionWhen> &Handlers) {
 	if(Handlers.empty())
@@ -166,10 +194,12 @@ void AppendCompiledBytecode(Bytecode &Dest, std::vector<std::string> &DestPool, 
 }
 
 CompiledBytecode CompileSqlChunk(Logger *Logger, OptimizationLevel OptLevel, const Database *CatalogDb,
-                                std::string_view Sql) {
+                                std::string_view Sql, bool ProbeQuery = false) {
 	Parser P(Sql);
 	(void)P;
-	return BuildCompiledBytecode(Logger, OptLevel, CatalogDb);
+	const OptimizationLevel Effective =
+	    ProbeQuery ? (OptLevel > OptimizationLevel::Basic ? OptimizationLevel::Basic : OptLevel) : OptLevel;
+	return BuildCompiledBytecode(Logger, Effective, CatalogDb);
 }
 
 std::string FindProbeTableName(const Bytecode &Bc) {
@@ -220,7 +250,7 @@ CompiledBytecode CompileIfBranchChain(Logger *Logger, OptimizationLevel OptLevel
 				Sql += Br.ConditionSql;
 				Sql += ");";
 			}
-			CondCompiled.push_back(CompileSqlChunk(Logger, OptLevel, CatalogDb, Sql));
+			CondCompiled.push_back(CompileSqlChunk(Logger, OptLevel, CatalogDb, Sql, true));
 			ProbeTables.push_back(FindProbeTableName(CondCompiled.back().Instructions));
 		}
 		BodyCompiled.push_back(CompileLoweredSegments(Logger, OptLevel, CatalogDb, Br.Segments, ProbeSeq));
@@ -293,13 +323,31 @@ CompiledBytecode CompileLoweredSegments(Logger *Logger, OptimizationLevel OptLev
 	(void)ProbeSeq;
 	Bytecode Out;
 	std::vector<std::string> Pool;
+	std::string LinearBatch;
+	const auto FlushLinearBatch = [&]() {
+		if(LinearBatch.empty())
+			return;
+		AppendCompiledBytecode(Out, Pool, CompileSqlChunk(Logger, OptLevel, CatalogDb, LinearBatch, false));
+		LinearBatch.clear();
+	};
 	for(const ProcedureControlSegment &Seg : Segments) {
-		if(!Seg.LinearSql.empty())
-			AppendCompiledBytecode(Out, Pool, CompileSqlChunk(Logger, OptLevel, CatalogDb, Seg.LinearSql));
-		if(!Seg.IfBranches.empty())
+		if(!Seg.IfBranches.empty()) {
+			FlushLinearBatch();
+			if(!Seg.LinearSql.empty())
+				AppendCompiledBytecode(Out, Pool,
+				                       CompileSqlChunk(Logger, OptLevel, CatalogDb, Seg.LinearSql, false));
 			AppendCompiledBytecode(Out, Pool,
-			                       CompileIfBranchChain(Logger, OptLevel, CatalogDb, Seg.IfBranches, ProbeSeq, Out.size()));
+			                       CompileIfBranchChain(Logger, OptLevel, CatalogDb, Seg.IfBranches, ProbeSeq,
+			                                            Out.size()));
+			continue;
+		}
+		if(Seg.LinearSql.empty())
+			continue;
+		if(!LinearBatch.empty())
+			LinearBatch += "; ";
+		LinearBatch += Seg.LinearSql;
 	}
+	FlushLinearBatch();
 	CompiledBytecode Result;
 	Result.Instructions = std::move(Out);
 	Result.StringPool = std::move(Pool);
@@ -312,7 +360,7 @@ CompiledBytecode WrapProcedureExceptions(Logger *Logger, OptimizationLevel OptLe
 	std::vector<CompiledBytecode> HandlerCompiled;
 	HandlerCompiled.reserve(ExceptionHandlers.size());
 	for(const auto &H : ExceptionHandlers)
-		HandlerCompiled.push_back(CompileSqlChunk(Logger, OptLevel, CatalogDb, H.HandlerSql));
+		HandlerCompiled.push_back(CompileSqlChunk(Logger, OptLevel, CatalogDb, H.HandlerSql, false));
 	const std::size_t TryCount = CountSansHalt(Core.Instructions);
 	std::vector<std::size_t> HandlerSizes;
 	HandlerSizes.reserve(HandlerCompiled.size());
@@ -401,7 +449,7 @@ CompiledBytecode CompileProcedureBody(Logger *Logger, OptimizationLevel OptLevel
 CompiledBytecode CompileProcedureBody(Logger *Logger, OptimizationLevel OptLevel, const Database *CatalogDb,
                                       std::string_view BodySql,
                                       const std::vector<ProcedureExceptionWhen> &ExceptionHandlers) {
-	LoweredProcedureBody Body = DecodeProcedureControlJson({}, BodySql);
+	LoweredProcedureBody Body = DecodeProcedureControl({}, BodySql);
 	if(Body.Segments.empty()) {
 		ProcedureControlSegment Seg;
 		Seg.LinearSql = std::string(BodySql);
@@ -410,6 +458,140 @@ CompiledBytecode CompileProcedureBody(Logger *Logger, OptimizationLevel OptLevel
 	Body.ExceptionHandlers = ExceptionHandlers;
 	Body.TryBodySql = std::string(BodySql);
 	return CompileProcedureBody(Logger, OptLevel, CatalogDb, Body);
+}
+
+namespace {
+
+constexpr char kApcfMagic[4] = {'A', 'P', 'C', 'F'};
+constexpr std::uint8_t kApcfVersion = 1;
+
+void AppendU32(std::string &Out, const std::uint32_t V) {
+	Out.push_back(static_cast<char>(V & 0xFF));
+	Out.push_back(static_cast<char>((V >> 8) & 0xFF));
+	Out.push_back(static_cast<char>((V >> 16) & 0xFF));
+	Out.push_back(static_cast<char>((V >> 24) & 0xFF));
+}
+
+bool ReadU32(std::string_view &In, std::uint32_t &V) {
+	if(In.size() < 4)
+		return false;
+	const auto *P = reinterpret_cast<const unsigned char *>(In.data());
+	V = static_cast<std::uint32_t>(P[0]) | (static_cast<std::uint32_t>(P[1]) << 8) |
+	    (static_cast<std::uint32_t>(P[2]) << 16) | (static_cast<std::uint32_t>(P[3]) << 24);
+	In.remove_prefix(4);
+	return true;
+}
+
+void AppendStr(std::string &Out, const std::string_view S) {
+	AppendU32(Out, static_cast<std::uint32_t>(S.size()));
+	Out.append(S);
+}
+
+bool ReadStr(std::string_view &In, std::string &Out) {
+	std::uint32_t Len = 0;
+	if(!ReadU32(In, Len) || In.size() < Len)
+		return false;
+	Out.assign(In.data(), Len);
+	In.remove_prefix(Len);
+	return true;
+}
+
+void EncodeBranches(std::string &Out, const std::vector<ProcedureIfBranch> &Branches);
+void EncodeSegments(std::string &Out, const std::vector<ProcedureControlSegment> &Segments);
+
+void EncodeBranches(std::string &Out, const std::vector<ProcedureIfBranch> &Branches) {
+	AppendU32(Out, static_cast<std::uint32_t>(Branches.size()));
+	for(const ProcedureIfBranch &Br : Branches) {
+		AppendStr(Out, Br.ConditionSql);
+		EncodeSegments(Out, Br.Segments);
+	}
+}
+
+void EncodeSegments(std::string &Out, const std::vector<ProcedureControlSegment> &Segments) {
+	AppendU32(Out, static_cast<std::uint32_t>(Segments.size()));
+	for(const ProcedureControlSegment &Seg : Segments) {
+		AppendStr(Out, Seg.LinearSql);
+		EncodeBranches(Out, Seg.IfBranches);
+	}
+}
+
+bool DecodeBranches(std::string_view &In, std::vector<ProcedureIfBranch> &Branches);
+bool DecodeSegments(std::string_view &In, std::vector<ProcedureControlSegment> &Segments);
+
+bool DecodeBranches(std::string_view &In, std::vector<ProcedureIfBranch> &Branches) {
+	std::uint32_t Count = 0;
+	if(!ReadU32(In, Count))
+		return false;
+	Branches.reserve(Count);
+	for(std::uint32_t I = 0; I < Count; ++I) {
+		ProcedureIfBranch Br;
+		if(!ReadStr(In, Br.ConditionSql))
+			return false;
+		if(!DecodeSegments(In, Br.Segments))
+			return false;
+		Branches.push_back(std::move(Br));
+	}
+	return true;
+}
+
+bool DecodeSegments(std::string_view &In, std::vector<ProcedureControlSegment> &Segments) {
+	std::uint32_t Count = 0;
+	if(!ReadU32(In, Count))
+		return false;
+	Segments.reserve(Count);
+	for(std::uint32_t I = 0; I < Count; ++I) {
+		ProcedureControlSegment Seg;
+		if(!ReadStr(In, Seg.LinearSql))
+			return false;
+		if(!DecodeBranches(In, Seg.IfBranches))
+			return false;
+		Segments.push_back(std::move(Seg));
+	}
+	return true;
+}
+
+} // namespace
+
+std::string EncodeProcedureControlBinary(const LoweredProcedureBody &Body) {
+	if(Body.Segments.empty())
+		return {};
+	std::string Out;
+	Out.reserve(64);
+	Out.append(kApcfMagic, 4);
+	Out.push_back(static_cast<char>(kApcfVersion));
+	EncodeSegments(Out, Body.Segments);
+	return Out;
+}
+
+LoweredProcedureBody DecodeProcedureControlBinary(std::string_view Blob) {
+	LoweredProcedureBody Out;
+	if(Blob.size() < 5 || Blob[0] != kApcfMagic[0] || Blob[1] != kApcfMagic[1] || Blob[2] != kApcfMagic[2] ||
+	   Blob[3] != kApcfMagic[3])
+		return Out;
+	Blob.remove_prefix(5);
+	if(!DecodeSegments(Blob, Out.Segments))
+		Out.Segments.clear();
+	return Out;
+}
+
+LoweredProcedureBody DecodeProcedureControl(const std::string_view Blob, const std::string_view FallbackLinearSql) {
+	if(Blob.size() >= 4 && Blob[0] == kApcfMagic[0] && Blob[1] == kApcfMagic[1] && Blob[2] == kApcfMagic[2] &&
+	   Blob[3] == kApcfMagic[3]) {
+		LoweredProcedureBody Out = DecodeProcedureControlBinary(Blob);
+		if(!FallbackLinearSql.empty())
+			Out.TryBodySql = std::string(FallbackLinearSql);
+		return Out;
+	}
+	if(!Blob.empty() && (Blob.front() == '[' || Blob.front() == '{'))
+		return DecodeProcedureControlJson(Blob, FallbackLinearSql);
+	LoweredProcedureBody Out;
+	if(!FallbackLinearSql.empty()) {
+		ProcedureControlSegment Seg;
+		Seg.LinearSql = std::string(FallbackLinearSql);
+		Out.Segments.push_back(std::move(Seg));
+		Out.TryBodySql = std::string(FallbackLinearSql);
+	}
+	return Out;
 }
 
 std::string EncodeProcedureControlJson(const LoweredProcedureBody &Body) {
@@ -733,7 +915,11 @@ StoredProcedureEntry CacheProcedureFromSql(ProcedureCatalog &Catalog, const std:
 	const std::filesystem::path CacheDir = DefaultProcedureCacheDir(SessionDbPath);
 	std::error_code Ec;
 	std::filesystem::create_directories(CacheDir, Ec);
-	LoweredProcedureBody Lowered = DecodeProcedureControlJson(ControlFlowJson, BodySql);
+	LoweredProcedureBody Lowered;
+	if(std::optional<LoweredProcedureBody> Stashed = TakeStashedLoweredProcedureBody(Name))
+		Lowered = std::move(*Stashed);
+	else
+		Lowered = DecodeProcedureControl(ControlFlowJson, BodySql);
 	if(Lowered.Segments.empty() && !BodySql.empty()) {
 		ProcedureControlSegment Seg;
 		Seg.LinearSql = BodySql;

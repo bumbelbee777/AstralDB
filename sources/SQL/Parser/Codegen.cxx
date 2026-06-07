@@ -1,15 +1,23 @@
-#include <SQL/Bytecode.hxx>
-#include <SQL/GraphOptimizer.hxx>
-#include <SQL/MathSciOptimizer.hxx>
-#include <SQL/SetExprEval.hxx>
-#include <Database/MathSci.hxx>
+#include <SQL/Bytecode/Bytecode.hxx>
+#include <SQL/Optimizer/GraphOptimizer.hxx>
+#include <SQL/MathSci/MathSciOptimizer.hxx>
+#include <SQL/Rewrite/RewritePipeline.hxx>
+#include <SQL/Rewrite/LazyCorrelationCache.hxx>
+#include <SQL/Fusion/FusionPlanTypes.hxx>
+#include <SQL/Fusion/FusionPass.hxx>
+#include <SQL/Bulk/BulkOpcodePass.hxx>
+#include <SQL/Optimizer/AdaptiveOptimizer.hxx>
+#include <SQL/Profiler/SqlSessionConfig.hxx>
+#include <SQL/Parser/SetExprEval.hxx>
+#include <Database/MathSci/MathSci.hxx>
 #include <SQL/SQL.hxx>
-#include <SQL/BytecodeProcedures.hxx>
-#include <SQL/BytecodeTriggers.hxx>
-#include <SQL/DialectCompat.hxx>
+#include <SQL/Procedures/BytecodeProcedures.hxx>
+#include <SQL/Procedures/BytecodeTriggers.hxx>
+#include <SQL/Parser/DialectCompat.hxx>
 #include <Database/Database.hxx>
-#include <Database/MathSci.hxx>
+#include <Database/MathSci/MathSci.hxx>
 #include <IO/Limits.hxx>
+#include <IO/RuntimeLimits.hxx>
 #include <IO/ArenaAllocator.hxx>
 #include <IO/Error.hxx>
 #include <DS/HashTable.hxx>
@@ -20,6 +28,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <algorithm>
 #include <cctype>
@@ -171,6 +180,17 @@ static constexpr const char *kOpBoolConst = "__BOOL_CONST__";
 static constexpr const char *kQuantifiedSubqueryCol = "__ASTRAL_QSUBQ__";
 static constexpr const char *kRowCompareCol = "__ASTRAL_ROWCMP__";
 
+/** Map bare aggregate source (e.g. \c amount) to grouped SELECT output (e.g. \c total_amount). */
+static std::string MapWindowAggColumnRef(const std::string &ColName, const SelectAST &Sel) {
+	if(ColName.empty())
+		return ColName;
+	for(const auto &Ca : Sel.ComboAggs()) {
+		if(Ca.SourceColumn == ColName)
+			return Ca.OutputColumn;
+	}
+	return ColName;
+}
+
 static std::string MapHavingAggOutputColumn(const FuncCallExprAST &F, const SelectAST &Sel) {
 	switch(F.BuiltinKind) {
 	case FuncCallExprAST::Kind::CountStar:
@@ -203,6 +223,26 @@ static std::string MapHavingAggOutputColumn(const FuncCallExprAST &F, const Sele
 				return Ca.OutputColumn;
 		}
 		FailCodegen("HAVING aggregate does not match a grouped SUM/MIN/MAX/AVG(column) in the SELECT list.");
+	}
+	case FuncCallExprAST::Kind::StdDevPop:
+	case FuncCallExprAST::Kind::StdDevSamp:
+	case FuncCallExprAST::Kind::Median:
+	case FuncCallExprAST::Kind::ApproxQuantile:
+	case FuncCallExprAST::Kind::Mode: {
+		GroupCombAggKind Want = GroupCombAggKind::StdDevPop;
+		if(F.BuiltinKind == FuncCallExprAST::Kind::StdDevSamp)
+			Want = GroupCombAggKind::StdDevSamp;
+		else if(F.BuiltinKind == FuncCallExprAST::Kind::Median)
+			Want = GroupCombAggKind::Median;
+		else if(F.BuiltinKind == FuncCallExprAST::Kind::ApproxQuantile)
+			Want = GroupCombAggKind::ApproxQuantile;
+		else if(F.BuiltinKind == FuncCallExprAST::Kind::Mode)
+			Want = GroupCombAggKind::Mode;
+		for(const auto &Ca : Sel.ComboAggs()) {
+			if(Ca.Kind == Want && Ca.SourceColumn == F.ArgColumn)
+				return Ca.OutputColumn;
+		}
+		FailCodegen("HAVING aggregate does not match a grouped aggregate in the SELECT list.");
 	}
 	default:
 		FailCodegen("Internal error: unknown aggregate in HAVING lowering.");
@@ -248,7 +288,25 @@ static std::unique_ptr<ExpressionAST> NormalizeHavingExpr(const ExpressionAST *R
 	FailCodegen("HAVING uses an expression shape that cannot be lowered for grouped columns.");
 }
 
-bool BuildWhereDnf(const ExpressionAST *WhereRoot, std::vector<std::vector<RowTriple>> &OutBranches);
+struct WhereMatCtx {
+	BytecodeScratch *Instructions = nullptr;
+	unsigned Counter = 0;
+};
+
+static std::string MaterializeWhereExpr(const ExpressionAST *E, WhereMatCtx &Ctx);
+static std::string MaterializeScalarToColumn(const ExpressionAST *E, BytecodeScratch &Instructions);
+static void EmitScalarFuncEvalInstruction(const ScalarFuncExprAST &F, const std::string &OutCol,
+                                          BytecodeScratch &Instructions);
+static void EmitCastEvalInstruction(const CastExprAST &C, const std::string &OutCol, BytecodeScratch &Instructions);
+static void EmitCoalesceForColumn(const CoalesceExprAST &C, const std::string &OutCol, BytecodeScratch &Instructions);
+static void EmitNvl2ForColumn(const Nvl2ExprAST &N, const std::string &OutCol, BytecodeScratch &Instructions);
+static void EmitCaseEvalInstruction(const CaseExprAST &C, const std::string &OutCol, BytecodeScratch &Instructions);
+static void EmitBinaryArithForColumn(const BinaryOpAST &B, const std::string &OutCol,
+                                     BytecodeScratch &Instructions);
+static void EmitMatchForColumn(const BinaryOpAST &B, const std::string &OutCol, BytecodeScratch &Instructions);
+
+bool BuildWhereDnf(const ExpressionAST *WhereRoot, std::vector<std::vector<RowTriple>> &OutBranches,
+                   WhereMatCtx *Ctx = nullptr);
 
 static void PutLeI64(std::string &S, int64_t V) {
 	for(int B = 0; B < 8; ++B)
@@ -293,7 +351,8 @@ bool ColumnNameExpr(const ExpressionAST *E, std::string &Out) {
 	const auto *C = dynamic_cast<const ColumnRefAST *>(E);
 	if(!C)
 		return false;
-	Out = C->Name;
+	const size_t Dot = C->Name.rfind('.');
+	Out = Dot == std::string::npos ? C->Name : C->Name.substr(Dot + 1);
 	return true;
 }
 
@@ -376,7 +435,7 @@ static bool SerializeQuantifiedSubqueryPayload(const ExpressionAST *Lhs, const Q
 	return true;
 }
 
-bool ExtractOneComparison(const ExpressionAST *Expr, RowTriple &Out) {
+bool ExtractOneComparison(const ExpressionAST *Expr, RowTriple &Out, WhereMatCtx *Ctx = nullptr) {
 	if(!Expr)
 		return false;
 	const auto *Bin = dynamic_cast<const BinaryOpAST *>(Expr);
@@ -402,13 +461,15 @@ bool ExtractOneComparison(const ExpressionAST *Expr, RowTriple &Out) {
 	std::string Rhs;
 
 	if(LCol && (RLit || RBool || RNullRhs)) {
-		Col = LCol->Name;
+		if(!ColumnNameExpr(Bin->LHS.get(), Col))
+			return false;
 		if(RBool)
 			Rhs = RBool->Value ? "1" : "0";
 		else
 			Rhs = RLit ? RLit->Value : std::string();
 	} else if((LLit || LBool || LNullLhs) && RCol) {
-		Col = RCol->Name;
+		if(!ColumnNameExpr(Bin->RHS.get(), Col))
+			return false;
 		if(LBool)
 			Rhs = LBool->Value ? "1" : "0";
 		else
@@ -424,10 +485,12 @@ bool ExtractOneComparison(const ExpressionAST *Expr, RowTriple &Out) {
 		else if(Op != "=" && Op != "==" && Op != "!=")
 			return false;
 	} else if(LCol && RCol) {
-		Col = LCol->Name;
+		std::string RcolBare;
+		if(!ColumnNameExpr(Bin->LHS.get(), Col) || !ColumnNameExpr(Bin->RHS.get(), RcolBare))
+			return false;
 		if(Op == "==")
 			Op = "=";
-		Rhs = std::string(kAstRhsColMarker) + RCol->Name;
+		Rhs = std::string(kAstRhsColMarker) + RcolBare;
 	} else if(QSub) {
 		if(Op != "=" && Op != "==" && Op != "!=" && Op != "<" && Op != "<=" && Op != ">" && Op != ">=")
 			return false;
@@ -436,6 +499,66 @@ bool ExtractOneComparison(const ExpressionAST *Expr, RowTriple &Out) {
 			return false;
 		Out = RowTriple(std::string(kQuantifiedSubqueryCol), std::move(Op), std::move(Payload));
 		return true;
+	} else if(const auto *LSf = dynamic_cast<const ScalarFuncExprAST *>(Bin->LHS.get())) {
+		if((RLit || RBool || RNullRhs) && LSf->Fn == ScalarSqlFn::RegexpExtract && LSf->Args.size() >= 2 &&
+		   LSf->Args.size() <= 3) {
+			if(!ColumnNameExpr(LSf->Args[0].get(), Col))
+				return false;
+			std::string Pat;
+			if(!LiteralOrNullCsv(LSf->Args[1].get(), Pat))
+				return false;
+			std::string Group = "1";
+			if(LSf->Args.size() == 3 && !LiteralOrNullCsv(LSf->Args[2].get(), Group))
+				return false;
+			if(RBool)
+				Rhs = Pat + "\x1E" + Group + "\x1E" + (RBool->Value ? "1" : "0");
+			else
+				Rhs = Pat + "\x1E" + Group + "\x1E" + (RLit ? RLit->Value : std::string());
+			if(Bin->Op == "!=")
+				Op = "NOT REGEXP_EXTRACT";
+			else if(Bin->Op != "=" && Bin->Op != "==")
+				return false;
+			else
+				Op = "REGEXP_EXTRACT";
+		} else if((RLit || RBool) && LSf->Fn == ScalarSqlFn::XmlValid && LSf->Args.size() == 1) {
+			if(!ColumnNameExpr(LSf->Args[0].get(), Col))
+				return false;
+			if(RBool)
+				Rhs = RBool->Value ? "1" : "0";
+			else
+				Rhs = RLit->Value;
+			if(Bin->Op == "!=")
+				Op = "NOT XML_VALID";
+			else if(Bin->Op != "=" && Bin->Op != "==")
+				return false;
+			else
+				Op = "XML_VALID";
+		} else if((RLit || RBool) && LSf->Fn == ScalarSqlFn::JsonExtract && LSf->Args.size() == 2) {
+			if(!ColumnNameExpr(LSf->Args[0].get(), Col))
+				return false;
+			std::string Path;
+			if(!LiteralOrNullCsv(LSf->Args[1].get(), Path))
+				return false;
+			if(RBool)
+				Rhs = Path + "\x1E" + (RBool->Value ? "1" : "0");
+			else
+				Rhs = Path + "\x1E" + RLit->Value;
+			if(Bin->Op == "!=")
+				Op = "NOT JSON_EXTRACT";
+			else if(Bin->Op != "=" && Bin->Op != "==")
+				return false;
+			else
+				Op = "JSON_EXTRACT";
+		} else if(Ctx && Ctx->Instructions && (RLit || RBool || RNullRhs)) {
+			Col = MaterializeWhereExpr(Bin->LHS.get(), *Ctx);
+			if(Col.empty())
+				return false;
+			if(RBool)
+				Rhs = RBool->Value ? "1" : "0";
+			else
+				Rhs = RLit ? RLit->Value : std::string();
+		} else
+			return false;
 	} else if(LRow && RRow) {
 		if(Op != "=" && Op != "==" && Op != "!=" && Op != "<" && Op != "<=" && Op != ">" && Op != ">=")
 			return false;
@@ -449,15 +572,17 @@ bool ExtractOneComparison(const ExpressionAST *Expr, RowTriple &Out) {
 
 	if(Col.empty() || Op.empty())
 		return false;
-	if(Op != "=" && Op != "==" && Op != "!=" && Op != "<" && Op != "<=" && Op != ">" && Op != ">=")
+	if(Op != "REGEXP_EXTRACT" && Op != "NOT REGEXP_EXTRACT" && Op != "XML_VALID" && Op != "NOT XML_VALID" &&
+	   Op != "JSON_EXTRACT" && Op != "NOT JSON_EXTRACT" && Op != "=" && Op != "==" && Op != "!=" && Op != "<" &&
+	   Op != "<=" && Op != ">" && Op != ">=")
 		return false;
 	Out = RowTriple(std::move(Col), std::move(Op), std::move(Rhs));
 	return true;
 }
 
-bool AtomToTriples(const ExpressionAST *Expr, std::vector<RowTriple> &Out) {
+bool AtomToTriples(const ExpressionAST *Expr, std::vector<RowTriple> &Out, WhereMatCtx *Ctx = nullptr) {
 	RowTriple One;
-	if(ExtractOneComparison(Expr, One)) {
+	if(ExtractOneComparison(Expr, One, Ctx)) {
 		Out.push_back(std::move(One));
 		return true;
 	}
@@ -470,6 +595,13 @@ bool AtomToTriples(const ExpressionAST *Expr, std::vector<RowTriple> &Out) {
 			if(!LiteralOrNullCsv(Sf->Args[1].get(), Pat))
 				return false;
 			Out.emplace_back(Col, "REGEXP", Pat);
+			return true;
+		}
+		if(Ctx && Ctx->Instructions) {
+			const std::string Col = MaterializeWhereExpr(Expr, *Ctx);
+			if(Col.empty())
+				return false;
+			Out.emplace_back(Col, "=", "1");
 			return true;
 		}
 	}
@@ -488,10 +620,16 @@ bool AtomToTriples(const ExpressionAST *Expr, std::vector<RowTriple> &Out) {
 		std::string Blob;
 		PackDnfOperandsBlob(Inner, Blob);
 		std::string Payload;
-		Payload.reserve(2 + Blob.size());
+		Payload.reserve(2 + Blob.size() + Ep->SemiJoinOuterKey.size() + Ep->SemiJoinInnerKey.size() + 4);
 		Payload.push_back(Ep->Negated ? '1' : '0');
 		Payload.push_back('\x1E');
 		Payload.append(Blob);
+		if(Ep->SemiJoinRewritten()) {
+			Payload.push_back('\x1D');
+			Payload.append(Ep->SemiJoinOuterKey);
+			Payload.push_back('\x1D');
+			Payload.append(Ep->SemiJoinInnerKey);
+		}
 		Out.emplace_back(std::string(kExistCol), Ep->InnerTable, std::move(Payload));
 		return true;
 	}
@@ -538,9 +676,36 @@ bool AtomToTriples(const ExpressionAST *Expr, std::vector<RowTriple> &Out) {
 
 	const auto *Bin = dynamic_cast<const BinaryOpAST *>(Expr);
 	if(Bin && (Bin->Op == "IN" || Bin->Op == "NOT IN")) {
+		if(const auto *LSf = dynamic_cast<const ScalarFuncExprAST *>(Bin->LHS.get())) {
+			if(LSf->Fn == ScalarSqlFn::JsonExtract && LSf->Args.size() == 2) {
+				std::string Col;
+				std::string Path;
+				if(!ColumnNameExpr(LSf->Args[0].get(), Col))
+					return false;
+				if(!LiteralOrNullCsv(LSf->Args[1].get(), Path))
+					return false;
+				const auto *Rhs = dynamic_cast<const InValuesAST *>(Bin->RHS.get());
+				if(!Rhs || Rhs->Values.empty())
+					return false;
+				std::ostringstream O;
+				O << Path << '\x1F';
+				for(size_t I = 0; I < Rhs->Values.size(); ++I) {
+					if(I)
+						O << '\x1E';
+					O << Rhs->Values[I];
+				}
+				Out.emplace_back(Col, Bin->Op == "NOT IN" ? kOpNotIn : kOpIn, std::move(O).str());
+				return true;
+			}
+		}
 		std::string Col;
-		if(!ColumnNameExpr(Bin->LHS.get(), Col))
-			return false;
+		if(!ColumnNameExpr(Bin->LHS.get(), Col)) {
+			if(!Ctx || !Ctx->Instructions)
+				return false;
+			Col = MaterializeWhereExpr(Bin->LHS.get(), *Ctx);
+			if(Col.empty())
+				return false;
+		}
 		const auto *Rhs = dynamic_cast<const InValuesAST *>(Bin->RHS.get());
 		if(!Rhs || Rhs->Values.empty())
 			return false;
@@ -603,7 +768,8 @@ void FlattenAndAtoms(const ExpressionAST *Root, std::vector<const ExpressionAST 
 	Out.push_back(Root);
 }
 
-bool BuildWhereDnf(const ExpressionAST *WhereRoot, std::vector<std::vector<RowTriple>> &OutBranches) {
+bool BuildWhereDnf(const ExpressionAST *WhereRoot, std::vector<std::vector<RowTriple>> &OutBranches,
+                   WhereMatCtx *Ctx) {
 	std::vector<const ExpressionAST *> OrBranches;
 	FlattenOrBranches(WhereRoot, OrBranches);
 	if(OrBranches.empty())
@@ -613,7 +779,7 @@ bool BuildWhereDnf(const ExpressionAST *WhereRoot, std::vector<std::vector<RowTr
 		FlattenAndAtoms(OrNode, Atoms);
 		std::vector<RowTriple> Conj;
 		for(const ExpressionAST *A : Atoms) {
-			if(!AtomToTriples(A, Conj))
+			if(!AtomToTriples(A, Conj, Ctx))
 				return false;
 		}
 		OutBranches.push_back(std::move(Conj));
@@ -684,8 +850,10 @@ static void EmitBinaryArithForColumn(const BinaryOpAST &B, const std::string &Ou
                                      BytecodeScratch &Instructions);
 
 static std::string MaterializeScalarToColumn(const ExpressionAST *E, BytecodeScratch &Instructions) {
-	if(const auto *C = dynamic_cast<const ColumnRefAST *>(E))
-		return C->Name;
+	if(const auto *C = dynamic_cast<const ColumnRefAST *>(E)) {
+		const size_t Dot = C->Name.rfind('.');
+		return Dot == std::string::npos ? C->Name : C->Name.substr(Dot + 1);
+	}
 	const std::string Tmp = std::string("_sxt") + std::to_string(GScalarMaterializeCounter++);
 	if(const auto *L = dynamic_cast<const LiteralAST *>(E)) {
 		std::vector<CaseExprAST::Arm> NoArms;
@@ -733,8 +901,44 @@ static std::string MaterializeScalarToColumn(const ExpressionAST *E, BytecodeScr
 	FailCodegen("Unsupported scalar expression in COALESCE/NVL2/CAST projection.");
 }
 
+static std::string MaterializeWhereExpr(const ExpressionAST *E, WhereMatCtx &Ctx) {
+	if(!E || !Ctx.Instructions)
+		return {};
+	std::string Col;
+	if(ColumnNameExpr(E, Col))
+		return Col;
+	return MaterializeScalarToColumn(E, *Ctx.Instructions);
+}
+
+static void EmitMatchForColumn(const BinaryOpAST &B, const std::string &OutCol, BytecodeScratch &Instructions) {
+	if(B.Op != "MATCH" && B.Op != "NOT MATCH")
+		FailCodegen("EmitMatchForColumn: expected MATCH or NOT MATCH.");
+	std::string Col;
+	std::string Query;
+	if(!ColumnNameExpr(B.LHS.get(), Col))
+		FailCodegen("MATCH requires a column reference on the left-hand side.");
+	if(!LiteralOrNullCsv(B.RHS.get(), Query))
+		FailCodegen("MATCH requires a string literal query.");
+	Instruction I;
+	I.Opcode_ = Opcode::SCALAR_FUNC_EVAL;
+	I.Operands.push_back(OutCol);
+	I.Operands.push_back(static_cast<int64_t>(ScalarSqlFn::TextMatch));
+	I.Operands.push_back(static_cast<int64_t>(2));
+	I.Operands.push_back(static_cast<int64_t>(0));
+	I.Operands.push_back(Col);
+	I.Operands.push_back(static_cast<int64_t>(0));
+	I.Operands.push_back(Query);
+	if(B.Op == "NOT MATCH")
+		FailCodegen("NOT MATCH projection is not supported in this dialect.");
+	Instructions.push_back(std::move(I));
+}
+
 static void EmitBinaryArithForColumn(const BinaryOpAST &B, const std::string &OutCol,
                                      BytecodeScratch &Instructions) {
+	if(B.Op == "MATCH" || B.Op == "NOT MATCH") {
+		EmitMatchForColumn(B, OutCol, Instructions);
+		return;
+	}
 	if(B.Op != "+" && B.Op != "-" && B.Op != "*" && B.Op != "/" && B.Op != "//")
 		FailCodegen("Unsupported arithmetic operator in SELECT projection.");
 	const std::string L = MaterializeScalarToColumn(B.LHS.get(), Instructions);
@@ -947,12 +1151,13 @@ static void EmitScalarFuncEvalInstruction(const ScalarFuncExprAST &F, const std:
 	for(const auto &A : F.Args) {
 		if(!A)
 			FailCodegen("Internal: scalar builtin null argument.");
-		if(dynamic_cast<const ScalarFuncExprAST *>(A.get())) {
+		if(dynamic_cast<const LiteralAST *>(A.get()) || dynamic_cast<const ColumnRefAST *>(A.get()) ||
+		   dynamic_cast<const NullLiteralAST *>(A.get())) {
+			AppendCaseScalarPayload(I, A.get());
+		} else {
 			const std::string SrcCol = MaterializeScalarToColumn(A.get(), Instructions);
 			I.Operands.push_back(static_cast<int64_t>(1));
 			I.Operands.push_back(SrcCol);
-		} else {
-			AppendCaseScalarPayload(I, A.get());
 		}
 	}
 	Instructions.push_back(std::move(I));
@@ -1283,6 +1488,195 @@ Opcode SqlJoinToOpcode(SqlJoinKind K) {
 
 } // namespace
 
+static bool WhereHasQualifiedColumnRefs(const ExpressionAST *Root) {
+	if(Root == nullptr)
+		return false;
+	if(const auto *C = dynamic_cast<const ColumnRefAST *>(Root))
+		return C->Name.find('.') != std::string::npos;
+	if(const auto *B = dynamic_cast<const BinaryOpAST *>(Root))
+		return WhereHasQualifiedColumnRefs(B->LHS.get()) || WhereHasQualifiedColumnRefs(B->RHS.get());
+	return false;
+}
+
+static bool EnvSemistructuredVmCodegen() noexcept {
+	const char *V = std::getenv("ASTRALDB_SEMISTRUCTURED_VM");
+	return V != nullptr && V[0] != '0' && V[0] != 'n' && V[0] != 'N';
+}
+
+static void EmitSemistructuredTopkBulk(const FusionPlan &Plan, const std::string &Table, BytecodeScratch &Instructions) {
+	Instruction Inst;
+	Inst.Opcode_ = EnvSemistructuredVmCodegen() ? Opcode::FUSED_SEMISTRUCTURED_SCAN : Opcode::SEMISTRUCTURED_TOPK_BULK;
+	Inst.Operands.push_back(Table);
+	Inst.Operands.push_back(static_cast<int64_t>(Plan.Filters.size()));
+	for(const FilterTriple &F : Plan.Filters) {
+		Inst.Operands.push_back(F.Column);
+		Inst.Operands.push_back(F.Op);
+		Inst.Operands.push_back(F.Literal);
+	}
+	Inst.Operands.push_back(static_cast<int64_t>(Plan.Projections.size()));
+	for(const FusedProjectionSpec &P : Plan.Projections) {
+		Inst.Operands.push_back(P.OutColumn);
+		Inst.Operands.push_back(static_cast<int64_t>(P.FnTag));
+		Inst.Operands.push_back(static_cast<int64_t>(P.Args.size()));
+		for(const auto &[Kind, Pay] : P.Args) {
+			Inst.Operands.push_back(Kind);
+			Inst.Operands.push_back(Pay);
+		}
+	}
+	Inst.Operands.push_back(Plan.OrderColumn);
+	Inst.Operands.push_back(static_cast<int64_t>(Plan.OrderAscending ? 1 : 0));
+	Inst.Operands.push_back(Plan.Limit);
+	AppendInstruction(Instructions, std::move(Inst));
+}
+
+static void EmitFusedPlanInstructions(const FusionPlan &Plan, const std::string &Dest, BytecodeScratch &Instructions) {
+	if(Plan.Kind == FusionKind::ScanFilterProjectLimit) {
+		EmitSemistructuredTopkBulk(Plan, Dest, Instructions);
+		return;
+	}
+	Instruction Inst;
+	switch(Plan.Kind) {
+	case FusionKind::ScanFilterAgg:
+	case FusionKind::ScanFilterAggLimit:
+		Inst.Opcode_ = Opcode::FUSED_SCAN_FILTER_AGG;
+		break;
+	default:
+		Inst.Opcode_ = Opcode::FUSED_SCAN_FILTER;
+		break;
+	}
+	Inst.Operands.push_back(Dest);
+	Inst.Operands.push_back(Plan.Table);
+	Inst.Operands.push_back(static_cast<int64_t>(Plan.Filters.size()));
+	for(const FilterTriple &F : Plan.Filters) {
+		Inst.Operands.push_back(F.Column);
+		Inst.Operands.push_back(F.Op);
+		Inst.Operands.push_back(F.Literal);
+	}
+	if(Inst.Opcode_ == Opcode::FUSED_SCAN_FILTER_AGG) {
+		Inst.Operands.push_back(static_cast<int64_t>(Plan.GroupKeys.size()));
+		for(const std::string &K : Plan.GroupKeys)
+			Inst.Operands.push_back(K);
+		Inst.Operands.push_back(Plan.SumColumn);
+		Inst.Operands.push_back(Plan.SumOutputColumn);
+	}
+	AppendInstruction(Instructions, std::move(Inst));
+}
+
+static void EmitWhereFilterInstructions(const ExpressionAST *WhereRoot, BytecodeScratch &Instructions) {
+	WhereMatCtx Wm;
+	Wm.Instructions = &Instructions;
+	std::vector<std::vector<RowTriple>> Branches;
+	if(!BuildWhereDnf(WhereRoot, Branches, &Wm))
+		FailCodegen(
+		    "WHERE clause shape is not supported yet for this statement (predicate grammar extension required).");
+	Instructions.push_back(MakeFilterDnf(Branches));
+}
+
+struct RelationBinding {
+	std::string Alias;
+	std::string Table;
+};
+
+static bool IsWhereAndExpr(const ExpressionAST *E) {
+	const auto *B = dynamic_cast<const BinaryOpAST *>(E);
+	return B && B->Op == "AND";
+}
+
+static bool IsWhereOrExpr(const ExpressionAST *E) {
+	const auto *B = dynamic_cast<const BinaryOpAST *>(E);
+	return B && B->Op == "OR";
+}
+
+static bool CollectWhereConjunctionAtoms(const ExpressionAST *E, std::vector<const ExpressionAST *> &Out) {
+	if(!E)
+		return true;
+	if(IsWhereAndExpr(E)) {
+		const auto *B = static_cast<const BinaryOpAST *>(E);
+		return CollectWhereConjunctionAtoms(B->LHS.get(), Out) &&
+		       CollectWhereConjunctionAtoms(B->RHS.get(), Out);
+	}
+	Out.push_back(E);
+	return true;
+}
+
+static void AddRelationBinding(std::vector<RelationBinding> &Rels, const std::string &Alias,
+                              const std::string &Table) {
+	std::string Key = Alias.empty() ? Table : Alias;
+	Rels.push_back({std::move(Key), Table});
+}
+
+static const RelationBinding *ResolveQualifiedColumnRelation(const ColumnRefAST &Col,
+                                                             const std::vector<RelationBinding> &Rels) {
+	const auto Dot = Col.Name.find('.');
+	if(Dot == std::string::npos)
+		return nullptr;
+	const std::string Alias = Col.Name.substr(0, Dot);
+	for(const RelationBinding &R : Rels)
+		if(R.Alias == Alias)
+			return &R;
+	return nullptr;
+}
+
+/** Push \c FILTER_DNF onto each joined relation that owns qualified \c alias.column predicates. */
+static bool TryEmitQualifiedPreJoinWhereFilters(const ExpressionAST *WhereRoot, const std::string &FromTable,
+                                                const std::string &FromAlias,
+                                                const std::vector<JoinClause> &Joins,
+                                                BytecodeScratch &Instructions) {
+	if(!WhereRoot || IsWhereOrExpr(WhereRoot))
+		return false;
+	std::vector<const ExpressionAST *> Atoms;
+	if(!CollectWhereConjunctionAtoms(WhereRoot, Atoms))
+		return false;
+	std::vector<RelationBinding> Rels;
+	AddRelationBinding(Rels, FromAlias, FromTable);
+	for(const JoinClause &J : Joins)
+		AddRelationBinding(Rels, J.RightAlias, J.RightTable);
+	std::unordered_map<std::string, std::vector<const ExpressionAST *>> ByTable;
+	for(const ExpressionAST *Atom : Atoms) {
+		const auto *Bin = dynamic_cast<const BinaryOpAST *>(Atom);
+		if(!Bin)
+			return false;
+		const auto *LCol = dynamic_cast<const ColumnRefAST *>(Bin->LHS.get());
+		if(!LCol)
+			return false;
+		const RelationBinding *Rel = ResolveQualifiedColumnRelation(*LCol, Rels);
+		if(!Rel)
+			return false;
+		ByTable[Rel->Table].push_back(Atom);
+	}
+	for(const auto &[Tbl, Parts] : ByTable) {
+		std::vector<std::vector<RowTriple>> Branches;
+		Branches.emplace_back();
+		for(const ExpressionAST *P : Parts) {
+			RowTriple One;
+			if(!ExtractOneComparison(P, One))
+				return false;
+			Branches.back().push_back(std::move(One));
+		}
+		const std::string Phys = ResolveRelationLogicalName(Tbl, Instructions);
+		AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Phys));
+		Instructions.push_back(MakeFilterDnf(Branches));
+		AppendInstruction(Instructions, MakeInstruction(Opcode::POP));
+	}
+	return true;
+}
+
+/** Filter base table before joins; \c Work must be on stack only after \c PUSH (materializations need row store). */
+static bool TryEmitPreJoinWhereFilter(const ExpressionAST *WhereRoot, const std::string &Work,
+                                      const std::string &FromTable, const std::string &FromAlias,
+                                      const std::vector<JoinClause> &Joins, BytecodeScratch &Instructions) {
+	if(!WhereRoot)
+		return false;
+	if(WhereHasQualifiedColumnRefs(WhereRoot))
+		return TryEmitQualifiedPreJoinWhereFilters(WhereRoot, FromTable, FromAlias, Joins, Instructions);
+	if(!Joins.empty())
+		return false;
+	AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Work));
+	EmitWhereFilterInstructions(WhereRoot, Instructions);
+	AppendInstruction(Instructions, MakeInstruction(Opcode::POP));
+	return true;
+}
+
 void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const std::string &JoinDestPrefix,
                                      BytecodeScratch &Instructions) const {
 	if(StorageHint_.has_value())
@@ -1300,7 +1694,10 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 		FailCodegen("Internal: COUNT(DISTINCT) missing column name.");
 	if(AggKind() == GroupAggMode::CountDistinct && Grp.empty())
 		FailCodegen("COUNT(DISTINCT column) requires a GROUP BY clause in this SQL dialect.");
-	if((AggKind() == GroupAggMode::CountStar || HeuristicAgg) && Grp.empty())
+	const bool ScalarCountStar =
+	    Grp.empty() && ComboAggs().empty() && OlapKind() == GroupOlapModifier::None &&
+	    (AggKind() == GroupAggMode::CountStar || HeuristicAgg);
+	if((AggKind() == GroupAggMode::CountStar || HeuristicAgg) && Grp.empty() && !ScalarCountStar)
 		FailCodegen("COUNT(*) requires a GROUP BY clause in this SQL dialect.");
 	if(!ComboAggs().empty() && Grp.empty())
 		FailCodegen("SUM, MIN, MAX, and AVG require a GROUP BY clause when used in the SELECT list.");
@@ -1311,12 +1708,47 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 	if(OlapKind() == GroupOlapModifier::GroupingSets && GroupingSets().empty())
 		FailCodegen("GROUPING SETS requires at least one grouping set.");
 
+	if(HasFusedPlan() && FusedPlan().Kind == FusionKind::ScanFilterProjectLimit && JoinSpecs().empty() &&
+	   WindowSpecs().empty() && !ConnectBy_.has_value() && !MatchRecognize_.has_value() && !DistinctSelected() &&
+	   HavingRoot() == nullptr && SelectOffsetValue() <= 0) {
+		for(const auto &Column : Columns_) {
+			if(Column.rfind(kColumnsExpandPrefix, 0) == 0)
+				continue;
+			AppendInstruction(Instructions, MakeInstruction(Opcode::SELECT, Column));
+		}
+		std::string Work = ResolveRelationLogicalName(MaterializedTable, Instructions);
+		const std::string FromBase = ResolveRelationLogicalName(Table_, Instructions);
+		if(Work != FromBase)
+			AppendInstruction(Instructions, MakeInstruction(Opcode::CLONE_TABLE, Work, FromBase));
+		AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Work));
+		EmitFusedPlanInstructions(FusedPlan(), Work, Instructions);
+		AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Work));
+		return;
+	}
+
+	if(HasFusedPlan() && JoinSpecs().empty() && WindowSpecs().empty() && !ConnectBy_.has_value() &&
+	   !MatchRecognize_.has_value() && OrderBySpecs().empty() && !DistinctSelected() && HavingRoot() == nullptr &&
+	   SelectLimitValue() < 0 && SelectOffsetValue() <= 0) {
+		for(const auto &Column : Columns_) {
+			if(Column.rfind(kColumnsExpandPrefix, 0) == 0)
+				continue;
+			AppendInstruction(Instructions, MakeInstruction(Opcode::SELECT, Column));
+		}
+		EmitFusedPlanInstructions(FusedPlan(), MaterializedTable, Instructions);
+		AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, MaterializedTable));
+		return;
+	}
+
 	std::string Work = ResolveRelationLogicalName(MaterializedTable, Instructions);
 	std::string FromBase = ResolveRelationLogicalName(Table_, Instructions);
 	if(IsDialectDualTable(Table_))
 		FromBase = std::string(kDialectDualInternal);
 	if(Work != FromBase)
 		AppendInstruction(Instructions, MakeInstruction(Opcode::CLONE_TABLE, Work, FromBase));
+	bool WherePushedBeforeJoins = false;
+	if(WhereRoot() && !JoinSpecs().empty())
+		WherePushedBeforeJoins =
+		    TryEmitPreJoinWhereFilter(WhereRoot(), Work, Table_, SourceTableAlias(), JoinSpecs(), Instructions);
 	for(size_t Ij = 0; Ij < JoinSpecs().size(); ++Ij) {
 		const JoinClause &Jc = JoinSpecs()[Ij];
 		if(Jc.IsLateral)
@@ -1332,6 +1764,11 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 			Ji.Operands.push_back(Pr.first);
 			Ji.Operands.push_back(Pr.second);
 		}
+		if(ScalarCountStar && JoinSpecs().size() == 1 && Jc.Kind == SqlJoinKind::Inner && !WhereRoot())
+			Ji.Operands.push_back(int64_t{1});
+		else if(!Grp.empty() && Grp.size() == 2 && !ComboAggs().empty() && OlapKind() == GroupOlapModifier::None &&
+		        Jc.Kind == SqlJoinKind::Inner)
+			Ji.Operands.push_back(int64_t{2});
 		Instructions.push_back(std::move(Ji));
 		Work = Dst;
 	}
@@ -1395,13 +1832,8 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 	}
 	AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Work));
 
-	if(WhereRoot()) {
-		std::vector<std::vector<RowTriple>> Branches;
-		if(!BuildWhereDnf(WhereRoot(), Branches))
-			FailCodegen(
-			    "WHERE clause shape is not supported yet for this statement (predicate grammar extension required).");
-		Instructions.push_back(MakeFilterDnf(Branches));
-	}
+	if(WhereRoot() && !WherePushedBeforeJoins)
+		EmitWhereFilterInstructions(WhereRoot(), Instructions);
 
 	if(ConnectBy()) {
 		const ConnectBySpec &Cb = *ConnectBy();
@@ -1426,9 +1858,11 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 	if(DistinctSelected())
 		AppendInstruction(Instructions, MakeInstruction(Opcode::DEDUP_ROWS));
 
-	if(!Grp.empty()) {
+	if(!Grp.empty() || ScalarCountStar) {
 		Instruction G;
-		if(OlapKind() == GroupOlapModifier::Rollup)
+		if(ScalarCountStar)
+			G.Opcode_ = Opcode::GROUP_BY;
+		else if(OlapKind() == GroupOlapModifier::Rollup)
 			G.Opcode_ = Opcode::ROLLUP;
 		else if(OlapKind() == GroupOlapModifier::Cube)
 			G.Opcode_ = Opcode::CUBE;
@@ -1449,11 +1883,11 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 				G.Operands.push_back(*CountDistinctColumn());
 				G.Operands.push_back(CountStarOutCol());
 			} else {
-				G.Operands.push_back(static_cast<int64_t>(AggCount ? 1 : 0));
+				G.Operands.push_back(static_cast<int64_t>((ScalarCountStar || AggCount) ? 1 : 0));
 				G.Operands.push_back(static_cast<int64_t>(Grp.size()));
 				for(const auto &Gc : Grp)
 					G.Operands.push_back(Gc);
-				if(AggCount)
+				if(ScalarCountStar || AggCount)
 					G.Operands.push_back(CountStarOutCol());
 			}
 		} else {
@@ -1514,11 +1948,12 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 		WI.Operands.push_back(static_cast<int64_t>(Ws.PartitionBy.size()));
 		for(const auto &K : Ws.PartitionBy)
 			WI.Operands.push_back(K);
-		WI.Operands.push_back(Ws.OrderColumn);
+		const std::string OrderCol = MapWindowAggColumnRef(Ws.OrderColumn, *this);
+		WI.Operands.push_back(OrderCol);
 		WI.Operands.push_back(static_cast<int64_t>(Ws.OrderAscending ? 1 : 0));
 		WI.Operands.push_back(Ws.OutputColumn);
 		WI.Operands.push_back(KindTag);
-		WI.Operands.push_back(Ws.SourceColumn);
+		WI.Operands.push_back(MapWindowAggColumnRef(Ws.SourceColumn, *this));
 		WI.Operands.push_back(Ws.FrameOffset);
 		WI.Operands.push_back(static_cast<int64_t>(Ws.HasExplicitFrame ? (Ws.FrameUnit == WindowFrameUnit::Range ? 2 : 1) : 0));
 		if(Ws.HasExplicitFrame) {
@@ -1566,9 +2001,26 @@ void SelectAST::EmitRelationPipeline(const std::string &MaterializedTable, const
 }
 
 void SelectAST::EmitOrderingFinalize(BytecodeScratch &Instructions) const {
-	for(const auto &[Column, Ascending] : OrderBySpecs()) {
-		AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, static_cast<int64_t>(Ascending ? 1 : 0)));
-		AppendInstruction(Instructions, MakeInstruction(Opcode::ORDER_BY, Column));
+	if(HasFusedPlan() && FusedPlan().Kind == FusionKind::ScanFilterProjectLimit) {
+		size_t StaticSelectCols = 0;
+		bool HasDynamicColumns = false;
+		for(const auto &Column : Columns_) {
+			if(Column.rfind(kColumnsExpandPrefix, 0) == 0)
+				HasDynamicColumns = true;
+			else
+				++StaticSelectCols;
+		}
+		if(HasDynamicColumns)
+			AppendInstruction(Instructions, MakeInstruction(Opcode::SELECT, static_cast<int64_t>(StaticSelectCols),
+			                                                static_cast<int64_t>(1)));
+		else
+			AppendInstruction(Instructions, MakeInstruction(Opcode::SELECT, static_cast<int64_t>(Columns_.size())));
+		return;
+	}
+	for(const auto &Spec : OrderBySpecs()) {
+		AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, static_cast<int64_t>(Spec.Ascending ? 1 : 0)));
+		AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, static_cast<int64_t>(Spec.NullsFirst ? 1 : 0)));
+		AppendInstruction(Instructions, MakeInstruction(Opcode::ORDER_BY, Spec.Column));
 	}
 
 	const int64_t Lim = SelectLimitValue();
@@ -1668,9 +2120,10 @@ void CompoundSelectAST::EmitBytecode(BytecodeScratch &Instructions) const {
 	}
 
 	AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, Acc));
-	for(const auto &[Column, Ascending] : OrderByColumns) {
-		AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, static_cast<int64_t>(Ascending ? 1 : 0)));
-		AppendInstruction(Instructions, MakeInstruction(Opcode::ORDER_BY, Column));
+	for(const auto &Spec : OrderByColumns) {
+		AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, static_cast<int64_t>(Spec.Ascending ? 1 : 0)));
+		AppendInstruction(Instructions, MakeInstruction(Opcode::PUSH, static_cast<int64_t>(Spec.NullsFirst ? 1 : 0)));
+		AppendInstruction(Instructions, MakeInstruction(Opcode::ORDER_BY, Spec.Column));
 	}
 	if(Offset > 0 && Limit >= 0)
 		AppendInstruction(Instructions, MakeInstruction(Opcode::SLICE_RANGE, Offset, Limit));
@@ -1691,13 +2144,30 @@ void WithSelectAST::EmitBytecode(BytecodeScratch& Instructions) const {
 		if(!Ct.IsRecursive())
 			continue;
 
+		if(Ct.PreferHierarchyScan) {
+			AppendInstruction(Instructions,
+			                  MakeInstruction(Opcode::HIERARCHY_PATH_SCAN, Work,
+			                                  ResolveRelationLogicalName(Ct.Anchor->SourceTableName(), Instructions),
+			                                  Ct.HierarchyIdCol.empty() ? std::string("id") : Ct.HierarchyIdCol,
+			                                  Ct.HierarchyParentCol.empty() ? std::string("parent_id") :
+			                                                                  Ct.HierarchyParentCol));
+			continue;
+		}
+
 		const std::string Delta = Work + "_delta";
 		const size_t LoopStart = Instructions.size();
 		Ct.RecursiveStep->EmitBytecodeForScratchTable(Delta, Instructions);
-		AppendInstruction(Instructions,
-		                   MakeInstruction(Opcode::RECURSIVE_CTE_FIXPOINT, Work, Delta,
-		                                    static_cast<int64_t>(Limits::MaxCteRecursionDepth),
-		                                    static_cast<int64_t>(LoopStart)));
+		if(Ct.PreferBfs) {
+			AppendInstruction(Instructions,
+			                   MakeInstruction(Opcode::RECURSIVE_CTE_BFS, Work, Delta,
+			                                    static_cast<int64_t>(Limits::MaxCteRecursionDepth),
+			                                    static_cast<int64_t>(LoopStart)));
+		} else {
+			AppendInstruction(Instructions,
+			                   MakeInstruction(Opcode::RECURSIVE_CTE_FIXPOINT, Work, Delta,
+			                                    static_cast<int64_t>(Limits::MaxCteRecursionDepth),
+			                                    static_cast<int64_t>(LoopStart)));
+		}
 	}
 	if(Main)
 		Main->EmitBytecode(Instructions);
@@ -1822,7 +2292,7 @@ void MergeAST::EmitBytecode(BytecodeScratch &Instructions) const {
 void BulkInsertAST::EmitBytecode(BytecodeScratch& Instructions) const {
 	if(Count <= 0)
 		FailCodegen("BULK INSERT row count must be a positive integer.");
-	if(static_cast<std::uint64_t>(Count) > Limits::MaxBulkInsertRowsBench)
+	if(static_cast<std::uint64_t>(Count) > RuntimeLimits::MaxBulkInsertRowsBench())
 		FailCodegen("BULK INSERT row count exceeds the configured maximum (see server limits).");
 	(void)Columns;
 	AppendInstruction(Instructions,
@@ -2046,9 +2516,32 @@ void GraphTraverseAST::EmitBytecode(BytecodeScratch &Instructions) const {
 }
 
 void GraphMatchAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	std::string LabelFilter = EdgeLabelFilter;
+	std::string EffectiveAnchor = AnchorVertexId;
+	if(LabelFilter.empty() && !VertexWhereCol.empty() && VertexWhereCol != "label") {
+		LabelFilter = VertexWhereValue;
+		EffectiveAnchor.clear();
+	}
+	if(Segments.size() > 1) {
+		Instruction I;
+		I.Opcode_ = Opcode::GRAPH_MATCH_BULK;
+		I.Operands.push_back(GraphName);
+		I.Operands.push_back(ResultTable);
+		I.Operands.push_back(EffectiveAnchor);
+		I.Operands.push_back(LabelFilter);
+		I.Operands.push_back(static_cast<int64_t>(Segments.size()));
+		for(const GraphMatchPatternSegment &S : Segments) {
+			I.Operands.push_back(S.MinHops);
+			I.Operands.push_back(S.MaxHops);
+			I.Operands.push_back(static_cast<int64_t>(S.Reverse ? 1 : 0));
+			I.Operands.push_back(static_cast<int64_t>(S.EndOnProduct ? 1 : 0));
+		}
+		AppendInstruction(Instructions, std::move(I));
+		return;
+	}
 	AppendInstruction(Instructions,
-	                  MakeInstruction(Opcode::GRAPH_MATCH, GraphName, EdgeLabelFilter, ResultTable, MinHops, MaxHops,
-	                                  AnchorVertexId, static_cast<int64_t>(Reverse ? 1 : 0)));
+	                  MakeInstruction(Opcode::GRAPH_MATCH, GraphName, LabelFilter, ResultTable, MinHops, MaxHops,
+	                                  EffectiveAnchor, static_cast<int64_t>(Reverse ? 1 : 0)));
 }
 
 void GraphShortestPathAST::EmitBytecode(BytecodeScratch &Instructions) const {
@@ -2085,29 +2578,37 @@ void DropViewAST::EmitBytecode(BytecodeScratch &Instructions) const {
 }
 
 void CreateProcedureAST::EmitBytecode(BytecodeScratch &Instructions) const {
-	if(ExceptionHandlers_.empty() && ControlFlowJson_.empty())
+	std::string ControlBlob;
+	if(StructuredBody_) {
+		StashLoweredProcedureBody(ProcedureName, *StructuredBody_);
+		ControlBlob = EncodeProcedureControlBinary(*StructuredBody_);
+	} else if(!ControlFlowJson_.empty())
+		ControlBlob = ControlFlowJson_;
+	const bool HasControl = !ControlBlob.empty();
+	const bool HasHandlers = !ExceptionHandlers_.empty();
+	if(!HasHandlers && !HasControl)
 		AppendInstruction(Instructions,
 		                  MakeInstruction(Opcode::CREATE_PROCEDURE, ProcedureName, BodySql_,
 		                                  static_cast<int64_t>(IfNotExists ? 1 : 0),
 		                                  static_cast<int64_t>(OrReplace ? 1 : 0), SourceDialect_));
-	else if(ControlFlowJson_.empty())
+	else if(!HasControl)
 		AppendInstruction(Instructions,
 		                  MakeInstruction(Opcode::CREATE_PROCEDURE, ProcedureName, BodySql_,
 		                                  static_cast<int64_t>(IfNotExists ? 1 : 0),
 		                                  static_cast<int64_t>(OrReplace ? 1 : 0), SourceDialect_,
 		                                  EncodeExceptionHandlersJson(ExceptionHandlers_)));
-	else if(ExceptionHandlers_.empty())
+	else if(!HasHandlers)
 		AppendInstruction(Instructions,
 		                  MakeInstruction(Opcode::CREATE_PROCEDURE, ProcedureName, BodySql_,
 		                                  static_cast<int64_t>(IfNotExists ? 1 : 0),
 		                                  static_cast<int64_t>(OrReplace ? 1 : 0), SourceDialect_,
-		                                  std::string(), ControlFlowJson_));
+		                                  std::string(), std::move(ControlBlob)));
 	else
 		AppendInstruction(Instructions,
 		                  MakeInstruction(Opcode::CREATE_PROCEDURE, ProcedureName, BodySql_,
 		                                  static_cast<int64_t>(IfNotExists ? 1 : 0),
 		                                  static_cast<int64_t>(OrReplace ? 1 : 0), SourceDialect_,
-		                                  EncodeExceptionHandlersJson(ExceptionHandlers_), ControlFlowJson_));
+		                                  EncodeExceptionHandlersJson(ExceptionHandlers_), std::move(ControlBlob)));
 }
 
 void DropProcedureAST::EmitBytecode(BytecodeScratch &Instructions) const {
@@ -2140,7 +2641,19 @@ void AlterTriggerAST::EmitBytecode(BytecodeScratch &Instructions) const {
 	                  MakeInstruction(Opcode::ALTER_TRIGGER, TriggerName, static_cast<int64_t>(Enable ? 1 : 0)));
 }
 
-Bytecode BuildBytecode(Logger *Logger, OptimizationLevel OptLevel, const AstralDB::Database *ViewCatalogDb) {
+void ExplainSelectAST::EmitBytecode(BytecodeScratch &Instructions) const {
+	if(Inner)
+		Inner->EmitBytecode(Instructions);
+}
+
+Bytecode BuildBytecode(Logger *Logger, OptimizationLevel OptLevel, const AstralDB::Database *ViewCatalogDb,
+                       const SqlSessionConfig *SessionCfg) {
+	StatementCorrelationCache().Clear();
+	RewritePipeline Rewrites;
+	Rewrites.RunTree(AST);
+	FusionPass Fusion;
+	Fusion.Run(AST, SessionCfg);
+
 	Bytecode Result;
 	std::unordered_map<std::string, std::string> LiveBodies;
 	if(ViewCatalogDb)
@@ -2159,7 +2672,7 @@ Bytecode BuildBytecode(Logger *Logger, OptimizationLevel OptLevel, const AstralD
 		if(Statement && Statement->Value) {
 			if(Logger)
 				Logger->Info("Emitting bytecode for AST node");
-			Arena.reset();
+			AstralDB::ArenaScope StmtArena(Arena);
 			std::pmr::monotonic_buffer_resource Pool(
 			    Arena.data(), Arena.capacity(), std::pmr::new_delete_resource());
 			BytecodeScratchAlloc Alloc(&Pool);
@@ -2173,11 +2686,17 @@ Bytecode BuildBytecode(Logger *Logger, OptimizationLevel OptLevel, const AstralD
 				LiveBodies.erase(Dv->ViewName);
 				SessionParsedBodies.erase(Dv->ViewName);
 				ViewCodegen.WalReparsedBodies.erase(Dv->ViewName);
+			} else if(dynamic_cast<PragmaAST *>(Statement->Value.get())) {
+				continue;
+			} else if(auto *Ex = dynamic_cast<ExplainSelectAST *>(Statement->Value.get())) {
+				if(Ex->Inner)
+					Ex->Inner->EmitBytecode(Instructions);
 			} else
 				Statement->Value->EmitBytecode(Instructions);
 			const size_t BaseIp = Result.size();
 			for(auto &Inst : Instructions) {
-				if(Inst.Opcode_ == Opcode::RECURSIVE_CTE_FIXPOINT && Inst.Operands.size() >= 4) {
+				if((Inst.Opcode_ == Opcode::RECURSIVE_CTE_FIXPOINT || Inst.Opcode_ == Opcode::RECURSIVE_CTE_BFS) &&
+				   Inst.Operands.size() >= 4) {
 					if(auto *LoopStart = std::get_if<int64_t>(&Inst.Operands[3]))
 						*LoopStart += static_cast<int64_t>(BaseIp);
 				}
@@ -2188,8 +2707,14 @@ Bytecode BuildBytecode(Logger *Logger, OptimizationLevel OptLevel, const AstralD
 
 	RunGraphOptimizerPipeline(Result, OptLevel, Logger);
 	RunMathSciOptimizerPipeline(Result, OptLevel, Logger);
-	RunOptimizerPipeline(Result, OptLevel, Logger);
-	RunGraphOptimizerPipeline(Result, OptLevel, Logger);
+	if(OptLevel >= OptimizationLevel::Advanced)
+		RunBulkOpcodePass(Result, OptLevel, Logger);
+	if(OptLevel >= OptimizationLevel::Maximum)
+		RunAdaptiveOptimizerPipeline(Result, Logger, SessionCfg);
+	else if(OptLevel >= OptimizationLevel::Basic)
+		RunOptimizerPipeline(Result, OptLevel, Logger);
+	if(OptLevel >= OptimizationLevel::Maximum)
+		RunBulkOpcodePass(Result, OptLevel, Logger);
 
 	if(Logger)
 		Logger->Info("Bytecode build complete with " + std::to_string(Result.size()) + " instructions");

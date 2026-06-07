@@ -1,6 +1,6 @@
 #pragma once
 
-#include <Database/EmbeddingCatalog.hxx>
+#include <Database/Embedding/EmbeddingCatalog.hxx>
 #include <string>
 #include <unordered_map>
 #include <vector>

@@ -1,0 +1,7 @@
+# neutroniumbomb timed query suite (label<TAB>path)
+Q0	examples/benchmarks/neutroniumbomb_q0.sql
+Q1	examples/benchmarks/neutroniumbomb_q1.sql
+Q3	examples/benchmarks/neutroniumbomb_q3.sql
+Q9	examples/benchmarks/neutroniumbomb_q9.sql
+Q10	examples/benchmarks/neutroniumbomb_query.sql
+Q11	examples/benchmarks/neutroniumbomb_htap.sql

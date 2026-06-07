@@ -62,7 +62,7 @@ Runnable scripts for each band live under **`examples/`** (for example **`sql92_
 
 **JSON, XML, search.** `JSON_EXTRACT`, `JSON_CONTAINS`, `JSON_MERGE`, and related scalars; XML extract/serialize/validate; **`WHERE col MATCH '…'`** with optional FTS indexes; **`CREATE INDEX … USING VECTOR`** and **`VECTOR_TOPK`**.
 
-**Advanced cells and MathSci.** DuckDB-style **`STRUCT`**, **`MAP`**, **`LIST`**, **`VECTOR`**, **`MATRIX`**, **`COMPLEX`**; **2D/3D geospatial** (`POINT`, `POLYGON`, `MESH`, terrain DEM)—[`Geospatial.md`](Geospatial.md); dataset opcodes; SIMD signal/FFT, autograd, differential-equation solvers, **MCTS / Bayesian inference / macro Fokker–Planck**, **classifiers**, **NLP**, **embedding** catalogs, **tiny LM training**, and **PINN-style** PDE demos in SQL—see **`examples/sql_math_sci.sql`**, **`examples/math_sci_inference_nfp.sql`**, **`examples/math_sci_lm_tiny.sql`**, **`examples/math_sci_pinn_tdse_1d.sql`**, **`examples/math_sci_pinn_navier_stokes_3d.sql`**, and **`docs/MathSci*.md`**.
+**Advanced cells and MathSci.** DuckDB-style **`STRUCT`**, **`MAP`**, **`LIST`**, **`VECTOR`**, **`MATRIX`**, **`COMPLEX`**; **2D/3D geospatial** (`POINT`, `POLYGON`, `MESH`, terrain DEM)—[`Geospatial.md`](Geospatial.md); dataset opcodes; SIMD signal/FFT, autograd, differential-equation solvers, **MCTS / Bayesian inference / macro Fokker–Planck**, **classifiers**, **NLP**, **embedding** catalogs, **tiny LM training**, and **PINN-style** PDE demos in SQL—see **`examples/sql_math_sci.sql`**, **`examples/math_sci_inference_nfp.sql`**, **`examples/math_sci_lm_tiny.sql`**, **`examples/math_sci_pinn_tdse_1d.sql`**, **`examples/math_sci_pinn_navier_stokes_3d.sql`**, and [`MathSciCore.md`](MathSciCore.md), [`MathSciMl.md`](MathSciMl.md), [`MathSciInference.md`](MathSciInference.md).
 
 ---
 
@@ -142,11 +142,9 @@ Near-term work: widen SQL coverage, harden semantics (especially `NULL` and opti
 | Geospatial 2D / 3D | [`Geospatial.md`](Geospatial.md) |
 | Stored procedures | [`StoredProcedures.md`](StoredProcedures.md) |
 | Triggers | [`Triggers.md`](Triggers.md) |
-| Tiny LM training | [`MathSciLmTrain.md`](MathSciLmTrain.md) |
-| PINN demos | [`MathSciPinn.md`](MathSciPinn.md) |
-| MCTS / Bayesian / NFP | [`MathSciInference.md`](MathSciInference.md), [`MathSciFokkerPlanck.md`](MathSciFokkerPlanck.md) |
-| Model cells (`MATHSCI_MODEL_*`) | [`MathSciModel.md`](MathSciModel.md) |
-| ODE/SDE/PDE solvers | [`MathSciDiffEq.md`](MathSciDiffEq.md), [`MathSciSolves.md`](MathSciSolves.md) |
+| MathSci core (signal, autograd, solvers) | [`MathSciCore.md`](MathSciCore.md) |
+| MathSci ML (models, NLP, PINN, LM) | [`MathSciMl.md`](MathSciMl.md) |
+| MathSci inference (MCTS, Bayesian, NFP) | [`MathSciInference.md`](MathSciInference.md) |
 | C++ conventions | [`CodingStyle.md`](CodingStyle.md) |
 | Cluster orchestration | [`Quasar.md`](Quasar.md) |
 | Runnable contract | `examples/`, `tests/` |

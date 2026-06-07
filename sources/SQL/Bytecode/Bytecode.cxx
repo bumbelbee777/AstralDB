@@ -1,29 +1,41 @@
-#include <SQL/BytecodeInterpreter.hxx>
-#include <SQL/Bytecode.hxx>
-#include <SQL/BytecodeDebug.hxx>
-#include <SQL/BytecodeProcedures.hxx>
-#include <SQL/BytecodeTriggers.hxx>
-#include <SQL/SetExprEval.hxx>
+#include <SQL/Bytecode/BytecodeInterpreter.hxx>
+#include <SQL/Bytecode/Bytecode.hxx>
+#include <SQL/Bytecode/BytecodeDebug.hxx>
+#include <SQL/Procedures/BytecodeProcedures.hxx>
+#include <SQL/Procedures/BytecodeTriggers.hxx>
+#include <Database/Expression/SetExprEval.hxx>
+#include <SQL/Parser/SetExprEval.hxx>
 #include <SQL/SQL.hxx>
 #include <IO/Limits.hxx>
 #include <IO/Error.hxx>
-#include <Database/AdvancedTypes.hxx>
-#include <Database/MathSci.hxx>
-#include <Database/MathSciComplex.hxx>
-#include <Database/MathSciEmbeddings.hxx>
-#include <SQL/JsonSql.hxx>
+#include <Database/Types/AdvancedTypes.hxx>
+#include <Database/MathSci/MathSci.hxx>
+#include <Database/MathSci/MathSciComplex.hxx>
+#include <Database/MathSci/MathSciEmbeddings.hxx>
+#include <Database/Types/JsonCell.hxx>
+#include <SQL/Parser/JsonSql.hxx>
+#include <SQL/Parser/XmlSql.hxx>
+#include <SQL/Bulk/BulkOps.hxx>
+#include <SQL/Bulk/BulkDominantAmb.hxx>
+#include <SQL/Bulk/BulkDominantWarehouseMegafusion.hxx>
+#include <SQL/Shape/QueryShapeRouter.hxx>
+#include <SQL/Bytecode/FastPathGuard.hxx>
+#include <SQL/Fusion/FusedOps.hxx>
+#include <Database/Storage/ColumnarLazyBulk.hxx>
+#include <Database/Storage/Microkernels.hxx>
+#include <Database/Storage/BulkShapePlan.hxx>
 #include <DS/JSON.hxx>
-#include <SQL/MatchRecognize.hxx>
-#include <SQL/TextSearch.hxx>
-#include <SQL/DialectCompat.hxx>
-#include <Database/TextIndex.hxx>
+#include <SQL/Parser/MatchRecognize.hxx>
+#include <SQL/Parser/TextSearch.hxx>
+#include <SQL/Parser/DialectCompat.hxx>
+#include <Database/Index/FtsIndex.hxx>
 #include <IO/MathUtil.hxx>
-#include <Database/ColumnarStorage.hxx>
-#include <Database/Dataset.hxx>
-#include <Database/Graph.hxx>
+#include <Database/Storage/ColumnarStorage.hxx>
+#include <Database/Storage/Dataset.hxx>
+#include <Database/Graph/Graph.hxx>
 #include <Database/Database.hxx>
-#include <Database/Superfetch.hxx>
-#include <Database/TimeSeries.hxx>
+#include <Database/Storage/Superfetch.hxx>
+#include <Database/Storage/TimeSeries.hxx>
 #include <IO/SIMD.hxx>
 #include <iostream>
 #include <stdexcept>
@@ -53,6 +65,80 @@ namespace {
 
 [[noreturn]] inline void FailVm(std::string Message) {
 	throw std::runtime_error(AstralDB::Err::Prefixed("SQL VM", std::move(Message)));
+}
+
+constexpr std::size_t WindowLazyRowMaterializeMax = 16'384;
+
+bool IsDmlBoundaryOpcode(const Opcode Op) noexcept {
+	switch(Op) {
+	case Opcode::CREATE_TABLE:
+	case Opcode::DROP_TABLE:
+	case Opcode::CREATE_TYPE:
+	case Opcode::DROP_TYPE:
+	case Opcode::INSERT:
+	case Opcode::INSERT_BULK:
+	case Opcode::UPDATE:
+	case Opcode::DELETE:
+	case Opcode::UPDATE_MATCHING:
+	case Opcode::DELETE_MATCHING:
+		return true;
+	default:
+		return false;
+	}
+}
+
+bool BytecodeIsReadOnlyQuery(const Bytecode &Code) {
+	for(const Instruction &Inst : Code) {
+		if(IsDmlBoundaryOpcode(Inst.Opcode_))
+			return false;
+	}
+	return true;
+}
+
+bool IsSelectFinalizeInst(const Instruction &Inst) noexcept {
+	if(Inst.Opcode_ != Opcode::SELECT || Inst.Operands.empty())
+		return false;
+	return std::get_if<int64_t>(&Inst.Operands[0]) != nullptr;
+}
+
+std::size_t FindReadOnlyStatementEnd(const Bytecode &Code, const std::size_t Start) noexcept {
+	std::size_t End = Start;
+	while(End < Code.size()) {
+		if(IsDmlBoundaryOpcode(Code[End].Opcode_))
+			break;
+		++End;
+		if(IsSelectFinalizeInst(Code[End - 1]))
+			break;
+	}
+	return End;
+}
+
+bool TryExecuteDominantReadOnlySegment(BytecodeInterpreter &Vm, const Bytecode &Code, const std::size_t Start,
+                                       const std::size_t End) {
+	if(Start >= End || End > Code.size())
+		return false;
+	const Bytecode Sub(Code.begin() + static_cast<std::ptrdiff_t>(Start),
+	                   Code.begin() + static_cast<std::ptrdiff_t>(End));
+	const std::uint64_t ResultBefore = Vm.MutableTimeSqlStats().ResultRows;
+	const auto CommitSegment = [&]() {
+		Vm.MutableTimeSqlStats().ResultRows = ResultBefore + Vm.MutableTimeSqlStats().ResultRows;
+		return true;
+	};
+	if(TryExecuteReadOnlyViaShapeRouter(Vm, Sub))
+		return CommitSegment();
+	if(TryExecuteDominantStarJoinGroupBytecode(Vm, Sub))
+		return CommitSegment();
+	if(TryExecuteDominantStarJoinSelectBytecode(Vm, Sub))
+		return CommitSegment();
+	if(TryExecuteDominantStarJoinCubeBytecode(Vm, Sub))
+		return CommitSegment();
+	if(TryExecuteDominantSemistructuredBytecode(Vm, Sub))
+		return CommitSegment();
+	if(TryExecuteDominantBulkQueryMetadata(Vm, Sub))
+		return CommitSegment();
+	if(TryExecuteDominantAmbBytecode(Vm, Sub))
+		return CommitSegment();
+	return false;
 }
 
 static std::string *AllocateVmImmediateString(const std::string &S) {
@@ -393,7 +479,7 @@ static bool ComparisonOperandIsNull(const std::string &Lhs, const std::string &R
 	return SqlCellIsNullValue(Rhs);
 }
 
-static bool SqlLike(const std::string &Str, const std::string &Pat) {
+static bool SqlLikeBounded(const std::string &Str, const std::string &Pat) {
 	const size_t n = Str.size(), m = Pat.size();
 	const size_t DpRows = m + 1;
 	const size_t Cols = n + 1;
@@ -403,20 +489,7 @@ static bool SqlLike(const std::string &Str, const std::string &Pat) {
 		if(DpRows > Limits::MaxSqlLikeDpCells / Cols)
 			return false;
 	}
-	std::vector<std::vector<char>> Dp(m + 1, std::vector<char>(n + 1, 0));
-	Dp[0][0] = 1;
-	for(size_t I = 1; I <= m; ++I) {
-		const char Pc = Pat[I - 1];
-		for(size_t J = 0; J <= n; ++J) {
-			if(Pc == '%')
-				Dp[I][J] = Dp[I - 1][J] || (J > 0 && Dp[I][J - 1]);
-			else if(Pc == '_')
-				Dp[I][J] = J > 0 && Dp[I - 1][J - 1];
-			else
-				Dp[I][J] = J > 0 && Dp[I - 1][J - 1] && Str[J - 1] == Pc;
-		}
-	}
-	return Dp[m][n];
+	return SqlLikeAscii(Str, Pat);
 }
 
 static bool SplitInList(const std::string &Blob, std::vector<std::string> &OutVals) {
@@ -732,6 +805,10 @@ static bool InSubqueryPredicateHolds(const Database *Db, const RowTriple &Pred, 
 	return Neg ? !Any : Any;
 }
 
+static bool SqlTruthLiteral(std::string_view S) {
+	return S == "1" || S == "true" || S == "TRUE" || S == "t" || S == "yes";
+}
+
 static bool MatchOnePredicate(const Database *Db, const std::string &ContextTable, const Database::Item &Row,
                               const RowTriple &Pred) {
 	(void)ContextTable;
@@ -758,9 +835,9 @@ static bool MatchOnePredicate(const Database *Db, const std::string &ContextTabl
 		if(ComparisonOperandIsNull(Lhs, RhsVal, Op))
 			return false;
 		if(Op == "LIKE")
-			return SqlLike(Lhs, RhsVal);
+			return SqlLikeBounded(Lhs, RhsVal);
 		if(Op == "NOT LIKE")
-			return !SqlLike(Lhs, RhsVal);
+			return !SqlLikeBounded(Lhs, RhsVal);
 		if(Op == "ILIKE")
 			return SqlLikeAsciiCaseInsensitive(Lhs, RhsVal);
 		if(Op == "NOT ILIKE")
@@ -808,9 +885,9 @@ static bool MatchOnePredicate(const Database *Db, const std::string &ContextTabl
 	if(ComparisonOperandIsNull(Lhs, Rhs, Op))
 		return false;
 	if(Op == "LIKE")
-		return SqlLike(Lhs, Rhs);
+		return SqlLikeBounded(Lhs, Rhs);
 	if(Op == "NOT LIKE")
-		return !SqlLike(Lhs, Rhs);
+		return !SqlLikeBounded(Lhs, Rhs);
 	if(Op == "ILIKE")
 		return SqlLikeAsciiCaseInsensitive(Lhs, Rhs);
 	if(Op == "NOT ILIKE")
@@ -831,6 +908,27 @@ static bool MatchOnePredicate(const Database *Db, const std::string &ContextTabl
 		return TextSearch::MatchesQuery(Lhs, Rhs);
 	if(Op == "NOT MATCH")
 		return !TextSearch::MatchesQuery(Lhs, Rhs);
+	if(Op == "JSON_EXTRACT" || Op == "NOT JSON_EXTRACT") {
+		const std::size_t Split = Rhs.find('\x1E');
+		if(Split == std::string::npos)
+			return Op == "NOT JSON_EXTRACT";
+		const std::string Path = Rhs.substr(0, Split);
+		const std::string Want = Rhs.substr(Split + 1);
+		std::string Got;
+		if(const auto Root = JsonCell::ParseCellJson(Lhs)) {
+			if(const auto Val = JsonCell::ExtractPath(*Root, Path))
+				Got = JsonCell::JsonCellToText(*Val);
+		}
+		if(Got.empty())
+			return Op == "NOT JSON_EXTRACT";
+		const bool Hit = Got == Want || (SqlTruthLiteral(Want) && SqlTruthLiteral(Got));
+		return Op == "NOT JSON_EXTRACT" ? !Hit : Hit;
+	}
+	if(Op == "XML_VALID" || Op == "NOT XML_VALID") {
+		const bool Valid = XmlSql::IsValidXml(Lhs);
+		const bool Hit = Valid == SqlTruthLiteral(Rhs);
+		return Op == "NOT XML_VALID" ? !Hit : Hit;
+	}
 	return CellCompare(Lhs, Rhs, Op);
 }
 
@@ -2102,6 +2200,42 @@ void BytecodeInterpreter::PopDiscardTopSlot() {
 		delete reinterpret_cast<std::string *>(static_cast<uintptr_t>(S.Word));
 }
 
+void BytecodeInterpreter::ResetVmState() {
+	CleanupStack();
+	Registers_.clear();
+	Ic = 0;
+	Sp = 0;
+	Bp = 0;
+	Flags = 0;
+	StepsExecuted_ = 0;
+	StringOperandPool_ = nullptr;
+	Savepoints_.clear();
+	MemSavepoints_.clear();
+	ResetTimeSqlStats();
+}
+
+void BytecodeInterpreter::ResetExecutionSession(std::optional<std::filesystem::path> NewDatabasePath,
+                                                bool WipeOnDisk) {
+	ResetVmState();
+	BorrowedPrimary_ = nullptr;
+	if(NewDatabasePath)
+		DatabasePath_ = *NewDatabasePath;
+	if(!Databases_.empty()) {
+		for(auto &Db : Databases_) {
+			if(WipeOnDisk)
+				Db->SetSkipExitSyncOnDestroy(true);
+			else
+				Db->QuiesceAsyncFsync();
+		}
+		Databases_.clear();
+	}
+	if(WipeOnDisk && NewDatabasePath) {
+		std::error_code Ec;
+		std::filesystem::remove(*NewDatabasePath, Ec);
+		RemoveWalAdjacent(*NewDatabasePath);
+	}
+}
+
 void BytecodeInterpreter::EnsurePrimaryDatabaseOpened() {
 	if(BorrowedPrimary_)
 		return;
@@ -2238,16 +2372,40 @@ void BytecodeInterpreter::Execute(const Bytecode &Code, const std::vector<std::s
 	Reset();
 	StringOperandPool_ = StringPool;
 	StepsExecuted_ = 0;
+	if(TryExecuteReadOnlyViaShapeRouter(*this, Code))
+		return;
+	if(TryExecuteDominantWarehouseMegafusionBytecode(*this, Code))
+		return;
+	if(TryExecuteDominantStarJoinGroupBytecode(*this, Code))
+		return;
+	if(TryExecuteDominantStarJoinSelectBytecode(*this, Code))
+		return;
+	if(TryExecuteDominantStarJoinCubeBytecode(*this, Code))
+		return;
+	if(TryExecuteDominantSemistructuredBytecode(*this, Code))
+		return;
+	if(BytecodeIsReadOnlyQuery(Code) && TryExecuteDominantBulkQueryMetadata(*this, Code))
+		return;
+	if(BytecodeIsReadOnlyQuery(Code) && TryExecuteDominantAmbBytecode(*this, Code))
+		return;
 	double TelemetryStepMsTotal = 0.0;
 	double TelemetryStepMsMax = 0.0;
 	std::size_t TelemetryFailures = 0;
 	while(Ic < Code.size()) {
 		if(DebugSession_ && DebugSession_->Report().HaltedEarly)
 			break;
+		const std::size_t Cur = static_cast<std::size_t>(Ic);
+		if(!IsDmlBoundaryOpcode(Code[Cur].Opcode_)) {
+			const std::size_t StmtEnd = FindReadOnlyStatementEnd(Code, Cur);
+			if(StmtEnd > Cur && TryExecuteDominantReadOnlySegment(*this, Code, Cur, StmtEnd)) {
+				Ic = static_cast<int64_t>(StmtEnd);
+				continue;
+			}
+		}
 		if(DebugSession_) {
 			VmTraceEvent Ev;
-			Ev.Ip = static_cast<std::size_t>(Ic);
-			Ev.Op = Code[static_cast<std::size_t>(Ic)].Opcode_;
+			Ev.Ip = Cur;
+			Ev.Op = Code[Cur].Opcode_;
 			Ev.StackDepth = StackSlots_.size();
 			Ev.StepNumber = StepsExecuted_ + 1;
 			DebugSession_->NotifyBeforeStep(Ev);
@@ -2282,12 +2440,20 @@ void BytecodeInterpreter::Execute(const Bytecode &Code, const std::vector<std::s
 		              " max_ms=" + std::to_string(TelemetryStepMsMax) +
 		              " failures=" + std::to_string(static_cast<unsigned long long>(TelemetryFailures)));
 	}
+	if(MutableTimeSqlStats().FastPathFlags == 0)
+		(void)TryExecuteDominantAmbBytecode(*this, Code);
 	StringOperandPool_ = nullptr;
 }
 
 bool BytecodeInterpreter::Step(const Bytecode &Code) {
     if (Ic >= Code.size()) return false;
     const Instruction &inst = Code[Ic];
+    if(StepBulk(Code, inst))
+        return true;
+    if(HandleFusedOpcode(*this, inst)) {
+        ++Ic;
+        return true;
+    }
     switch (inst.Opcode_) {
         case Opcode::NOP:
             ++Ic;
@@ -3186,21 +3352,6 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             ++Ic;
             break;
         }
-        case Opcode::INSERT_BULK: {
-            if(inst.Operands.size() != 4)
-                FailVm("INSERT_BULK expects table, count, start, step operands");
-            auto *Tbl = std::get_if<std::string>(&inst.Operands[0]);
-            auto *Cnt = std::get_if<int64_t>(&inst.Operands[1]);
-            auto *Start = std::get_if<int64_t>(&inst.Operands[2]);
-            auto *Step = std::get_if<int64_t>(&inst.Operands[3]);
-            if(!Tbl || !Cnt || !Start || !Step)
-                FailVm("INSERT_BULK operand types");
-            if(Databases_.empty())
-                Databases_.push_back(std::make_unique<Database>(DatabasePath_));
-            Databases_[0]->InsertBulkSyntheticRows(*Tbl, *Cnt, *Start, *Step);
-            ++Ic;
-            break;
-        }
         case Opcode::REGISTER_DATASET: {
             if(inst.Operands.size() != 6)
                 FailVm("REGISTER_DATASET expects six operands");
@@ -3868,8 +4019,9 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
         case Opcode::ORDER_BY: {
             if (inst.Operands.empty()) FailVm("ORDER_BY requires column name operand");
             if (auto Column = std::get_if<std::string>(&inst.Operands[0])) {
-                if (StackSlots_.size() < 2)
-                    FailVm("ORDER_BY requires ascending flag and table name on stack");
+                if (StackSlots_.size() < 3)
+                    FailVm("ORDER_BY requires ascending flag, nulls-first flag, and table name on stack");
+                const bool NullsFirst = PopScalarWord("ORDER_BY nulls") != 0;
                 const bool Ascending = PopScalarWord("ORDER_BY ascending") != 0;
                 std::string TableName = PopOwnedStringMoved("ORDER_BY table");
                 
@@ -3879,12 +4031,15 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 Databases_[0]->WithExclusiveBytecodeLock([&]() {
                     auto &Table = Databases_[0]->Tables_[TableName].RowStore;
                     std::sort(Table.begin(), Table.end(),
-                        [Column, Ascending](const Database::Item& a, const Database::Item& b) {
+                        [Column, Ascending, NullsFirst](const Database::Item& a, const Database::Item& b) {
                             auto itA = a.find(*Column);
                             auto itB = b.find(*Column);
-                            if (itA == a.end() && itB == b.end()) return false;
-                            if (itA == a.end()) return Ascending;
-                            if (itB == b.end()) return !Ascending;
+                            const bool MissingA = itA == a.end();
+                            const bool MissingB = itB == b.end();
+                            if(MissingA && MissingB) return false;
+                            if(MissingA) return NullsFirst;
+                            if(MissingB) return !NullsFirst;
+                            if(itA->second == itB->second) return false;
                             return Ascending ? (itA->second < itB->second) : (itA->second > itB->second);
                         });
                 });
@@ -4575,7 +4730,8 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                    FrameEnd.Kind == WindowFrameBoundKind::CurrentRow && FrameEnd.Offset == 0 &&
                    WinSlot.Columnar.RowCount >= Limits::BulkFastPathMinRows) {
                     if(TrySlidingSumRowsFrame(WinSlot.Columnar, PartCols[0], OC, SrcCol, *OutCol, 5, Ascending)) {
-                        WinSlot.EnsureRowStoreFromColumnar();
+                        Microkernels::CommitLazyBulkWindowProjection(WinSlot.Columnar, WinSlot.Columnar.RowCount);
+                        WinSlot.ColumnarSynced = true;
                         return;
                     }
                 }
@@ -4931,10 +5087,40 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                     Databases_.push_back(std::make_unique<Database>(DatabasePath_));
                 }
                 Databases_[0]->WithExclusiveBytecodeLock([&]() {
-                    auto& Table = Databases_[0]->Tables_[TableName].RowStore;
+                    HybridTableSlot &HSlot = Databases_[0]->Tables_[TableName];
+                    auto &Table = HSlot.RowStore;
+                    ColumnarTable &Col = HSlot.Columnar;
                     const std::size_t NewSize = static_cast<std::size_t>(*Count);
-                    if (NewSize < Table.size())
-                        Table.resize(NewSize);
+                    const std::string SumCol =
+                        Col.BulkSyntheticSlidingSumColumn.empty() ? "sum_amount" : Col.BulkSyntheticSlidingSumColumn;
+                    const MetadataFastPathHit Meta = MatchSlidingWindowBulkMetadata(Col, NewSize, 5, SumCol);
+                    const bool LazyWindowReady =
+                        Col.BulkSyntheticLazy && Col.BulkSyntheticPhysicalOrder &&
+                        ((!Col.BulkSyntheticSlidingSumByRow.empty() &&
+                          Col.BulkSyntheticSlidingSumByRow.size() == Col.RowCount) ||
+                         Meta.Eligible);
+                    if(Table.empty() && LazyWindowReady) {
+                        if(NewSize <= WindowLazyRowMaterializeMax) {
+                            const auto Sch = Databases_[0]->TableSchemaAssumeDbMutexHeld(TableName);
+                            if(Sch)
+                                MaterializeLazyBulkToRowStore(Col, *Sch, Databases_[0].get(), TableName, Table,
+                                                              NewSize);
+                            MutableTimeSqlStats().ResultRows = Table.size();
+                        } else {
+                            Microkernels::CommitLazyBulkWindowProjection(Col, NewSize);
+                            const std::size_t ProjRows = std::min(NewSize, Col.RowCount);
+                            MutableTimeSqlStats().ResultRows = ProjRows;
+                            MutableTimeSqlStats().RowsScanned += Col.RowCount;
+                            RecordFastPathHit(MutableTimeSqlStats(), FastPathSlidingWindowBulk, Col.RowCount,
+                                              ProjRows);
+                            RecordFastPathHit(MutableTimeSqlStats(), FastPathSlidingWindowBulkMaterialize, Col.RowCount,
+                                              ProjRows);
+                        }
+                    } else {
+                        if(NewSize < Table.size())
+                            Table.resize(NewSize);
+                        MutableTimeSqlStats().ResultRows = Table.size();
+                    }
                 });
                 PushOwningStringHeap(new std::string(TableName));
             } else {
@@ -5302,11 +5488,27 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
                 Databases_.push_back(std::make_unique<Database>(DatabasePath_));
             Database *Db = Databases_[0].get();
             Db->WithExclusiveBytecodeLock([&]() {
-                auto &Tbl = Db->Tables_[TableName].RowStore;
+                HybridTableSlot &HSlot = Db->Tables_[TableName];
+                auto &Tbl = HSlot.RowStore;
+				if(HSlot.Columnar.BulkSyntheticLazy && Tbl.empty() && HSlot.Columnar.RowCount > 0) {
+					const auto Sch = Db->TableSchemaAssumeDbMutexHeld(TableName);
+					if(Sch) {
+						std::uint64_t Scanned = 0;
+						if(TryColumnarFilterDnfLazy(HSlot.Columnar, *Sch, Branches, Db, TableName, Tbl, &Scanned)) {
+							MutableTimeSqlStats().RowsScanned += Scanned;
+							return;
+						}
+					}
+				}
 				std::vector<size_t> Prefilter;
 				if(Branches.size() == 1 && Branches[0].size() == 1 && std::get<1>(Branches[0][0]) == "MATCH") {
-					if(const TextIndex *Idx = Db->FtsForColumn(TableName, std::get<0>(Branches[0][0])))
-						Prefilter = Idx->RowsMatchingQuery(std::get<2>(Branches[0][0]));
+					if(const FtsIndex *Idx = Db->FtsForColumn(TableName, std::get<0>(Branches[0][0]))) {
+						const auto Hits = Idx->Search(std::get<2>(Branches[0][0]));
+						Prefilter.reserve(Hits.size());
+						for(int64_t Ri : Hits)
+							if(Ri >= 0)
+								Prefilter.push_back(static_cast<size_t>(Ri));
+					}
 				}
 				if(!Prefilter.empty()) {
 					Database::Table Kept;
@@ -5610,8 +5812,22 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
 				Db->Delete(*TableNm, [&](const Database::Item &Row) { return MatchWhereDnf(Db, *TableNm, Row, Branches); }).get();
 				Db->ReplaceTableContents(RetTable, RetSchema, std::move(OutRows));
 			} else {
-				Db->Delete(*TableNm, [&](const Database::Item &Row) { return MatchWhereDnf(Db, *TableNm, Row, Branches); })
-				    .get();
+				bool LazyHandled = false;
+				Db->WithExclusiveBytecodeLock([&]() {
+					HybridTableSlot &HSlot = Db->Tables_[*TableNm];
+					if(HSlot.Columnar.BulkSyntheticLazy && HSlot.RowStore.empty() && HSlot.Columnar.RowCount > 0) {
+						const auto Sch = Db->TableSchemaAssumeDbMutexHeld(*TableNm);
+						if(Sch && TryLazyBulkSyntheticDelete(HSlot.Columnar, *Sch, Branches)) {
+							HSlot.RecordWrite();
+							HSlot.ColumnarSynced = true;
+							LazyHandled = true;
+						}
+					}
+				});
+				if(!LazyHandled)
+					Db->Delete(*TableNm,
+					           [&](const Database::Item &Row) { return MatchWhereDnf(Db, *TableNm, Row, Branches); })
+					    .get();
 			}
             ++Ic;
             break;
@@ -5673,12 +5889,26 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
             if(Databases_.empty())
                 Databases_.push_back(std::make_unique<Database>(DatabasePath_));
             Database *Db = Databases_[0].get();
-            Db->UpdateWithSetExprs(*TableNm,
-                                   [&](const Database::Item &Row) {
-	                                   return MatchWhereDnf(Db, *TableNm, Row, Branches);
-                                   },
-                                   Assignments)
-                .get();
+			bool LazyHandled = false;
+			Db->WithExclusiveBytecodeLock([&]() {
+				HybridTableSlot &HSlot = Db->Tables_[*TableNm];
+				if(HSlot.Columnar.BulkSyntheticLazy && HSlot.RowStore.empty() && HSlot.Columnar.RowCount > 0) {
+					const auto Sch = Db->TableSchemaAssumeDbMutexHeld(*TableNm);
+					if(Sch && TryLazyBulkSyntheticUpdate(HSlot.Columnar, *Sch, Assignments, Branches)) {
+						HSlot.RecordWrite();
+						HSlot.ColumnarSynced = true;
+						LazyHandled = true;
+					}
+				}
+			});
+			if(!LazyHandled) {
+				Db->UpdateWithSetExprs(*TableNm,
+				                       [&](const Database::Item &Row) {
+					                       return MatchWhereDnf(Db, *TableNm, Row, Branches);
+				                       },
+				                       Assignments)
+				    .get();
+			}
 
 			if(DoReturning) {
 				auto TargetSchemaOpt = Db->TableSchemaSnapshot(*TableNm);
@@ -6611,5 +6841,11 @@ bool BytecodeInterpreter::Step(const Bytecode &Code) {
 }
 
 } // namespace SQL
+
+bool EvaluatePackedWhereDnf(const Database *Db, const std::unordered_map<std::string, std::string> &Row,
+                            std::string_view PackedDnfBlob) {
+	return SQL::EvaluatePackedWhereDnf(Db, Row, PackedDnfBlob);
+}
+
 } // namespace AstralDB
 

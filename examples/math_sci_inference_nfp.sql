@@ -1,4 +1,4 @@
--- MathSci: MCTS, Bayesian inference, neural macro Fokker–Planck (docs/MathSciInference.md, MathSciFokkerPlanck.md).
+-- MathSci: MCTS, Bayesian inference, neural macro Fokker–Planck (docs/MathSciInference.md).
 
 DROP TABLE IF EXISTS inf_demo;
 CREATE TABLE inf_demo (id INT, tag TEXT, val TEXT);

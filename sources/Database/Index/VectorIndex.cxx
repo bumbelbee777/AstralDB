@@ -1,6 +1,6 @@
-#include <Database/VectorIndex.hxx>
+#include <Database/Index/VectorIndex.hxx>
 
-#include <Database/AdvancedTypes.hxx>
+#include <Database/Types/AdvancedTypes.hxx>
 #include <IO/SIMD.hxx>
 
 #include <algorithm>

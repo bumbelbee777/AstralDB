@@ -1,0 +1,26 @@
+name: Setup UPX
+description: Cache and install UPX from official GitHub releases
+inputs:
+  version:
+    description: UPX release tag (without v prefix)
+    required: false
+    default: "4.2.4"
+runs:
+  using: composite
+  steps:
+    - name: Cache UPX
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.tool_cache }}/upx
+        key: upx-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
+    - name: Install UPX (Unix)
+      if: runner.os != 'Windows'
+      shell: bash
+      run: bash "${{ github.workspace }}/.github/scripts/setup-upx.sh" "${{ inputs.version }}"
+
+    - name: Install UPX (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        & "${{ github.workspace }}/.github/scripts/setup-upx.ps1" -Version "${{ inputs.version }}"

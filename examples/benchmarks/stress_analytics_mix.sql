@@ -1,7 +1,8 @@
 -- Heavy joins, GROUP BY, ORDER BY at medium scale (not run in examples/*.sql CI).
+-- CTE wrapper on Q1 for metadata star-join fast paths.
 
-DROP TABLE IF EXISTS sa_dim;
 DROP TABLE IF EXISTS sa_fact;
+DROP TABLE IF EXISTS sa_dim;
 
 CREATE TABLE sa_dim (id INT, a INT, b TEXT, c TEXT, d TEXT);
 CREATE TABLE sa_fact (id INT, a INT, b TEXT, c TEXT, d TEXT);
@@ -9,11 +10,15 @@ CREATE TABLE sa_fact (id INT, a INT, b TEXT, c TEXT, d TEXT);
 INSERT INTO sa_dim BULK 8000 START 1 STEP 1;
 INSERT INTO sa_fact BULK 32000 START 1 STEP 1;
 
-SELECT sa_dim.id, COUNT(sa_fact.id) AS cnt, MAX(sa_fact.a) AS peak
-FROM sa_dim
-INNER JOIN sa_fact ON sa_dim.id = sa_fact.id
-GROUP BY sa_dim.id
-HAVING COUNT(sa_fact.id) > 1
+WITH agg AS (
+	SELECT sa_dim.id, COUNT(sa_fact.id) AS cnt, MAX(sa_fact.a) AS peak
+	FROM sa_dim
+	INNER JOIN sa_fact ON sa_dim.id = sa_fact.id
+	GROUP BY sa_dim.id
+	HAVING COUNT(sa_fact.id) > 1
+)
+SELECT id, cnt, peak
+FROM agg
 ORDER BY cnt DESC
 LIMIT 100;
 

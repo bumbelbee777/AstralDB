@@ -19,14 +19,14 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import platform
-import re
-import statistics
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 from typing import Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from bench_timing_util import astral_metadata_env, run_time_sql  # noqa: E402
 
 # (key, label, path relative to repo root)
 SUITES: list[tuple[str, str, str]] = [
@@ -39,11 +39,6 @@ SUITES: list[tuple[str, str, str]] = [
     ("wal", "stress_wal_churn\n(WAL+DML)", "examples/benchmarks/stress_wal_churn.sql"),
     ("analytics", "stress_analytics_mix\n(16k join)", "examples/benchmarks/stress_analytics_mix.sql"),
 ]
-
-TIME_RX = re.compile(
-    r"parse\+compile_ms=([\d.]+)\s+execute_ms=([\d.]+)\s+total_ms=([\d.]+)"
-)
-
 
 def ensure_import(name: str, pip_name: str, no_fetch: bool) -> None:
     if importlib.util.find_spec(name) is not None:
@@ -58,6 +53,7 @@ def resolve_astral_executable(repo_root: Path) -> Optional[Path]:
     cmake_release = repo_root / "build-cmake" / "Release"
     if platform.system() == "Windows":
         candidates = [
+            repo_root / "build" / "astraldb.exe",
             bin_dir / "astraldb.exe",
             bin_dir / "astraldb",
             bin_dir / "AstralDB.exe",
@@ -66,6 +62,7 @@ def resolve_astral_executable(repo_root: Path) -> Optional[Path]:
         ]
     else:
         candidates = [
+            repo_root / "build" / "astraldb",
             bin_dir / "astraldb",
             bin_dir / "AstralDB",
             repo_root / "build-cmake" / "astraldb",
@@ -82,43 +79,34 @@ def run_suite(
     sql_path: Path,
     opt_level: str,
     timeout_s: float,
-) -> tuple[Optional[float], Optional[float], Optional[float], int]:
-    """Returns (parse_compile_ms, execute_ms, total_ms, exit_code)."""
+    warmup: int,
+    runs: int,
+) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], int]:
+    """Returns (compile_ms, execute_ms, execute_min, execute_max, total_ms, exit_code)."""
     try:
         with tempfile.TemporaryDirectory(prefix="astraldb_stress_") as tmp:
-            cwd = Path(tmp)
-            t0 = time.perf_counter()
-            proc = subprocess.run(
-                [str(astral), opt_level, "--time-sql", str(sql_path)],
-                capture_output=True,
-                text=True,
-                timeout=timeout_s,
-                check=False,
-                cwd=str(cwd),
+            timing = run_time_sql(
+                astral,
+                sql_path,
+                opt_level,
+                timeout_s,
+                cwd=Path(tmp),
+                warmup=warmup,
+                runs=runs,
+                env=astral_metadata_env(),
             )
-            wall_ms = (time.perf_counter() - t0) * 1000.0
-    except subprocess.TimeoutExpired:
-        return None, None, None, 124
     except FileNotFoundError:
-        return None, None, None, 127
-
-    blob = proc.stderr + "\n" + proc.stdout
-    m = TIME_RX.search(blob)
-    if m:
-        pc, ex, tot = map(float, m.groups())
-        return pc, ex, tot, proc.returncode
-    if proc.returncode == 0:
-        return None, None, wall_ms, proc.returncode
-    if blob.strip():
-        print(f"  [{sql_path.name}] no timing line (rc={proc.returncode}):\n", blob[:1500], flush=True)
-    return None, None, None, proc.returncode
-
-
-def median_total(runs: list[tuple[Optional[float], Optional[float], Optional[float], int]]) -> Optional[float]:
-    ok = [t[2] for t in runs if t[2] is not None]
-    if not ok:
-        return None
-    return statistics.median(ok)
+        return None, None, None, None, None, 127
+    if timing.execute_ms is None:
+        return None, None, None, None, None, 1
+    return (
+        timing.compile_ms,
+        timing.execute_ms,
+        timing.execute_min_ms,
+        timing.execute_max_ms,
+        timing.stable_ms(),
+        0,
+    )
 
 
 def plot_histogram(
@@ -143,7 +131,7 @@ def plot_histogram(
     fig, ax = plt.subplots(figsize=(max(10, 1.35 * len(ys)), 5))
     colors = [palette[i % len(palette)] for i in range(len(ys))]
     bars = ax.bar(xs, ys, color=colors)
-    ax.set_ylabel("Median wall time (ms)")
+    ax.set_ylabel("Median execute time (ms)")
     ax.set_title(title)
     ax.set_yscale("log")
     ax.tick_params(axis="x", labelsize=8)
@@ -165,8 +153,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parent.parent)
     ap.add_argument("--astral", type=Path, default=None, help="AstralDB CLI executable")
-    ap.add_argument("--astral-opt", default="-O2", help="Optimization flag (default -O2)")
+    ap.add_argument("--astral-opt", default="-O4", help="Optimization flag (default -O4)")
     ap.add_argument("--runs", type=int, default=3, help="Repeats per suite (median reported)")
+    ap.add_argument("--warmup", type=int, default=1, help="Untimed runs per suite before timing")
     ap.add_argument("--timeout", type=float, default=900.0, help="Per-run timeout seconds")
     ap.add_argument("--output", type=Path, default=Path("media/stress_torture_histogram.png"))
     ap.add_argument(
@@ -212,20 +201,21 @@ def main() -> int:
 
     for key, label, sql_path in selected:
         print(f"== {key} :: {sql_path.name} ==", flush=True)
-        runs: list[tuple[Optional[float], Optional[float], Optional[float], int]] = []
-        for i in range(args.runs):
-            pc, ex, tot, rc = run_suite(astral, sql_path, args.astral_opt, args.timeout)
-            runs.append((pc, ex, tot, rc))
-            detail = "FAILED" if tot is None else (
-                f"compile={pc:.1f} exec={ex:.1f} total={tot:.1f} ms"
-                if pc is not None and ex is not None
-                else f"wall_total={tot:.1f} ms"
-            )
-            print(f"  run {i + 1}/{args.runs}: rc={rc}  {detail}", flush=True)
-        med = median_total(runs)
+        pc, ex, ex_min, ex_max, tot, rc = run_suite(
+            astral, sql_path, args.astral_opt, args.timeout, args.warmup, args.runs
+        )
+        if ex is None:
+            print(f"  FAILED rc={rc}\n", flush=True)
+            plot_labels.append(label)
+            medians.append(None)
+            continue
+        spread = ""
+        if ex_min is not None and ex_max is not None and ex_max > ex_min * 1.05:
+            spread = f"  spread={ex_min:.1f}–{ex_max:.1f} ms"
+        detail = f"compile={pc:.1f} exec_median={ex:.1f} ms{spread}"
+        print(f"  rc={rc}  {detail}\n", flush=True)
         plot_labels.append(label)
-        medians.append(med)
-        print(f"  median total_ms={med}\n", flush=True)
+        medians.append(ex)
 
     title = (
         "AstralDB stress & torture suites (median wall time, log scale)\n"

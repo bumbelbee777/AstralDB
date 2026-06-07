@@ -2,7 +2,7 @@
 
 #include <IO/Logger.hxx>
 #include <SQL/SQL.hxx>
-#include <SQL/BytecodeInterpreter.hxx>
+#include <SQL/Bytecode/BytecodeInterpreter.hxx>
 
 #include <cctype>
 #include <filesystem>

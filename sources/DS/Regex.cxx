@@ -31,11 +31,13 @@ struct Node {
 		Plus,
 		Quest,
 		AnchorBegin,
-		AnchorEnd
+		AnchorEnd,
+		Group
 	} K = Kind::Empty;
 	std::string Lit;
 	ByteSet Class{};
 	bool ClassNegated = false;
+	int CaptureGroup = 0;
 	std::vector<std::unique_ptr<Node>> Children;
 };
 
@@ -75,6 +77,18 @@ bool BytesEqualFolded(const char *A, const char *B, std::size_t Len, Flag Flags)
 			if(A[I] != B[I])
 				return false;
 		return true;
+#elif defined(__ARM_NEON) || defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
+		std::size_t I = 0;
+		for(; I + 16 <= Len; I += 16) {
+			const uint8x16_t Va = vld1q_u8(reinterpret_cast<const uint8_t *>(A + I));
+			const uint8x16_t Vb = vld1q_u8(reinterpret_cast<const uint8_t *>(B + I));
+			if(!Simd::NeonAllEq(vceqq_u8(Va, Vb)))
+				return false;
+		}
+		for(; I < Len; ++I)
+			if(A[I] != B[I])
+				return false;
+		return true;
 #else
 		return std::memcmp(A, B, Len) == 0;
 #endif
@@ -92,10 +106,20 @@ bool ClassContains(const ByteSet &Set, bool Negated, unsigned char C, Flag Flags
 	return Negated ? !Hit : Hit;
 }
 
+int MaxCaptureGroup(const Node *N) {
+	if(!N)
+		return 0;
+	int M = (N->K == Node::Kind::Group) ? N->CaptureGroup : 0;
+	for(const auto &C : N->Children)
+		M = std::max(M, MaxCaptureGroup(C.get()));
+	return M;
+}
+
 struct Parser {
 	std::string_view Pat;
 	std::size_t Pos = 0;
 	Flag Flags = Flag::None;
+	int NextCaptureGroup = 0;
 	CompileError *Err = nullptr;
 
 	void Fail(std::size_t Off, std::string Msg) {
@@ -281,7 +305,11 @@ struct Parser {
 				Fail(Pos, "Expected ')'");
 				return std::nullopt;
 			}
-			return Inner;
+			auto N = std::make_unique<Node>();
+			N->K = Node::Kind::Group;
+			N->CaptureGroup = ++NextCaptureGroup;
+			N->Children.push_back(std::move(*Inner));
+			return N;
 		}
 		if(TakeIf('[')) {
 			--Pos;
@@ -442,67 +470,64 @@ void ScanAnchors(const Node *N, bool &Begin, bool &End) {
 	}
 }
 
-bool MatchNode(const Node *N, std::string_view Text, std::size_t &Pos, Flag Flags, std::size_t Depth);
+using CaptureVec = std::vector<std::pair<std::size_t, std::size_t>>;
+
+bool MatchNode(const Node *N, std::string_view Text, std::size_t &Pos, Flag Flags, std::size_t Depth,
+               CaptureVec *Caps);
 
 bool MatchSequencePtrs(const Node *const *Nodes, std::size_t Count, std::size_t Idx, std::string_view Text,
-                       std::size_t &Pos, Flag Flags, std::size_t Depth) {
+                       std::size_t &Pos, Flag Flags, std::size_t Depth, CaptureVec *Caps) {
 	if(Idx >= Count)
 		return true;
 	const Node *N = Nodes[Idx];
 	if(!N)
-		return MatchSequencePtrs(Nodes, Count, Idx + 1, Text, Pos, Flags, Depth);
+		return MatchSequencePtrs(Nodes, Count, Idx + 1, Text, Pos, Flags, Depth, Caps);
 
-	const auto MatchRest = [&]() { return MatchSequencePtrs(Nodes, Count, Idx + 1, Text, Pos, Flags, Depth); };
+	const auto MatchRest = [&]() {
+		return MatchSequencePtrs(Nodes, Count, Idx + 1, Text, Pos, Flags, Depth, Caps);
+	};
 
 	if((N->K == Node::Kind::Star || N->K == Node::Kind::Plus || N->K == Node::Kind::Quest)
 	   && !N->Children.empty()) {
 		const Node *Sub = N->Children[0].get();
 		if(N->K == Node::Kind::Quest) {
-			if(MatchRest())
-				return true;
 			const std::size_t Save = Pos;
-			if(MatchNode(Sub, Text, Pos, Flags, Depth + 1) && MatchRest())
+			if(MatchNode(Sub, Text, Pos, Flags, Depth + 1, Caps) && MatchRest())
 				return true;
 			Pos = Save;
-			return false;
+			return MatchRest();
 		}
-		bool NeedOne = N->K == Node::Kind::Plus;
-		const std::size_t Start = Pos;
-		if(!NeedOne && MatchRest())
-			return true;
-		std::size_t Guard = 0;
-		while(Guard++ <= Text.size()) {
-			if(!NeedOne || Pos > Start) {
-				if(MatchRest())
-					return true;
-			}
-			if(Pos >= Text.size())
-				break;
+		const bool NeedOne = N->K == Node::Kind::Plus;
+		if(NeedOne) {
+			if(!MatchNode(Sub, Text, Pos, Flags, Depth + 1, Caps))
+				return false;
+		}
+		for(;;) {
 			const std::size_t Before = Pos;
-			if(!MatchNode(Sub, Text, Pos, Flags, Depth + 1))
+			if(!MatchNode(Sub, Text, Pos, Flags, Depth + 1, Caps))
 				break;
-			if(NeedOne && Pos == Before)
+			if(Pos == Before)
 				break;
-			NeedOne = false;
 		}
-		return false;
+		return MatchRest();
 	}
 
-	if(!MatchNode(N, Text, Pos, Flags, Depth))
+	if(!MatchNode(N, Text, Pos, Flags, Depth, Caps))
 		return false;
-	return MatchSequencePtrs(Nodes, Count, Idx + 1, Text, Pos, Flags, Depth);
+	return MatchSequencePtrs(Nodes, Count, Idx + 1, Text, Pos, Flags, Depth, Caps);
 }
 
 bool MatchSequence(const std::vector<std::unique_ptr<Node>> &Nodes, std::size_t Idx, std::string_view Text,
-                   std::size_t &Pos, Flag Flags, std::size_t Depth) {
+                   std::size_t &Pos, Flag Flags, std::size_t Depth, CaptureVec *Caps) {
 	std::vector<const Node *> Ptrs;
 	Ptrs.reserve(Nodes.size());
 	for(const auto &C : Nodes)
 		Ptrs.push_back(C.get());
-	return MatchSequencePtrs(Ptrs.data(), Ptrs.size(), Idx, Text, Pos, Flags, Depth);
+	return MatchSequencePtrs(Ptrs.data(), Ptrs.size(), Idx, Text, Pos, Flags, Depth, Caps);
 }
 
-bool MatchNode(const Node *N, std::string_view Text, std::size_t &Pos, Flag Flags, std::size_t Depth) {
+bool MatchNode(const Node *N, std::string_view Text, std::size_t &Pos, Flag Flags, std::size_t Depth,
+               CaptureVec *Caps) {
 	if(!N)
 		return true;
 	if(Depth > Limits::MaxRegexMatchDepth)
@@ -543,19 +568,32 @@ bool MatchNode(const Node *N, std::string_view Text, std::size_t &Pos, Flag Flag
 		++Pos;
 		return true;
 	case Node::Kind::Concat:
-		return MatchSequence(N->Children, 0, Text, Pos, Flags, Depth);
+		return MatchSequence(N->Children, 0, Text, Pos, Flags, Depth, Caps);
 	case Node::Kind::Alternate:
 		for(const auto &C : N->Children) {
 			const std::size_t Save = Pos;
-			if(MatchNode(C.get(), Text, Pos, Flags, Depth + 1))
+			if(MatchNode(C.get(), Text, Pos, Flags, Depth + 1, Caps))
 				return true;
 			Pos = Save;
 		}
 		return false;
+	case Node::Kind::Group: {
+		if(N->Children.empty())
+			return false;
+		const std::size_t CapStart = Pos;
+		if(!MatchNode(N->Children[0].get(), Text, Pos, Flags, Depth + 1, Caps))
+			return false;
+		if(Caps && N->CaptureGroup > 0) {
+			const std::size_t Idx = static_cast<std::size_t>(N->CaptureGroup);
+			if(Idx < Caps->size())
+				(*Caps)[Idx] = {CapStart, Pos};
+		}
+		return true;
+	}
 	case Node::Kind::Star:
 	case Node::Kind::Plus:
 	case Node::Kind::Quest:
-		return MatchSequencePtrs(&N, 1, 0, Text, Pos, Flags, Depth);
+		return MatchSequencePtrs(&N, 1, 0, Text, Pos, Flags, Depth, Caps);
 	case Node::Kind::AnchorBegin:
 		if(Pos != 0) {
 			if(!HasFlag(Flags, Flag::Multiline))
@@ -576,13 +614,18 @@ bool MatchNode(const Node *N, std::string_view Text, std::size_t &Pos, Flag Flag
 	return false;
 }
 
-bool RunMatch(Node *Root, Flag Flags, bool AnchorEnd, std::string_view Text, std::size_t Start,
-              bool RequireEnd) {
+bool RunMatch(Node *Root, Flag Flags, bool AnchorEnd, std::string_view Text, std::size_t Start, bool RequireEnd,
+              CaptureVec *Caps, int NumCaptureGroups) {
 	if(!Root)
 		return Text.empty() && Start == 0;
+	if(Caps)
+		Caps->assign(static_cast<std::size_t>(NumCaptureGroups) + 1U,
+		             {std::string::npos, std::string::npos});
 	std::size_t Pos = Start;
-	if(!MatchNode(Root, Text, Pos, Flags, 0))
+	if(!MatchNode(Root, Text, Pos, Flags, 0, Caps))
 		return false;
+	if(Caps && !Caps->empty())
+		(*Caps)[0] = {Start, Pos};
 	if(RequireEnd || AnchorEnd)
 		return Pos == Text.size();
 	return true;
@@ -618,6 +661,7 @@ struct Program::Impl {
 	std::unique_ptr<Node> Root;
 	bool AnchorBegin = false;
 	bool AnchorEnd = false;
+	int NumCaptureGroups = 0;
 };
 
 std::optional<Program> Compiler::Compile(std::string_view Pattern, Flag Flags, CompileError *ErrOut) {
@@ -631,6 +675,7 @@ std::optional<Program> Compiler::Compile(std::string_view Pattern, Flag Flags, C
 	auto Impl = std::make_shared<Program::Impl>();
 	Impl->Flags = Flags;
 	Impl->Root = std::move(*Root);
+	Impl->NumCaptureGroups = MaxCaptureGroup(Impl->Root.get());
 	ScanAnchors(Impl->Root.get(), Impl->AnchorBegin, Impl->AnchorEnd);
 	Program Out;
 	Out.Impl_ = std::move(Impl);
@@ -640,7 +685,8 @@ std::optional<Program> Compiler::Compile(std::string_view Pattern, Flag Flags, C
 bool FullMatch(const Program &Re, std::string_view Text) {
 	if(!Re.Impl_ || !Re.Impl_->Root)
 		return Text.empty();
-	return RunMatch(Re.Impl_->Root.get(), Re.Impl_->Flags, Re.Impl_->AnchorEnd, Text, 0, true);
+	return RunMatch(Re.Impl_->Root.get(), Re.Impl_->Flags, Re.Impl_->AnchorEnd, Text, 0, true, nullptr,
+	                Re.Impl_->NumCaptureGroups);
 }
 
 bool Search(const Program &Re, std::string_view Text) {
@@ -648,9 +694,11 @@ bool Search(const Program &Re, std::string_view Text) {
 		return Text.empty();
 	const auto &Impl = *Re.Impl_;
 	if(Impl.AnchorBegin)
-		return RunMatch(Impl.Root.get(), Impl.Flags, Impl.AnchorEnd, Text, 0, Impl.AnchorEnd);
+		return RunMatch(Impl.Root.get(), Impl.Flags, Impl.AnchorEnd, Text, 0, Impl.AnchorEnd, nullptr,
+		                Impl.NumCaptureGroups);
 	for(std::size_t I = 0; I <= Text.size(); ++I) {
-		if(RunMatch(Impl.Root.get(), Impl.Flags, Impl.AnchorEnd, Text, I, Impl.AnchorEnd))
+		if(RunMatch(Impl.Root.get(), Impl.Flags, Impl.AnchorEnd, Text, I, Impl.AnchorEnd, nullptr,
+		            Impl.NumCaptureGroups))
 			return true;
 	}
 	return false;
@@ -659,7 +707,40 @@ bool Search(const Program &Re, std::string_view Text) {
 bool MatchAt(const Program &Re, std::string_view Text, std::size_t Start) {
 	if(!Re.Impl_)
 		return false;
-	return RunMatch(Re.Impl_->Root.get(), Re.Impl_->Flags, Re.Impl_->AnchorEnd, Text, Start, false);
+	return RunMatch(Re.Impl_->Root.get(), Re.Impl_->Flags, Re.Impl_->AnchorEnd, Text, Start, false, nullptr,
+	                Re.Impl_->NumCaptureGroups);
+}
+
+std::optional<std::string> ExtractFirst(const Program &Re, std::string_view Text, int GroupIndex) {
+	if(!Re.Impl_ || !Re.Impl_->Root || GroupIndex < 0)
+		return std::nullopt;
+	const auto &Impl = *Re.Impl_;
+	const auto TryAt = [&](std::size_t Start) -> std::optional<std::string> {
+		CaptureVec Caps;
+		if(!RunMatch(Impl.Root.get(), Impl.Flags, Impl.AnchorEnd, Text, Start, Impl.AnchorEnd, &Caps,
+		             Impl.NumCaptureGroups))
+			return std::nullopt;
+		std::size_t Pick = 0;
+		if(GroupIndex > 0 && static_cast<std::size_t>(GroupIndex) < Caps.size() &&
+		   Caps[static_cast<std::size_t>(GroupIndex)].first != std::string::npos)
+			Pick = static_cast<std::size_t>(GroupIndex);
+		else if(Caps.empty() || Caps[0].first == std::string::npos)
+			return std::nullopt;
+		const auto &Span = Caps[Pick];
+		if(Span.second < Span.first || Span.second > Text.size())
+			return std::nullopt;
+		return std::string(Text.substr(Span.first, Span.second - Span.first));
+	};
+	if(Impl.AnchorBegin) {
+		if(auto Got = TryAt(0))
+			return Got;
+		return std::nullopt;
+	}
+	for(std::size_t I = 0; I <= Text.size(); ++I) {
+		if(auto Got = TryAt(I))
+			return Got;
+	}
+	return std::nullopt;
 }
 
 bool FullMatch(std::string_view Text, std::string_view Pattern, Flag Flags) {
@@ -693,6 +774,30 @@ bool SqlMatch(std::string_view Text, std::string_view Pattern, Flag Flags) {
 		SqlCache()[Key] = CacheEntry{*Compiled};
 	}
 	return Search(*Compiled, Text);
+}
+
+std::optional<std::string> SqlExtract(std::string_view Text, std::string_view Pattern, int GroupIndex,
+                                      Flag Flags) {
+	if(Pattern.size() > Limits::MaxRegexPatternBytes || GroupIndex < 0)
+		return std::nullopt;
+	const std::string Key = CacheKey(Pattern, Flags);
+	{
+		std::lock_guard<std::mutex> Lock(SqlCacheMutex());
+		auto It = SqlCache().find(Key);
+		if(It != SqlCache().end())
+			return ExtractFirst(It->second.Prog, Text, GroupIndex);
+	}
+	CompileError Err;
+	auto Compiled = Compiler::Compile(Pattern, Flags, &Err);
+	if(!Compiled)
+		return std::nullopt;
+	{
+		std::lock_guard<std::mutex> Lock(SqlCacheMutex());
+		if(SqlCache().size() >= Limits::MaxRegexCacheEntries)
+			SqlCache().clear();
+		SqlCache()[Key] = CacheEntry{*Compiled};
+	}
+	return ExtractFirst(*Compiled, Text, GroupIndex);
 }
 
 } // namespace Regex

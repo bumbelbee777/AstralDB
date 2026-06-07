@@ -44,6 +44,7 @@ private:
 	friend bool FullMatch(const Program &, std::string_view);
 	friend bool Search(const Program &, std::string_view);
 	friend bool MatchAt(const Program &, std::string_view, std::size_t Start);
+	friend std::optional<std::string> ExtractFirst(const Program &, std::string_view, int);
 
 	struct Impl;
 	std::shared_ptr<const Impl> Impl_;
@@ -67,6 +68,13 @@ bool Search(std::string_view Text, std::string_view Pattern, Flag Flags = Flag::
 
 /** SQL integration: compile-once cache keyed by pattern + flags. */
 bool SqlMatch(std::string_view Text, std::string_view Pattern, Flag Flags = Flag::None);
+
+/** First substring match; \p GroupIndex 0 = whole match, 1+ = capturing group (default 1). */
+std::optional<std::string> ExtractFirst(const Program &Re, std::string_view Text, int GroupIndex = 1);
+
+/** Cached compile + \c ExtractFirst (ISO SQL \c REGEXP_EXTRACT). */
+std::optional<std::string> SqlExtract(std::string_view Text, std::string_view Pattern, int GroupIndex = 1,
+                                      Flag Flags = Flag::None);
 
 } // namespace Regex
 } // namespace DS

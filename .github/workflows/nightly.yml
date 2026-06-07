@@ -31,9 +31,12 @@ jobs:
               cmake -S . -B build-ci
               -G Ninja
               -DCMAKE_BUILD_TYPE=Release
+              -DASTRALDB_RELEASE_PROFILE=size
+              -DASTRALDB_RELEASE_DIST=ON
             build: cmake --build build-ci --target astraldb
             binary: build-ci/astraldb
             staged: dist/astraldb
+            upx: true
 
           - name: macos-arm64
             os: macos-14
@@ -42,9 +45,12 @@ jobs:
               cmake -S . -B build-ci
               -G Ninja
               -DCMAKE_BUILD_TYPE=Release
+              -DASTRALDB_RELEASE_PROFILE=size
+              -DASTRALDB_RELEASE_DIST=ON
             build: cmake --build build-ci --target astraldb
             binary: build-ci/astraldb
             staged: dist/astraldb
+            upx: false
 
           - name: windows-amd64
             os: windows-latest
@@ -54,9 +60,12 @@ jobs:
               -G Ninja
               -DCMAKE_BUILD_TYPE=Release
               -DCMAKE_CXX_COMPILER=clang++
+              -DASTRALDB_RELEASE_PROFILE=size
+              -DASTRALDB_RELEASE_DIST=ON
             build: cmake --build build-ci --target astraldb
             binary: build-ci/astraldb.exe
             staged: dist/astraldb.exe
+            upx: true
 
     steps:
       - name: Checkout
@@ -143,7 +152,12 @@ jobs:
         with:
           path: artifacts
 
+      - name: Setup UPX
+        uses: ./.github/actions/setup-upx
+
       - name: Stage release assets and SHA256SUMS
+        env:
+          REQUIRE_UPX: "1"
         run: bash .github/scripts/stage-release-assets.sh artifacts release
 
       - name: Set nightly tag names
@@ -175,6 +189,8 @@ jobs:
             | `astraldb-macos-arm64` | macOS Apple Silicon (arm64) |
             | `astraldb-windows-amd64.exe` | Windows x86_64 |
             | `quasar-*-py3-none-any.whl` | Quasar (Python ≥3.10) |
+
+            Linux and Windows `astraldb` builds are **UPX-packed** for smaller downloads; macOS is not.
 
             ### Verify downloads
 

@@ -10,7 +10,7 @@ struct MemoryGuard {
 	static constexpr std::size_t SoftDisableBelowBytes = 48ULL * 1024ULL * 1024ULL;
 	static constexpr std::size_t SpikeSingleAllocBytes = 8ULL * 1024ULL * 1024ULL;
 	static constexpr std::size_t SpikeGrowthBytes = 32ULL * 1024ULL * 1024ULL;
-	static constexpr std::size_t HardSessionCapBytes = 512ULL * 1024ULL * 1024ULL;
+	static constexpr std::size_t HardSessionCapBytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
 
 	/** Fast path: false → skip accounting on small steady-state work. */
 	static bool GuardsActive() noexcept;
@@ -26,6 +26,9 @@ struct MemoryGuard {
 
 	/** Bounds check for index/size pairs; returns false when \p Index >= \p Size or overflow would occur. */
 	static bool SecureBoundsCheck(std::size_t Index, std::size_t Size, std::size_t ElementBytes = 1) noexcept;
+
+	/** True when \p Offset + \p Bytes fits in a buffer of \p Capacity (overflow-safe). */
+	static bool BufferRangeFits(std::size_t Offset, std::size_t Bytes, std::size_t Capacity) noexcept;
 
 	/** Reset session accounting (tests and post-VACUUM). */
 	static void ResetSession() noexcept;

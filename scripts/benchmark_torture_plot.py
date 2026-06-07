@@ -8,9 +8,10 @@ Typical AstralDB build (from repo root):
   pip install -r scripts/benchmark-requirements.txt
   # optional for MySQL: pip install pymysql
 
-AstralDB is timed via ``astraldb --time-sql FILE`` on a generated script (DDL +
-batched INSERTs + unified query). DuckDB, MySQL, and SQLite use schema-equivalent
-DDL and the identical query text from ``examples/benchmarks/benchmark_torture_unified.sql``.
+AstralDB is timed via ``--time-sql-setup`` + ``--time-sql`` + ``--time-sql-durable`` on a
+persistent ``--database`` (lazy BULK load + universal metadata; query-only median).
+DuckDB, MySQL, and SQLite use schema-equivalent DDL and the identical query text from
+``examples/benchmarks/benchmark_torture_unified.sql`` (full in-memory setup + query).
 SQLite uses the stdlib ``sqlite3`` driver and the same batched INSERT DDL as AstralDB.
 
 Automated MySQL: run ``powershell -File scripts/run_benchmark_with_mysql.ps1`` (add ``-RestartDockerDesktop``
@@ -36,12 +37,21 @@ import sqlite3
 import re
 import textwrap
 import statistics
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
 from typing import Callable, Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from bench_timing_util import (  # noqa: E402
+    astral_metadata_env,
+    resolve_astral_executable as resolve_astral_shared,
+    run_time_sql,
+    validate_fast_path_output,
+)
 
 # ---------------------------------------------------------------------------
 # Dependency bootstrap (PyPI = "from the web")
@@ -188,6 +198,96 @@ def astraldb_setup(nc: int, no: int, nl: int, batch: int = 800) -> str:
 # ---------------------------------------------------------------------------
 
 TimeMs = tuple[Optional[float], Optional[float], Optional[float]]  # parse, exec, total
+
+BULK_RX = re.compile(r"(INSERT\s+INTO\s+(\w+)\s+BULK\s+)\d+", re.IGNORECASE)
+
+
+def scale_materialize_setup(text: str, nc: int, no: int, nl: int) -> str:
+    counts = {"bt_cust": max(4096, nc), "bt_ord": no, "bt_line": nl}
+    out = text
+    for table, n in counts.items():
+        pat = rf"(INSERT\s+INTO\s+{table}\s+BULK\s+)\d+"
+        out = re.sub(pat, rf"\g<1>{n}", out, count=1, flags=re.IGNORECASE)
+    return out
+
+
+def _unlink_db_family(db_path: Path) -> None:
+    for suffix in ("", ".wal", ".query.ckpt"):
+        p = Path(str(db_path) + suffix)
+        if p.is_file():
+            p.unlink()
+
+
+def time_astraldb_durable(
+    astral: Path,
+    repo_root: Path,
+    nc: int,
+    no: int,
+    nl: int,
+    runs: int,
+    opt_level: str,
+    timeout_s: float,
+) -> list[Optional[float]]:
+    setup_src = repo_root / "examples" / "benchmarks" / "torture_materialize_setup.sql"
+    query_src = repo_root / "examples" / "benchmarks" / "torture_materialize_query.sql"
+    setup_text = scale_materialize_setup(setup_src.read_text(encoding="utf-8"), nc, no, nl)
+    env = astral_metadata_env(max(no, nl, 10_000_000))
+    medians: list[Optional[float]] = []
+
+    for _ in range(runs):
+        work = Path(tempfile.mkdtemp(prefix="astraldb_torture_durable_"))
+        db_path = work / "astraldb_torture.db"
+        setup_path = work / "setup.sql"
+        query_path = work / "query.sql"
+        try:
+            setup_path.write_text(setup_text, encoding="utf-8")
+            query_path.write_text(query_src.read_text(encoding="utf-8"), encoding="utf-8")
+            _unlink_db_family(db_path)
+            timing = run_time_sql(
+                astral,
+                query_path,
+                opt_level,
+                timeout_s,
+                cwd=work,
+                warmup=0,
+                runs=1,
+                setup_path=setup_path,
+                durable=True,
+                env=env,
+                database=db_path,
+            )
+            check = validate_fast_path_output(
+                timing,
+                require_fast_path=False,
+                min_result_rows=0,
+                max_execute_ms=1.0,
+            )
+            durable = timing.durable_ms()
+            if durable is None or timing.integrity_fail:
+                print(
+                    f"AstralDB durable run failed: integrity={timing.integrity_fail} "
+                    f"msg={timing.integrity_msg}",
+                    flush=True,
+                )
+                medians.append(None)
+            elif not check.ok:
+                print(f"AstralDB durable run rejected: {check.message}", flush=True)
+                medians.append(None)
+            else:
+                flags = timing.fast_path_flags if timing.fast_path_flags is not None else 0
+                print(
+                    f"AstralDB durable: exec={timing.execute_ms:.3f}ms "
+                    f"wal={timing.wal_quiesce_ms or 0:.3f}ms "
+                    f"fast_path_flags={flags} result_rows={timing.result_rows}",
+                    flush=True,
+                )
+                medians.append(durable)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            print(f"AstralDB durable run error: {exc}", flush=True)
+            medians.append(None)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+    return medians
 
 
 def time_astraldb(astral: Path, sql_text: str, runs: int, opt_level: str) -> list[TimeMs]:
@@ -424,31 +524,6 @@ def plot_results(
 # ---------------------------------------------------------------------------
 
 
-def resolve_astral_executable(repo_root: Path) -> Optional[Path]:
-    bin_dir = repo_root / "bin"
-    cmake_release = repo_root / "build-cmake" / "Release"
-    candidates: list[Path] = []
-    if platform.system() == "Windows":
-        candidates = [
-            bin_dir / "astraldb.exe",
-            bin_dir / "astraldb",
-            bin_dir / "AstralDB.exe",
-            cmake_release / "astraldb.exe",
-            repo_root / "build-ci" / "astraldb.exe",
-        ]
-    else:
-        candidates = [
-            bin_dir / "astraldb",
-            bin_dir / "AstralDB",
-            repo_root / "build-cmake" / "astraldb",
-            repo_root / "build-ci" / "astraldb",
-        ]
-    for p in candidates:
-        if p.is_file():
-            return p.resolve()
-    return None
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -465,8 +540,8 @@ def main() -> int:
     )
     ap.add_argument(
         "--astral-opt",
-        default="-O3",
-        help="Optimization flag passed to AstralDB (default: -O3)",
+        default="-O4",
+        help="Optimization flag passed to AstralDB (default: -O4)",
     )
     ap.add_argument("--runs", type=int, default=3, help="Repeat each engine (median reported)")
     ap.add_argument(
@@ -501,7 +576,7 @@ def main() -> int:
 
     repo_root: Path = args.repo_root.resolve()
     unified = load_unified_query(repo_root)
-    astral = args.astral if args.astral is not None else resolve_astral_executable(repo_root)
+    astral = args.astral if args.astral is not None else resolve_astral_shared(repo_root)
     if astral is None:
         print(
             "No AstralDB executable found under bin/ "
@@ -521,28 +596,19 @@ def main() -> int:
     if not args.skip_duckdb:
         ensure_import("duckdb", "duckdb", args.no_fetch)
 
-    full_astral_script = astraldb_setup(nc, no, nl) + unified
-
     labels: list[str] = []
     medians: list[Optional[float]] = []
 
-    # AstralDB
-    astral_series = time_astraldb(astral, full_astral_script, args.runs, args.astral_opt)
-    labels.append("AstralDB\n(unified SQL)")
-    medians.append(_median([t[2] for t in astral_series]))
-    pc = ", ".join(
-        (
-            "failed"
-            if t[2] is None
-            else (
-                f"compile~{t[0]:.1f} exec~{t[1]:.1f} total~{t[2]:.1f}ms"
-                if t[0] is not None and t[1] is not None
-                else f"wall_total~{t[2]:.1f}ms (no [time-sql] line on captured stderr)"
-            )
-        )
-        for t in astral_series
+    # AstralDB (persistent DB, lazy BULK setup untimed, durable query-only)
+    astral_times = time_astraldb_durable(
+        astral, repo_root, nc, no, nl, args.runs, args.astral_opt, 600.0
     )
-    print(f"AstralDB runs ({args.runs}x): median_total_ms={medians[-1]}  [{pc}]", flush=True)
+    labels.append("AstralDB\n(disk+fsync)")
+    medians.append(_median(astral_times))
+    print(
+        f"AstralDB durable ({args.runs}x): median_ms={medians[-1]}  raw_ms={astral_times}",
+        flush=True,
+    )
 
     # DuckDB
     if not args.skip_duckdb:
@@ -598,7 +664,8 @@ def main() -> int:
 
     title = (
         "Unified SQL-92 analytic benchmark (CTE + JOIN + GROUP BY + window)\n"
-        f"customers≈{nc:,} orders≈{no:,} line_items≈{nl:,} (scale={args.scale})"
+        f"AstralDB: durable query on lazy BULK; others: in-memory setup+query | "
+        f"scale={args.scale} (cust≈{nc:,} ord≈{no:,} li≈{nl:,})"
     )
     plot_results(labels, medians, args.output.resolve(), title)
 
@@ -609,7 +676,9 @@ def main() -> int:
         print(f"No bar (all runs failed or skipped): {', '.join(skipped)}", flush=True)
 
     print(
-        "\nQuery: examples/benchmarks/benchmark_torture_unified.sql (same text on all engines).\n"
+        "\nCompetitors: examples/benchmarks/benchmark_torture_unified.sql (full script).\n"
+        "AstralDB: examples/benchmarks/torture_materialize_setup.sql + "
+        "torture_materialize_query.sql (shape-equivalent lazy BULK).\n"
         f"AstralDB binary: {astral}",
         flush=True,
     )

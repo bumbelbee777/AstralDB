@@ -1,12 +1,12 @@
 #pragma once
 
-#include <Database/WriteAheadLog.hxx>
-#include <Database/HybridStorageScheduler.hxx>
-#include <Database/Dataset.hxx>
-#include <Database/EmbeddingCatalog.hxx>
-#include <Database/Graph.hxx>
-#include <Database/HybridTable.hxx>
-#include <Database/Superfetch.hxx>
+#include <Database/Storage/WriteAheadLog.hxx>
+#include <Database/Storage/HybridStorageScheduler.hxx>
+#include <Database/Storage/Dataset.hxx>
+#include <Database/Embedding/EmbeddingCatalog.hxx>
+#include <Database/Graph/Graph.hxx>
+#include <Database/Storage/HybridTable.hxx>
+#include <Database/Storage/Superfetch.hxx>
 #include <IO/Limits.hxx>
 #include <IO/Spinlock.hxx>
 #include <mutex>
@@ -15,10 +15,10 @@
 #include <IO/Logger.hxx>
 #include <IO/AuditLog.hxx>
 #include <DS/EncryptedString.hxx>
-#include <Database/User.hxx>
-#include <Database/IndexManagement.hxx>
-#include <Database/TextIndex.hxx>
-#include <Database/VectorIndex.hxx>
+#include <Database/Security/User.hxx>
+#include <Database/Index/IndexManagement.hxx>
+#include <Database/Index/FtsIndex.hxx>
+#include <Database/Index/VectorIndex.hxx>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -30,7 +30,8 @@
 #include <atomic>
 #include <thread>
 #include <optional>
-#include <SQL/BytecodeTriggers.hxx>
+#include <Database/Catalog/Triggers.hxx>
+#include <Database/Execution/BytecodeTypes.hxx>
 
 namespace AstralDB {
 
@@ -41,7 +42,7 @@ void DatabaseVmPopDbMutexDepth() noexcept;
 struct FtsIndexSpec {
 	std::string Table;
 	std::string Column;
-	TextIndex Index;
+	FtsIndex Index;
 };
 
 struct VectorIndexSpec {
@@ -140,6 +141,12 @@ public:
     using Table = std::vector<Item>;
     using TablesMap = std::unordered_map<std::string, HybridTableSlot>;
 
+	/** In-memory rollback image for BEGIN/SAVEPOINT on session or medium-sized databases. */
+	struct DatabaseWorkingSnapshot {
+		TablesMap Tables;
+		std::map<std::string, Schema> TableSchemas;
+	};
+
 private:
     std::optional<User> CurrentUser_;
     std::vector<User> Users_;
@@ -161,7 +168,7 @@ private:
 	/** Persisted CREATE PROCEDURE bodies (cached \c .abc under \c astraldb_procs_cache ). */
 	std::unordered_map<std::string, std::string> ProcedureDefinitionSql_;
 	/** Persisted CREATE TRIGGER specs (catalog + snapshot + WAL). */
-	std::unordered_map<std::string, SQL::StoredTriggerEntry> TriggerDefinitions_;
+	std::unordered_map<std::string, StoredTriggerEntry> TriggerDefinitions_;
 	int TriggerFireDepth_ = 0;
 	std::unordered_map<std::string, SequenceState> Sequences_;
 	std::unordered_map<std::string, DatasetCatalog> Datasets_;
@@ -174,6 +181,7 @@ private:
 	std::unordered_map<std::string, std::vector<std::string>> GraphProjectionsByBase_;
 
     std::atomic<bool> Dirty_;
+	std::optional<DatabaseWorkingSnapshot> TransactionSnapshot_;
 	std::atomic<bool> WalSuspended_{false};
     std::atomic<bool> StopFlushWorker_;
     std::thread FlushWorkerThread_;
@@ -199,7 +207,8 @@ private:
 	void AppendWalAfterDrop(const std::string &TableName);
 	void AppendWalAfterDefineView(const std::string &ViewName, const std::string &SqlBody);
 	void AppendWalAfterDropView(const std::string &ViewName);
-	void AppendWalAfterDefineProcedure(const std::string &Name, const std::string &SqlBody);
+	void AppendWalAfterDefineProcedure(const std::string &Name, const std::string &SqlBody,
+	                                   std::string_view ControlFlowBlob = {});
 	void AppendWalAfterDropProcedure(const std::string &Name);
 	void AppendWalAfterDefineTrigger(const std::string &Name, const std::string &SpecJson);
 	void AppendWalAfterDropTrigger(const std::string &Name);
@@ -285,6 +294,8 @@ public:
 	void SyncToFileAndCopyMainDbFileTo(const std::filesystem::path &SnapshotPath);
 	/** Persist any buffered WAL lines to the .wal file (COMMIT / checkpoint / shutdown). */
 	void FlushWalToDisk();
+	void QuiesceAsyncFsync();
+	[[nodiscard]] std::size_t PendingWalAsyncFsync() const { return Wal_.PendingAsyncFsyncCount(); }
 
 	/** Internal: bounded async worker accounting; do not call from application code. */
 	void AcquireAsyncBudget() const;
@@ -327,6 +338,12 @@ public:
 	void GraphPageRank(const GraphPageRankRequest &Req);
 	/** Replace \p TableName with \p Schema and \p Rows under one lock (graph result materialization). */
 	void ReplaceTableContents(const std::string &TableName, const Schema &Schema, Table Rows);
+	/** Same as \c ReplaceTableContents; caller must hold \c DbMutex_. */
+	void ReplaceTableContentsAssumeLocked(const std::string &TableName, const Schema &Schema, Table Rows);
+	/** Columnar-first table body for bulk CUBE/window fast paths; caller must hold \c DbMutex_. */
+	void ReplaceTableContentsColumnarAssumeLocked(const std::string &TableName, const Schema &Schema, Table Rows);
+	void ReplaceTableContentsFromColumnarAssumeLocked(const std::string &TableName, const Schema &Schema,
+	                                                  ColumnarTable Col);
 	/** Compact storage, rebuild columnar replicas, sync main file, truncate WAL. */
 	void Vacuum(const std::string &TableName = std::string());
 	/** Online repack: build shadow table and swap under brief exclusive lock. */
@@ -405,13 +422,23 @@ public:
 
     IndexManagement<std::string, size_t>& GetOrCreateIndex(const std::string& table, const std::string& column);
 
+	void EnsureBTreeIndexesForTableAssumeLocked(const std::string &TableName);
+	void RebuildBTreeIndexesForTableAssumeLocked(const std::string &TableName);
+	std::optional<std::vector<size_t>> LookupRowsByBTreeAssumeLocked(const std::string &TableName, const std::string &Column,
+	                                                                 const std::string &Op, const std::string &Value);
+	bool TryLimitByPrimaryIndexAssumeLocked(const std::string &TableName, std::size_t LimitCount, Table &OutRows);
+	[[nodiscard]] HybridTableSlot *FindTableSlotAssumeDbMutexHeld(const std::string &TableName) noexcept;
+	bool TryLazyBulkStarGroupByFromBaseTablesAssumeLocked(const SQL::Instruction &Inst,
+	                                                      const std::vector<std::string> &GroupKeys, Table &Out,
+	                                                      std::uint64_t *RowsScanned);
+
 	void CreateFtsIndex(const std::string &IndexName, const std::string &TableName, const std::string &ColumnName);
 	void DropFtsIndex(const std::string &IndexName, bool IfExists);
 	void CreateVectorIndex(const std::string &IndexName, const std::string &TableName, const std::string &ColumnName,
 	                      VectorMetric Metric);
 	void DropVectorIndex(const std::string &IndexName, bool IfExists);
 	void DropSecondaryIndex(const std::string &IndexName, bool IfExists);
-	const TextIndex *FtsForColumn(const std::string &TableName, const std::string &ColumnName) const;
+	const FtsIndex *FtsForColumn(const std::string &TableName, const std::string &ColumnName) const;
 	std::vector<size_t> VectorTopK(const std::string &IndexName, const std::vector<double> &Query, std::size_t K) const;
 	/** Like \c VectorTopK without locking; caller must hold \c DbMutex_ exclusively (bytecode VM). */
 	std::vector<size_t> VectorTopKAssumeDbMutexHeld(const std::string &IndexName, const std::vector<double> &Query,
@@ -420,12 +447,14 @@ public:
     bool ExportToCSV(std::filesystem::path Destination);
     bool ExportToJSON(std::filesystem::path Destination);
     bool ExportToTSV(std::filesystem::path Destination);
-    /** Full-database bundle (markers + CSV semantics for csv/tsv). Format: json | csv | tsv */
+    /** Full-database bundle. Format: json | csv | tsv | xlsx (excel alias) */
     bool ExportBundle(std::filesystem::path Destination, std::string_view Format);
     bool ImportFromCSV(const std::string& TableName, std::filesystem::path Source);
     bool ImportFromJSON(const std::string& TableName, std::filesystem::path Source);
     bool ImportFromTSV(const std::string& TableName, std::filesystem::path Source);
-    /** Replace all loaded tables/schemas with bundle contents. Format: json | csv | tsv */
+    /** First worksheet → table (T-SQL OPENROWSET / BULK-style single-sheet import). */
+    bool ImportFromXlsx(const std::string& TableName, std::filesystem::path Source);
+    /** Replace all loaded tables/schemas with bundle contents. Format: json | csv | tsv | xlsx */
     bool ImportBundle(std::filesystem::path Source, std::string_view Format);
 
     static bool ConvertTabularFiles(std::filesystem::path SourcePath, std::filesystem::path DestPath,
@@ -458,6 +487,15 @@ public:
 	/** Snapshot copy of table + schema (no WAL records). Dest is replaced if it already existed. */
 	void CloneTable(const std::string &Dest, const std::string &Src);
 
+	/** Fast transaction/savepoint path when row count is modest or the DB file is an ephemeral session. */
+	bool PreferMemorySnapshots() const;
+	DatabaseWorkingSnapshot CaptureWorkingSnapshot() const;
+	void RestoreWorkingSnapshot(DatabaseWorkingSnapshot Snap);
+	bool HasTransactionSnapshot() const;
+	void BeginTransactionSnapshot();
+	void CommitTransactionSnapshot();
+	void RollbackTransactionSnapshot();
+
 	/** COPY of view SQL bodies (thread-safe); used when compiling against a primed database. */
 	std::unordered_map<std::string, std::string> ViewDefinitionsSnapshot() const;
 	bool HasViewDefinition(const std::string &ViewName) const;
@@ -469,9 +507,10 @@ public:
 	                    bool OrReplace = false, std::string SourceDialect = {},
 	                    std::string ExceptionHandlersJson = {}, std::string ControlFlowJson = {});
 	void DropProcedureDefinition(const std::string &ProcedureName, bool IfExists = false);
-	void ReplayWalDefineProcedure(const std::string &ProcedureName, std::string SqlBody);
+	void ReplayWalDefineProcedure(const std::string &ProcedureName, std::string SqlBody,
+	                              std::string ControlFlowBlob = {});
 	void ReplayWalDropProcedure(const std::string &ProcedureName);
-	void DefineTrigger(SQL::StoredTriggerEntry Spec, bool IfNotExists = false, bool OrReplace = false);
+	void DefineTrigger(StoredTriggerEntry Spec, bool IfNotExists = false, bool OrReplace = false);
 	void DropTriggerDefinition(const std::string &TriggerName, bool IfExists = false);
 	void SetTriggerEnabled(const std::string &TriggerName, bool Enabled);
 	void ReplayWalDefineTrigger(const std::string &TriggerName, std::string SpecJson);
@@ -487,7 +526,7 @@ public:
 			--TriggerFireDepth_;
 	}
 	/** Caller must hold \c DbMutex_ exclusively. */
-	const std::unordered_map<std::string, SQL::StoredTriggerEntry> &TriggerDefinitionsAssumeLocked() const {
+	const std::unordered_map<std::string, StoredTriggerEntry> &TriggerDefinitionsAssumeLocked() const {
 		return TriggerDefinitions_;
 	}
 	/** Idempotent WAL replay helpers (no new WAL rows; overwrite view SQL if name already mapped). */

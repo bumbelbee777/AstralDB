@@ -1,8 +1,10 @@
-#include <SQL/Bytecode.hxx>
+#include <SQL/Bytecode/Bytecode.hxx>
 #include <IO/Logger.hxx>
 #include <algorithm>
+#include <cstdint>
 #include <limits>
 #include <optional>
+#include <tuple>
 #include <unordered_set>
 #include <vector>
 
@@ -15,7 +17,7 @@ constexpr size_t kIpRemoved = std::numeric_limits<size_t>::max();
 
 int PeepholeRoundsFor(const OptimizationLevel Level) {
 	if(Level >= OptimizationLevel::Maximum)
-		return 4;
+		return 6;
 	if(Level >= OptimizationLevel::Advanced)
 		return 3;
 	return 2;
@@ -23,7 +25,7 @@ int PeepholeRoundsFor(const OptimizationLevel Level) {
 
 int AdvancedRoundsFor(const OptimizationLevel Level) {
 	if(Level >= OptimizationLevel::Maximum)
-		return 3;
+		return 5;
 	return 2;
 }
 
@@ -69,9 +71,105 @@ std::optional<int64_t> FoldBinary(Opcode Op, int64_t A, int64_t B) {
 		return static_cast<int64_t>(A > B);
 	case Opcode::GE:
 		return static_cast<int64_t>(A >= B);
+	case Opcode::INT_DIV:
+		if(B == 0)
+			return std::nullopt;
+		return A / B;
 	default:
 		return std::nullopt;
 	}
+}
+
+using RowTriple = std::tuple<std::string, std::string, std::string>;
+
+bool IsPowerOfTwo(int64_t V) {
+	return V > 0 && (static_cast<uint64_t>(V) & (static_cast<uint64_t>(V) - 1)) == 0;
+}
+
+bool ReadDnfOperands(const std::vector<Value> &Ops, size_t Start, size_t &OutEnd,
+                     std::vector<std::vector<RowTriple>> &OutBranches) {
+	size_t I = Start;
+	if(I >= Ops.size())
+		return false;
+	const auto *Nb = std::get_if<int64_t>(&Ops[I++]);
+	if(!Nb || *Nb < 0 || *Nb > 64)
+		return false;
+	for(int64_t B = 0; B < *Nb; ++B) {
+		if(I >= Ops.size())
+			return false;
+		const auto *Nk = std::get_if<int64_t>(&Ops[I++]);
+		if(!Nk || *Nk < 0 || *Nk > 128)
+			return false;
+		std::vector<RowTriple> Branch;
+		for(int64_t K = 0; K < *Nk; ++K) {
+			if(I + 3 > Ops.size())
+				return false;
+			const auto *Cs = std::get_if<std::string>(&Ops[I++]);
+			const auto *Os = std::get_if<std::string>(&Ops[I++]);
+			const auto *Vs = std::get_if<std::string>(&Ops[I++]);
+			if(!Cs || !Os || !Vs)
+				return false;
+			Branch.emplace_back(*Cs, *Os, *Vs);
+		}
+		OutBranches.push_back(std::move(Branch));
+	}
+	OutEnd = I;
+	return true;
+}
+
+void AppendDnfOperands(std::vector<Value> &Ops, const std::vector<std::vector<RowTriple>> &Dnf) {
+	Ops.push_back(static_cast<int64_t>(Dnf.size()));
+	for(const auto &Branch : Dnf) {
+		Ops.push_back(static_cast<int64_t>(Branch.size()));
+		for(const auto &[Col, O, V] : Branch) {
+			Ops.push_back(Col);
+			Ops.push_back(O);
+			Ops.push_back(V);
+		}
+	}
+}
+
+void MergeConsecutiveDnfs(const std::vector<std::vector<RowTriple>> &A, const std::vector<std::vector<RowTriple>> &B,
+                          std::vector<std::vector<RowTriple>> &Out) {
+	Out.clear();
+	Out.reserve(A.size() * B.size());
+	for(const auto &Ba : A) {
+		for(const auto &Bb : B) {
+			std::vector<RowTriple> Branch = Ba;
+			Branch.insert(Branch.end(), Bb.begin(), Bb.end());
+			Out.push_back(std::move(Branch));
+		}
+	}
+}
+
+struct StackSlot {
+	bool Known = false;
+	int64_t Value = 0;
+};
+
+void ClearStackOnBoundary(const Instruction &Inst, std::vector<StackSlot> &Stack) {
+	if(Inst.HasSideEffects() || Inst.IsTerminator() || Inst.Opcode_ == Opcode::POP || Inst.Opcode_ == Opcode::CALL ||
+	   Inst.Opcode_ == Opcode::RET)
+		Stack.clear();
+}
+
+bool EliminateDeadPureBeforePop(Bytecode &Code) {
+	bool Modified = false;
+	for(size_t I = 0; I + 3 < Code.size(); ++I) {
+		if(Code[I + 3].Opcode_ != Opcode::POP)
+			continue;
+		int64_t A = 0;
+		int64_t B = 0;
+		if(!IsPushInt64(Code[I], A) || !IsPushInt64(Code[I + 1], B))
+			continue;
+		if(!Code[I + 2].IsPure() || !Code[I + 2].Operands.empty())
+			continue;
+		Code[I] = MakeInstruction(Opcode::NOP);
+		Code[I + 1] = MakeInstruction(Opcode::NOP);
+		Code[I + 2] = MakeInstruction(Opcode::NOP);
+		Modified = true;
+	}
+	return Modified;
 }
 
 std::optional<int64_t> FoldUnary(Opcode Op, int64_t A) {
@@ -247,16 +345,111 @@ bool TryFoldPushPushOp(Bytecode &Code, size_t I, Bytecode &Out, std::vector<size
 		Modified = true;
 		return true;
 	}
+	if(A == B) {
+		if(Op.Opcode_ == Opcode::SUB) {
+			Remap[I] = OutIdx;
+			Remap[I + 1] = OutIdx;
+			Remap[I + 2] = OutIdx;
+			Out.push_back(MakeInstruction(Opcode::PUSH, static_cast<int64_t>(0)));
+			Modified = true;
+			return true;
+		}
+		if(Op.Opcode_ == Opcode::DIV && A != 0) {
+			Remap[I] = OutIdx;
+			Remap[I + 1] = OutIdx;
+			Remap[I + 2] = OutIdx;
+			Out.push_back(MakeInstruction(Opcode::PUSH, static_cast<int64_t>(1)));
+			Modified = true;
+			return true;
+		}
+		if(Op.Opcode_ == Opcode::MOD && A != 0) {
+			Remap[I] = OutIdx;
+			Remap[I + 1] = OutIdx;
+			Remap[I + 2] = OutIdx;
+			Out.push_back(MakeInstruction(Opcode::PUSH, static_cast<int64_t>(0)));
+			Modified = true;
+			return true;
+		}
+	}
+	if(Op.Opcode_ == Opcode::AND && (A == 0 || B == 0)) {
+		Remap[I] = OutIdx;
+		Remap[I + 1] = OutIdx;
+		Remap[I + 2] = OutIdx;
+		Out.push_back(MakeInstruction(Opcode::PUSH, static_cast<int64_t>(0)));
+		Modified = true;
+		return true;
+	}
+	if(Op.Opcode_ == Opcode::OR && (A == 1 || B == 1)) {
+		Remap[I] = OutIdx;
+		Remap[I + 1] = OutIdx;
+		Remap[I + 2] = OutIdx;
+		Out.push_back(MakeInstruction(Opcode::PUSH, static_cast<int64_t>(1)));
+		Modified = true;
+		return true;
+	}
+	if(Op.Opcode_ == Opcode::OR && A == 0) {
+		Remap[I] = OutIdx;
+		Remap[I + 1] = OutIdx;
+		Out.push_back(Code[I + 1]);
+		Modified = true;
+		return true;
+	}
+	if(Op.Opcode_ == Opcode::OR && B == 0) {
+		Remap[I] = OutIdx;
+		Remap[I + 1] = OutIdx;
+		Out.push_back(Code[I]);
+		Modified = true;
+		return true;
+	}
+	if(Op.Opcode_ == Opcode::DIV && B == 1) {
+		Remap[I] = OutIdx;
+		Remap[I + 1] = OutIdx;
+		Out.push_back(Code[I]);
+		Modified = true;
+		return true;
+	}
+	if(Op.Opcode_ == Opcode::MOD && B == 1) {
+		Remap[I] = OutIdx;
+		Remap[I + 1] = OutIdx;
+		Remap[I + 2] = OutIdx;
+		Out.push_back(MakeInstruction(Opcode::PUSH, static_cast<int64_t>(0)));
+		Modified = true;
+		return true;
+	}
 	return false;
+}
+
+bool TryStrengthReduceMul(Bytecode &Code, size_t I, Bytecode &Out, std::vector<size_t> &Remap, bool &Modified) {
+	int64_t A = 0;
+	int64_t B = 0;
+	if(I + 2 >= Code.size() || !IsPushInt64(Code[I], A) || !IsPushInt64(Code[I + 1], B))
+		return false;
+	if(Code[I + 2].Opcode_ != Opcode::MUL || !Code[I + 2].Operands.empty())
+		return false;
+	if(!IsPowerOfTwo(B) || B == 1)
+		return false;
+	const size_t OutIdx = Out.size();
+	Remap[I] = OutIdx;
+	Out.push_back(Code[I]);
+	if(B != 2)
+		return false;
+	Remap[I + 1] = OutIdx + 1;
+	Out.push_back(Code[I]);
+	Remap[I + 2] = OutIdx + 2;
+	Out.push_back(MakeInstruction(Opcode::ADD));
+	Modified = true;
+	return true;
 }
 
 void RunBasicPasses(Bytecode &Code, Logger *Logger, const int Rounds) {
 	const auto RunPass = [&](OptimizationPass &Pass) -> bool { return Pass.Run(Code, Logger); };
+	ConstantPropagationPass CProp;
 	PeepholePass Peephole;
 	ConstantFoldingPass Fold;
+	PredicatePushdownPass Pushdown;
 	DeadCodeEliminationPass Dce;
 	for(int Round = 0; Round < Rounds; ++Round) {
-		const bool Changed = RunPass(Peephole) || RunPass(Fold);
+		const bool Changed = RunPass(CProp) || RunPass(Peephole) || RunPass(Fold) || RunPass(Pushdown);
 		if(!Changed)
 			break;
 	}
@@ -308,7 +501,9 @@ void RunOptimizerPipeline(Bytecode &Code, const OptimizationLevel OptLevel, Logg
 	if(Logger)
 		Logger->Info("Applying bytecode optimizations");
 
-	const Bytecode Backup = Code;
+	std::optional<Bytecode> Backup;
+	if(OptLevel >= OptimizationLevel::Basic)
+		Backup = Code;
 	const int BasicRounds = PeepholeRoundsFor(OptLevel);
 	const int AdvRounds = AdvancedRoundsFor(OptLevel);
 
@@ -320,6 +515,13 @@ void RunOptimizerPipeline(Bytecode &Code, const OptimizationLevel OptLevel, Logg
 		UnreachableBlockPass().Run(Code, Logger);
 	if(OptLevel >= OptimizationLevel::Maximum) {
 		RunAdvancedPasses(Code, Logger, AdvRounds);
+		AlgebraicSimplificationPass().Run(Code, Logger);
+		LogicalSimplificationPass().Run(Code, Logger);
+		IdentityEliminationPass().Run(Code, Logger);
+		StrengthReductionPass().Run(Code, Logger);
+		DeadCodeEliminationPass().Run(Code, Logger);
+		RunBasicPasses(Code, Logger, BasicRounds);
+		RunAdvancedPasses(Code, Logger, AdvRounds);
 		DeadCodeEliminationPass().Run(Code, Logger);
 		RunBasicPasses(Code, Logger, BasicRounds);
 		DeadCodeEliminationPass().Run(Code, Logger);
@@ -328,7 +530,8 @@ void RunOptimizerPipeline(Bytecode &Code, const OptimizationLevel OptLevel, Logg
 	if(!ValidateBytecodeControlFlow(Code)) {
 		if(Logger)
 			Logger->Info("Optimizer: control-flow invalid after passes; reverting bytecode");
-		Code = Backup;
+		if(Backup)
+			Code = std::move(*Backup);
 	}
 }
 
@@ -392,6 +595,10 @@ bool PeepholePass::Run(Bytecode &Code, Logger *Logger) {
 			I += 3;
 			continue;
 		}
+		if(TryStrengthReduceMul(Code, I, Out, Remap, Modified)) {
+			I += 3;
+			continue;
+		}
 
 		if(I + 2 < Code.size()) {
 			int64_t A = 0;
@@ -431,11 +638,136 @@ bool PeepholePass::Run(Bytecode &Code, Logger *Logger) {
 	return true;
 }
 
+bool ConstantPropagationPass::Run(Bytecode &Code, Logger *Logger) {
+	if(Logger)
+		Logger->Info("Running constant propagation");
+	if(Code.empty())
+		return false;
+	bool Modified = false;
+	std::vector<StackSlot> Stack;
+	Stack.reserve(32);
+	for(size_t I = 0; I < Code.size(); ++I) {
+		Instruction &Inst = Code[I];
+		if(Inst.Opcode_ == Opcode::PUSH) {
+			if(const auto *V = std::get_if<int64_t>(&Inst.Operands[0])) {
+				Stack.push_back(StackSlot{true, *V});
+				continue;
+			}
+			Stack.clear();
+			continue;
+		}
+		if(Inst.Opcode_ == Opcode::POP) {
+			if(!Stack.empty())
+				Stack.pop_back();
+			continue;
+		}
+		if(Inst.IsPure() && Inst.Operands.empty() && Stack.size() >= 2) {
+			const StackSlot B = Stack.back();
+			Stack.pop_back();
+			const StackSlot A = Stack.back();
+			Stack.pop_back();
+			if(A.Known && B.Known) {
+				if(const auto Folded = FoldBinary(Inst.Opcode_, A.Value, B.Value)) {
+					if(I >= 2) {
+						Code[I - 2] = MakeInstruction(Opcode::NOP);
+						Code[I - 1] = MakeInstruction(Opcode::NOP);
+					}
+					Inst = MakeInstruction(Opcode::PUSH, *Folded);
+					Stack.push_back(StackSlot{true, *Folded});
+					Modified = true;
+					continue;
+				}
+			}
+			Stack.push_back(StackSlot{});
+			continue;
+		}
+		ClearStackOnBoundary(Inst, Stack);
+	}
+	return Modified;
+}
+
+bool AlgebraicSimplificationPass::Run(Bytecode &Code, Logger *Logger) {
+	if(Logger)
+		Logger->Info("Running algebraic simplification (via peephole)");
+	return PeepholePass().Run(Code, Logger);
+}
+
+bool LogicalSimplificationPass::Run(Bytecode &Code, Logger *Logger) {
+	if(Logger)
+		Logger->Info("Running logical simplification (via peephole)");
+	return PeepholePass().Run(Code, Logger);
+}
+
+bool IdentityEliminationPass::Run(Bytecode &Code, Logger *Logger) {
+	if(Logger)
+		Logger->Info("Running identity elimination (via peephole)");
+	return PeepholePass().Run(Code, Logger);
+}
+
+bool StrengthReductionPass::Run(Bytecode &Code, Logger *Logger) {
+	if(Logger)
+		Logger->Info("Running strength reduction");
+	if(Code.empty())
+		return false;
+	Bytecode Out;
+	Out.reserve(Code.size());
+	std::vector<size_t> Remap(Code.size(), kIpRemoved);
+	bool Modified = false;
+	for(size_t I = 0; I < Code.size();) {
+		if(Code[I].Opcode_ == Opcode::NOP) {
+			++I;
+			continue;
+		}
+		if(TryStrengthReduceMul(Code, I, Out, Remap, Modified)) {
+			I += 3;
+			continue;
+		}
+		Remap[I] = Out.size();
+		Out.push_back(Code[I]);
+		++I;
+	}
+	if(!Modified)
+		return false;
+	Code = std::move(Out);
+	ApplyIpRemap(Code, Remap);
+	return true;
+}
+
+bool PredicatePushdownPass::Run(Bytecode &Code, Logger *Logger) {
+	if(Logger)
+		Logger->Info("Running predicate pushdown");
+	if(Code.size() < 2)
+		return false;
+	bool Modified = false;
+	for(size_t I = 0; I + 1 < Code.size(); ++I) {
+		if(Code[I].Opcode_ != Opcode::FILTER_DNF || Code[I + 1].Opcode_ != Opcode::FILTER_DNF)
+			continue;
+		std::vector<std::vector<RowTriple>> Left;
+		std::vector<std::vector<RowTriple>> Right;
+		size_t End = 0;
+		if(!ReadDnfOperands(Code[I].Operands, 0, End, Left) || End != Code[I].Operands.size())
+			continue;
+		if(!ReadDnfOperands(Code[I + 1].Operands, 0, End, Right) || End != Code[I + 1].Operands.size())
+			continue;
+		std::vector<std::vector<RowTriple>> Merged;
+		MergeConsecutiveDnfs(Left, Right, Merged);
+		Code[I].Operands.clear();
+		AppendDnfOperands(Code[I].Operands, Merged);
+		Code[I + 1] = MakeInstruction(Opcode::NOP);
+		Modified = true;
+	}
+	if(Modified)
+		DeadCodeEliminationPass().Run(Code, Logger);
+	return Modified;
+}
+
 bool DeadCodeEliminationPass::Run(Bytecode &Code, Logger *Logger) {
 	if(Logger)
 		Logger->Info("Running dead code elimination");
 	if(Code.empty())
 		return false;
+
+	bool Modified = EliminateDeadPureBeforePop(Code);
 
 	std::vector<bool> Keep(Code.size(), true);
 	MarkRecursiveCteRegions(Code, Keep);
@@ -463,7 +795,6 @@ bool DeadCodeEliminationPass::Run(Bytecode &Code, Logger *Logger) {
 			Keep[I] = false;
 	}
 
-	bool Modified = false;
 	for(bool K : Keep) {
 		if(!K) {
 			Modified = true;
@@ -471,7 +802,7 @@ bool DeadCodeEliminationPass::Run(Bytecode &Code, Logger *Logger) {
 		}
 	}
 	if(!Modified)
-		return false;
+		return Modified;
 
 	const std::vector<size_t> Remap = CompactBytecode(Code, Keep);
 	ApplyIpRemap(Code, Remap);

@@ -2,7 +2,7 @@
 
 #include <array>
 #include <cstdint>
-#include <cstring>
+#include <IO/SIMD.hxx>
 #include <vector>
 #include <algorithm>
 
@@ -81,7 +81,7 @@ private:
             Counter,    Nonce[0],   Nonce[1],   Nonce[2]
         };
         uint32_t Working[16];
-        std::memcpy(Working, State, sizeof(State));
+        Simd::Memcpy(Working, State, sizeof(State));
         for(int i = 0; i < 10; i++) {
             QuarterRound(Working[0], Working[4], Working[8],  Working[12]);
             QuarterRound(Working[1], Working[5], Working[9],  Working[13]);

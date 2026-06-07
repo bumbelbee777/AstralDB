@@ -11,6 +11,8 @@ enum class ProcedureDialectKind {
 	Standard,
 	PlSql,
 	PlPgSql,
+	TSql,
+	DuckDb,
 };
 
 /** One \c WHEN … \c THEN handler inside an \c EXCEPTION block. */
@@ -47,14 +49,14 @@ struct ProcedureParseResult {
 	/** Lowered statement list for the main SQL parser / bytecode compiler. */
 	std::string LoweredBodySql;
 	LoweredProcedureBody Body_;
-	/** Human-readable dialect tag stored in procedure metadata (\c plsql, \c plpgsql). */
+	/** Human-readable dialect tag stored in procedure metadata (\c plsql, \c plpgsql, \c tsql, \c duckdb, \c sql). */
 	std::string DialectTag;
 	bool OrReplace = false;
 	bool IfNotExists = false;
 };
 
 /**
- * Dedicated lexer/parser for Oracle PL/SQL and PostgreSQL PL/pgSQL \c CREATE PROCEDURE|FUNCTION forms.
+ * Dedicated lexer/parser for Oracle PL/SQL, PostgreSQL PL/pgSQL, and T-SQL \c CREATE PROCEDURE|FUNCTION forms.
  * Dialect bodies are identified, then lowered to sequential AstralDB SQL for \c .abc compilation.
  */
 class ProcedureParser {

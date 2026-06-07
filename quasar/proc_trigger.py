@@ -15,6 +15,7 @@ PathLike = Union[str, Path]
 DIALECT_ASTRAL = "astral"
 DIALECT_PLSQL = "plsql"
 DIALECT_PLSQL_ALT = "plpgsql"
+DIALECT_TSQL = "tsql"
 
 
 @dataclass
@@ -76,6 +77,8 @@ def normalize_procedure_sql(sql: str, *, name: Optional[str] = None) -> str:
     if body.startswith("(") and body.endswith(")"):
         return f"CREATE PROCEDURE {proc_name} AS {body};"
     if "BEGIN" in upper and "END" in upper:
+        if "@" in text or "SET NOCOUNT" in upper or "BEGIN TRY" in upper or "CREATE OR ALTER" in upper:
+            return text if text.endswith(";") else text + ";"
         return f"CREATE PROCEDURE {proc_name} LANGUAGE plpgsql AS $$\n{body}\n$$;"
     return f"CREATE PROCEDURE {proc_name} AS (\n{body}\n);"
 

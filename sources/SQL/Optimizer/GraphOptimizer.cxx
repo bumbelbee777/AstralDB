@@ -1,4 +1,4 @@
-#include <SQL/GraphOptimizer.hxx>
+#include <SQL/Optimizer/GraphOptimizer.hxx>
 #include <IO/Limits.hxx>
 #include <IO/Logger.hxx>
 #include <algorithm>

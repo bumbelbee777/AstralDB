@@ -1,6 +1,7 @@
 #pragma once
 
-#include <SQL/Bytecode.hxx>
+#include <SQL/Bytecode/Bytecode.hxx>
+#include <SQL/Bytecode/BytecodeDisasm.hxx>
 #include <cstddef>
 #include <map>
 #include <string>
@@ -8,10 +9,6 @@
 
 namespace AstralDB {
 namespace SQL {
-
-std::string OpcodeName(Opcode Op);
-
-std::string DisassemblePretty(const Bytecode &Code);
 
 enum class BytecodeAspectKind {
 	Stats,

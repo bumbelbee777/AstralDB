@@ -1,4 +1,4 @@
--- Tiny next-token LM on a short-story excerpt (see docs/MathSciLmTrain.md).
+-- Tiny next-token LM on a short-story excerpt (see docs/MathSciMl.md).
 -- Trains a 4-D weight vector on ctx=fox -> next=saw, then runs inference.
 
 DROP TABLE IF EXISTS lm_w;

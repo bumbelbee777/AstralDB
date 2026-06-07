@@ -1,4 +1,4 @@
--- Steady 3-D incompressible Navier-Stokes PINN toy (docs/MathSciPinn.md).
+-- Steady 3-D incompressible Navier-Stokes PINN toy (docs/MathSciMl.md).
 -- Uses PREDICT(), binary model I/O, and PINN finite-difference helpers.
 
 DROP TABLE IF EXISTS pinn_ns_model;

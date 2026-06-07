@@ -1,18 +1,38 @@
-#include <Database/AdvancedTypes.hxx>
+#include <Database/Types/AdvancedTypes.hxx>
+#include <Database/Storage/ColumnarLazyBulk.hxx>
+#include <Database/Storage/Microkernels.hxx>
 #include <Database/Database.hxx>
-#include <Database/GraphStorage.hxx>
-#include <Database/MathSciComplex.hxx>
-#include <Database/ColumnarStorage.hxx>
-#include <Database/EmbeddingStorage.hxx>
-#include <IO/ArenaAllocator.hxx>
+#include <Database/Graph/GraphStorage.hxx>
+#include <Database/Graph/GraphLazyBulk.hxx>
+#include <Database/MathSci/MathSciComplex.hxx>
+#include <DS/Xlsx.hxx>
+#include <Database/Storage/BulkSynthetic.hxx>
+#include <Database/Storage/BulkSyntheticPrecompute.hxx>
+#include <Database/Storage/BulkSyntheticPrecomputeColumns.hxx>
+#include <Database/Storage/BulkShapePlan.hxx>
+#include <Database/Storage/BulkQueryMetadata.hxx>
+#include <Database/Storage/BulkSyntheticDerive.hxx>
+#include <Database/Storage/StarJoinCubeAnalytic.hxx>
+#include <Database/Storage/GeneralizedLazyGroupBy.hxx>
+#include <Database/Storage/PredicateKind.hxx>
+#include <Database/Storage/ColumnarStorage.hxx>
+#include <Database/Storage/LazyBulkZoneMap.hxx>
+#include <IO/ColumnShardStream.hxx>
+#include <IO/ColumnShardConfig.hxx>
+#include <IO/ColumnShardRegistry.hxx>
+#include <IO/Job.hxx>
+#include <IO/RuntimeLimits.hxx>
+#include <Database/Embedding/EmbeddingStorage.hxx>
 #include <IO/MemoryGuard.hxx>
+#include <IO/SIMD.hxx>
 #include <cstring>
-#include <Database/AtRestKey.hxx>
-#include <SQL/SetExprEval.hxx>
-#include <SQL/DialectCompat.hxx>
+#include <Database/Security/AtRestKey.hxx>
+#include <Database/Expression/SetExprEval.hxx>
+#include <Database/Text/PatternMatch.hxx>
 #include <IO/Error.hxx>
 #include <DS/LZ4.hxx>
 #include <DS/XChaCha20.hxx>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <fstream>
@@ -30,18 +50,20 @@
 #include <shared_mutex>
 #include <type_traits>
 #include <array>
-#include <cstring>
 #include <limits>
 #include <random>
 #include <vector>
-#include <string_view>
 #include <cctype>
 #include <DS/TabularData.hxx>
 #include <DS/JSON.hxx>
-#include <SQL/Bytecode.hxx>
-#include <SQL/BytecodeProcedures.hxx>
-#include <SQL/BytecodeTriggers.hxx>
-#include <Database/TriggerRuntime.hxx>
+#include <SQL/Bytecode/Bytecode.hxx>
+#include <SQL/Procedures/BytecodeProcedures.hxx>
+#include <SQL/Procedures/BytecodeTriggers.hxx>
+#include <Database/Storage/StarJoinCubeBulk.hxx>
+#include <Database/Storage/ColumnarLazyBulk.hxx>
+#include <Database/Catalog/Triggers.hxx>
+#include <Database/Catalog/TriggerFire.hxx>
+#include <SQL/Parser/DialectCompat.hxx>
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -82,7 +104,7 @@ static void AppendTriggerSnapshotTrailer(std::string &RawData,
 	if(Triggers.empty())
 		return;
 	RawData.append(kTriggerSnapshotMarkerSv.data(), kTriggerSnapshotMarkerSv.size());
-	const auto Blob = SQL::SerializeTriggerRegistry(TriggerRegistryVector(Triggers));
+        const auto Blob = SerializeTriggerRegistry(TriggerRegistryVector(Triggers));
 	RawData += std::to_string(Blob.size());
 	RawData.push_back('\n');
 	RawData += Blob;
@@ -111,7 +133,7 @@ static bool StripAndParseTriggerSnapshotTrailer(std::string &RawData,
 		return false;
 	const std::string Blob(Tail.substr(0, BN));
 	std::vector<SQL::StoredTriggerEntry> Entries;
-	if(!SQL::DeserializeTriggerRegistry(Blob, Entries))
+        if(!DeserializeTriggerRegistry(Blob, Entries))
 		return false;
 	for(SQL::StoredTriggerEntry &E : Entries)
 		Out.emplace(E.Name, std::move(E));
@@ -1292,11 +1314,14 @@ void Database::AppendWalAfterDropView(const std::string &ViewName) {
 	Wal_.AppendLine(std::string("DV|") + ViewName);
 }
 
-void Database::AppendWalAfterDefineProcedure(const std::string &Name, const std::string &SqlBody) {
+void Database::AppendWalAfterDefineProcedure(const std::string &Name, const std::string &SqlBody,
+                                             std::string_view ControlFlowBlob) {
 	if(WalSuspended_.load(std::memory_order_acquire))
 		return;
 	std::ostringstream O;
 	O << "PR|" << Name << '|' << WalEncodeSqlBody(SqlBody);
+	if(!ControlFlowBlob.empty())
+		O << '|' << WalEncodeSqlBody(ControlFlowBlob);
 	Wal_.AppendLine(O.str());
 }
 
@@ -1576,6 +1601,10 @@ void Database::FlushWalToDisk() {
 	Wal_.Flush();
 }
 
+void Database::QuiesceAsyncFsync() {
+	Wal_.QuiesceAsyncFsync();
+}
+
 void Database::QuiesceBackgroundIOForFilesystemRollback() noexcept {
 	while(OutstandingAsyncJobs_.load(std::memory_order_acquire) != 0)
 		std::this_thread::sleep_for(std::chrono::microseconds(200));
@@ -1658,19 +1687,7 @@ void Database::DropViewDefinition(const std::string &ViewName, bool IfExists) {
 	Dirty_.store(true, std::memory_order_release);
 }
 
-void Database::ReplayWalDefineView(const std::string &ViewName, std::string SqlBody) {
-	std::scoped_lock Guard(DbMutex_);
-	if(ViewName.empty())
-		FailStorage("WAL replay CREATE VIEW: empty name.");
-	if(TableSchemas_.find(ViewName) != TableSchemas_.end())
-		FailStorage("WAL replay CREATE VIEW: name \"" + ViewName + "\" collides with existing table.");
-	ViewDefinitionSql_[ViewName] = std::move(SqlBody);
-}
 
-void Database::ReplayWalDropView(const std::string &ViewName) {
-	std::scoped_lock Guard(DbMutex_);
-	ViewDefinitionSql_.erase(ViewName);
-}
 
 std::unordered_map<std::string, std::string> Database::ProcedureDefinitionsSnapshot() const {
 	std::scoped_lock Guard(DbMutex_);
@@ -1696,7 +1713,7 @@ void Database::DefineProcedure(const std::string &ProcedureName, std::string Sql
 		}
 		ProcedureDefinitionSql_[ProcedureName] = SqlBody;
 		BodyForCache = ProcedureDefinitionSql_[ProcedureName];
-		AppendWalAfterDefineProcedure(ProcedureName, BodyForCache);
+		AppendWalAfterDefineProcedure(ProcedureName, BodyForCache, ControlFlowJson);
 		Dirty_.store(true, std::memory_order_release);
 	}
 	SQL::ProcedureCatalog Catalog;
@@ -1733,21 +1750,6 @@ void Database::DropProcedureDefinition(const std::string &ProcedureName, bool If
 	SQL::SaveProcedureCatalog(Catalog);
 }
 
-void Database::ReplayWalDefineProcedure(const std::string &ProcedureName, std::string SqlBody) {
-	{
-		std::scoped_lock Guard(DbMutex_);
-		if(ProcedureName.empty())
-			FailStorage("WAL replay CREATE PROCEDURE: empty name.");
-		ProcedureDefinitionSql_[ProcedureName] = SqlBody;
-	}
-	SQL::ProcedureCatalog Catalog;
-	const auto CatPath = SQL::DefaultProcedureCatalogPath(DbPath_);
-	Catalog.CatalogPath = CatPath;
-	Catalog = SQL::LoadProcedureCatalog(CatPath);
-	SQL::CacheProcedureFromSql(Catalog, DbPath_, ProcedureName, std::move(SqlBody), Logger_, SQL::OptimizationLevel::Advanced,
-	                           this, true);
-	SQL::SaveProcedureCatalog(Catalog);
-}
 
 void Database::InstallTriggerScratchRowAssumeLocked(const std::string &TableName, const Item *Row) {
 	if(!Row || Row->empty()) {
@@ -1779,7 +1781,7 @@ void Database::DefineTrigger(SQL::StoredTriggerEntry Spec, bool IfNotExists, boo
 		FailStorage("CREATE TRIGGER: name must be non-empty.");
 	if(Spec.TableName.empty())
 		FailStorage("CREATE TRIGGER: table name must be non-empty.");
-	const auto SpecJson = SQL::SerializeTriggerRegistry({Spec});
+	const auto SpecJson = SerializeTriggerRegistry({Spec});
 	SQL::StoredTriggerEntry ForCache;
 	{
 		std::scoped_lock Guard(DbMutex_);
@@ -1800,10 +1802,10 @@ void Database::DefineTrigger(SQL::StoredTriggerEntry Spec, bool IfNotExists, boo
 		AppendWalAfterDefineTrigger(Spec.Name, SpecJson);
 		Dirty_.store(true, std::memory_order_release);
 	}
-	SQL::TriggerCatalog Catalog;
-	const auto CatPath = SQL::DefaultTriggerCatalogPath(DbPath_);
+	TriggerCatalog Catalog;
+	const auto CatPath = DefaultTriggerCatalogPath(DbPath_);
 	Catalog.CatalogPath = CatPath;
-	Catalog = SQL::LoadTriggerCatalog(CatPath);
+	Catalog = LoadTriggerCatalog(CatPath);
 	SQL::UnregisterTrigger(Catalog, Spec.Name);
 	const SQL::StoredTriggerEntry Cached =
 	    SQL::CacheTriggerFromSql(Catalog, DbPath_, std::move(ForCache), Logger_, SQL::OptimizationLevel::Advanced, this,
@@ -1812,7 +1814,7 @@ void Database::DefineTrigger(SQL::StoredTriggerEntry Spec, bool IfNotExists, boo
 		std::scoped_lock Guard(DbMutex_);
 		TriggerDefinitions_[Spec.Name] = Cached;
 	}
-	SQL::SaveTriggerCatalog(Catalog);
+	SaveTriggerCatalog(Catalog);
 }
 
 void Database::DropTriggerDefinition(const std::string &TriggerName, bool IfExists) {
@@ -1828,14 +1830,14 @@ void Database::DropTriggerDefinition(const std::string &TriggerName, bool IfExis
 			Dirty_.store(true, std::memory_order_release);
 		}
 	}
-	SQL::TriggerCatalog Catalog;
-	const auto CatPath = SQL::DefaultTriggerCatalogPath(DbPath_);
-	Catalog = SQL::LoadTriggerCatalog(CatPath);
+	TriggerCatalog Catalog;
+	const auto CatPath = DefaultTriggerCatalogPath(DbPath_);
+	Catalog = LoadTriggerCatalog(CatPath);
 	if(Catalog.CatalogPath.empty())
 		Catalog.CatalogPath = CatPath;
 	if(!SQL::UnregisterTrigger(Catalog, TriggerName) && !IfExists)
 		FailStorage("DROP TRIGGER: \"" + TriggerName + "\" does not exist.");
-	SQL::SaveTriggerCatalog(Catalog);
+	SaveTriggerCatalog(Catalog);
 }
 
 void Database::SetTriggerEnabled(const std::string &TriggerName, bool Enabled) {
@@ -1850,9 +1852,9 @@ void Database::SetTriggerEnabled(const std::string &TriggerName, bool Enabled) {
 		AppendWalAfterSetTriggerEnabled(TriggerName, Enabled);
 		Dirty_.store(true, std::memory_order_release);
 	}
-	SQL::TriggerCatalog Catalog;
-	const auto CatPath = SQL::DefaultTriggerCatalogPath(DbPath_);
-	Catalog = SQL::LoadTriggerCatalog(CatPath);
+	TriggerCatalog Catalog;
+	const auto CatPath = DefaultTriggerCatalogPath(DbPath_);
+	Catalog = LoadTriggerCatalog(CatPath);
 	if(Catalog.CatalogPath.empty())
 		Catalog.CatalogPath = CatPath;
 	for(SQL::StoredTriggerEntry &E : Catalog.Triggers) {
@@ -1861,190 +1863,25 @@ void Database::SetTriggerEnabled(const std::string &TriggerName, bool Enabled) {
 			break;
 		}
 	}
-	SQL::SaveTriggerCatalog(Catalog);
+	SaveTriggerCatalog(Catalog);
 }
 
-void Database::ReplayWalDefineTrigger(const std::string &TriggerName, std::string SpecJson) {
-	std::vector<SQL::StoredTriggerEntry> Entries;
-	if(!SQL::DeserializeTriggerRegistry(SpecJson, Entries) || Entries.empty())
-		FailStorage("WAL replay CREATE TRIGGER: corrupt spec for \"" + TriggerName + "\".");
-	SQL::StoredTriggerEntry Spec = std::move(Entries.front());
-	Spec.Name = TriggerName;
-	{
-		std::scoped_lock Guard(DbMutex_);
-		TriggerDefinitions_[TriggerName] = Spec;
-	}
-	SQL::TriggerCatalog Catalog;
-	const auto CatPath = SQL::DefaultTriggerCatalogPath(DbPath_);
-	Catalog.CatalogPath = CatPath;
-	Catalog = SQL::LoadTriggerCatalog(CatPath);
-	SQL::UnregisterTrigger(Catalog, TriggerName);
-	SQL::CacheTriggerFromSql(Catalog, DbPath_, Spec, Logger_, SQL::OptimizationLevel::Advanced, this, true, true);
-	SQL::SaveTriggerCatalog(Catalog);
-}
 
-void Database::ReplayWalDropTrigger(const std::string &TriggerName) {
-	{
-		std::scoped_lock Guard(DbMutex_);
-		TriggerDefinitions_.erase(TriggerName);
-	}
-	SQL::TriggerCatalog Catalog;
-	const auto CatPath = SQL::DefaultTriggerCatalogPath(DbPath_);
-	Catalog = SQL::LoadTriggerCatalog(CatPath);
-	if(Catalog.CatalogPath.empty())
-		Catalog.CatalogPath = CatPath;
-	SQL::UnregisterTrigger(Catalog, TriggerName);
-	SQL::SaveTriggerCatalog(Catalog);
-}
 
-void Database::ReplayWalSetTriggerEnabled(const std::string &TriggerName, bool Enabled) {
-	{
-		std::scoped_lock Guard(DbMutex_);
-		auto It = TriggerDefinitions_.find(TriggerName);
-		if(It != TriggerDefinitions_.end())
-			It->second.Enabled = Enabled;
-	}
-	SQL::TriggerCatalog Catalog;
-	const auto CatPath = SQL::DefaultTriggerCatalogPath(DbPath_);
-	Catalog = SQL::LoadTriggerCatalog(CatPath);
-	if(Catalog.CatalogPath.empty())
-		Catalog.CatalogPath = CatPath;
-	for(SQL::StoredTriggerEntry &E : Catalog.Triggers) {
-		if(E.Name == TriggerName) {
-			E.Enabled = Enabled;
-			break;
-		}
-	}
-	SQL::SaveTriggerCatalog(Catalog);
-}
 
-void Database::ReplayWalDropProcedure(const std::string &ProcedureName) {
-	{
-		std::scoped_lock Guard(DbMutex_);
-		ProcedureDefinitionSql_.erase(ProcedureName);
-	}
-	SQL::ProcedureCatalog Catalog;
-	const auto CatPath = SQL::DefaultProcedureCatalogPath(DbPath_);
-	Catalog = SQL::LoadProcedureCatalog(CatPath);
-	if(Catalog.CatalogPath.empty())
-		Catalog.CatalogPath = CatPath;
-	SQL::UnregisterProcedure(Catalog, ProcedureName);
-	SQL::SaveProcedureCatalog(Catalog);
-}
 
-void Database::ReplayWalAddUser(std::string Name, std::string EncryptedBlob, std::array<uint8_t, 32> KeyMaterial) {
-	std::scoped_lock Guard(DbMutex_);
-	EncryptedString Es(std::move(EncryptedBlob), KeyMaterial);
-	User Nu(std::move(Name), std::move(Es));
-	for(auto &Existing : Users_) {
-		if(Existing.Name == Nu.Name) {
-			Existing = std::move(Nu);
-			return;
-		}
-	}
-	Users_.push_back(std::move(Nu));
-}
 
-void Database::ReplayWalRemoveUser(const std::string &Name) {
-	std::scoped_lock Guard(DbMutex_);
-	const auto It = std::find_if(Users_.begin(), Users_.end(), [&](const User &U) { return U.Name == Name; });
-	if(It == Users_.end())
-		return;
-	if(CurrentUser_.has_value() && CurrentUser_->Name == Name)
-		CurrentUser_.reset();
-	Users_.erase(It);
-}
 
-void Database::ReplayWalGrantAcl(const std::string &UserName, const std::string &Table, int Bits) {
-	std::scoped_lock Guard(DbMutex_);
-	Acls_[UserName][Table] =
-	    static_cast<Permissions>(static_cast<int>(Acls_[UserName][Table]) | Bits);
-}
 
-void Database::ReplayWalRevokeAcl(const std::string &UserName, const std::string &Table, int Bits) {
-	std::scoped_lock Guard(DbMutex_);
-	Acls_[UserName][Table] =
-	    static_cast<Permissions>(static_cast<int>(Acls_[UserName][Table]) & ~Bits);
-}
 
-void Database::ReplayWalCreateRole(const std::string &RoleName) {
-	std::scoped_lock Guard(DbMutex_);
-	Roles_.insert(RoleName);
-}
 
-void Database::ReplayWalDropRole(const std::string &RoleName) {
-	std::scoped_lock Guard(DbMutex_);
-	Roles_.erase(RoleName);
-	RoleAcls_.erase(RoleName);
-	for(auto &[Un, Roles] : UserRoles_) {
-		Roles.erase(std::remove(Roles.begin(), Roles.end(), RoleName), Roles.end());
-	}
-}
 
-void Database::ReplayWalGrantRoleMembership(const std::string &RoleName, const std::string &UserName) {
-	std::scoped_lock Guard(DbMutex_);
-	Roles_.insert(RoleName);
-	auto &Vec = UserRoles_[UserName];
-	if(std::find(Vec.begin(), Vec.end(), RoleName) == Vec.end())
-		Vec.push_back(RoleName);
-}
 
-void Database::ReplayWalRevokeRoleMembership(const std::string &RoleName, const std::string &UserName) {
-	std::scoped_lock Guard(DbMutex_);
-	auto &Vec = UserRoles_[UserName];
-	Vec.erase(std::remove(Vec.begin(), Vec.end(), RoleName), Vec.end());
-}
 
-void Database::ReplayWalGrantRoleAcl(const std::string &RoleName, const std::string &Table, int Bits) {
-	std::scoped_lock Guard(DbMutex_);
-	Roles_.insert(RoleName);
-	RoleAcls_[RoleName][Table] =
-	    static_cast<Permissions>(static_cast<int>(RoleAcls_[RoleName][Table]) | Bits);
-}
 
-void Database::ReplayWalRevokeRoleAcl(const std::string &RoleName, const std::string &Table, int Bits) {
-	std::scoped_lock Guard(DbMutex_);
-	RoleAcls_[RoleName][Table] =
-	    static_cast<Permissions>(static_cast<int>(RoleAcls_[RoleName][Table]) & ~Bits);
-}
 
-void Database::ReplayWalFineGrant(const std::string &UserName, RowColPermission Rule) {
-	std::scoped_lock Guard(DbMutex_);
-	for(User &U : Users_) {
-		if(U.Name != UserName)
-			continue;
-		U.FineGrainedPermissions.push_back(std::move(Rule));
-		return;
-	}
-}
 
-void Database::ReplayWalFineRevoke(const std::string &UserName, RowColPermission Rule) {
-	std::scoped_lock Guard(DbMutex_);
-	for(User &U : Users_) {
-		if(U.Name != UserName)
-			continue;
-		auto &Vec = U.FineGrainedPermissions;
-		Vec.erase(std::remove_if(Vec.begin(), Vec.end(),
-		                         [&](const RowColPermission &R) {
-			                         return R.Table == Rule.Table && R.RowId == Rule.RowId &&
-			                                R.Column == Rule.Column &&
-			                                static_cast<int>(R.Perms) == static_cast<int>(Rule.Perms);
-		                         }),
-		          Vec.end());
-		return;
-	}
-}
 
-void Database::ReplayWalAddForeignKey(const std::string &TableName, ForeignKey Key) {
-	std::scoped_lock Guard(DbMutex_);
-	auto &Vec = ForeignKeys_[TableName];
-	for(const ForeignKey &E : Vec) {
-		if(E.ColumnName == Key.ColumnName && E.ReferencedTable == Key.ReferencedTable &&
-		   E.ReferencedColumn == Key.ReferencedColumn && E.OnDelete == Key.OnDelete)
-			return;
-	}
-	Vec.push_back(std::move(Key));
-}
 
 void Database::ReplaceTableLevelCheckConstraints(const std::string &TableName,
                                                  std::vector<std::pair<std::string, std::string>> Checks) {
@@ -2484,7 +2321,7 @@ void Database::RejectRowIfChecksFailAssumeLocked(const std::string &TableName, c
 	for(const Column &Co : SchIt->second) {
 		if(!Co.CheckConstraintDnfPacked.has_value())
 			continue;
-		if(AstralDB::SQL::EvaluatePackedWhereDnf(this, Row, *Co.CheckConstraintDnfPacked))
+		if(EvaluatePackedWhereDnf(this, Row, *Co.CheckConstraintDnfPacked))
 			continue;
 		const std::string Snip = Co.CheckConstraintSql.value_or(std::string());
 		FailStorage("CHECK constraint failed on column \"" + Co.Name + "\"" +
@@ -2494,7 +2331,7 @@ void Database::RejectRowIfChecksFailAssumeLocked(const std::string &TableName, c
 	if(TcIt == TableCheckConstraints_.end())
 		return;
 	for(const auto &Pr : TcIt->second) {
-		if(AstralDB::SQL::EvaluatePackedWhereDnf(this, Row, Pr.second))
+		if(EvaluatePackedWhereDnf(this, Row, Pr.second))
 			continue;
 		FailStorage("CHECK constraint failed (table-level): " + Pr.first);
 	}
@@ -2537,13 +2374,6 @@ StorageLayout Database::TableStoragePolicy(const std::string &TableName) const {
 	return It->second.DeclaredPolicy;
 }
 
-void Database::ReplayWalSetTableStorage(const std::string &TableName, StorageLayout Policy) {
-	std::scoped_lock Guard(DbMutex_);
-	auto It = Tables_.find(TableName);
-	if(It == Tables_.end())
-		return;
-	It->second.SetDeclaredPolicy(Policy);
-}
 
 std::future<void> Database::CreateTable(const std::string &TableName, const Schema &Columns,
                                         StorageLayout Storage) {
@@ -2908,72 +2738,15 @@ std::string Database::NextSequenceValue(const std::string &Name) {
 	return NextSequenceValueAssumeLocked(Name);
 }
 
-void Database::ReplayWalCreateSequence(const std::string &Name, int64_t Start, int64_t Increment) {
-	std::scoped_lock Guard(DbMutex_);
-	SequenceState St;
-	St.Start = Start;
-	St.Increment = Increment;
-	St.Current = Start;
-	Sequences_[Name] = St;
-}
 
-void Database::ReplayWalDropSequence(const std::string &Name) {
-	std::scoped_lock Guard(DbMutex_);
-	Sequences_.erase(Name);
-}
 
-void Database::ReplayWalCreateType(const std::string &TypeName, ObjectTypeSchema Fields) {
-	std::scoped_lock Guard(DbMutex_);
-	ObjectTypes_[TypeName] = std::move(Fields);
-}
 
-void Database::ReplayWalDropType(const std::string &TypeName) {
-	std::scoped_lock Guard(DbMutex_);
-	ObjectTypes_.erase(TypeName);
-	for(auto It = TypedTableBindings_.begin(); It != TypedTableBindings_.end();) {
-		if(It->second == TypeName)
-			It = TypedTableBindings_.erase(It);
-		else
-			++It;
-	}
-}
 
-void Database::ReplayWalBindTypedTable(const std::string &TableName, const std::string &TypeName) {
-	std::scoped_lock Guard(DbMutex_);
-	TypedTableBindings_[TableName] = TypeName;
-}
 
 namespace {
 
 bool IsEphemeralSessionDbPath(const std::filesystem::path &Path) {
 	return Path.string().find("astraldb_session_") != std::string::npos;
-}
-
-std::string UpperAscii(std::string S) {
-	for(char &C : S)
-		C = static_cast<char>(std::toupper(static_cast<unsigned char>(C)));
-	return S;
-}
-
-void AssignBulkSyntheticCell(Database::Item &Row, const std::string &Col, int64_t RowId, std::size_t ColIndex,
-                             std::size_t ColCount) {
-	const std::string Key = UpperAscii(Col);
-	if(Key == "ID")
-		Row[Col] = std::to_string(RowId);
-	else if(Key == "ACCT" || Key == "A")
-		Row[Col] = std::to_string(RowId % 997);
-	else if(Key == "AMOUNT" || (ColCount == 5 && ColIndex == 2))
-		Row[Col] = std::to_string(RowId % 10000) + "." + std::to_string((RowId / 100) % 100);
-	else if(Key == "TS" || Key == "TIMESTAMP" || (ColCount == 5 && ColIndex == 4))
-		Row[Col] = std::to_string(1'704'067'200LL + RowId);
-	else if(Key == "B" || (ColCount == 5 && ColIndex == 2))
-		Row[Col] = std::string("txt_") + std::to_string(RowId);
-	else if(Key == "C" || (ColCount == 5 && ColIndex == 3))
-		Row[Col] = std::string("chk_") + std::to_string(RowId % 71);
-	else if(Key == "D" || (ColCount == 5 && ColIndex == 4))
-		Row[Col] = std::string("e_") + std::to_string(RowId / 17);
-	else
-		Row[Col] = std::to_string(RowId + static_cast<int64_t>(ColIndex));
 }
 
 } // namespace
@@ -2982,10 +2755,11 @@ void Database::InsertBulkSyntheticRows(const std::string &TableName, int64_t Cou
 	if(Count <= 0)
 		FailStorage("BULK INSERT row count must be a positive integer.");
 	const bool Ephemeral = IsEphemeralSessionDbPath(DbPath_);
-	const std::uint64_t Cap = Ephemeral ? Limits::MaxBulkInsertRowsBench : Limits::MaxBulkInsertRows;
+	const bool BenchBulk = RuntimeLimits::BulkBenchScaleEnabled(Ephemeral);
+	const std::uint64_t Cap = RuntimeLimits::EffectiveMaxBulkInsertRows(Ephemeral);
 	if(static_cast<std::uint64_t>(Count) > Cap)
 		FailStorage("BULK INSERT row count exceeds the configured maximum (see server limits).");
-	const bool FastPath = Ephemeral && static_cast<std::uint64_t>(Count) >= Limits::BulkFastPathMinRows;
+	const bool FastPath = BenchBulk && static_cast<std::uint64_t>(Count) >= Limits::BulkFastPathMinRows;
 	const std::size_t EstBytes = static_cast<std::size_t>(Count) * 256U;
 	if(!MemoryGuard::SecureBoundsCheck(0, static_cast<std::size_t>(Count), 256U))
 		FailStorage("BULK INSERT row count exceeds safe bounds.");
@@ -3011,19 +2785,8 @@ void Database::InsertBulkSyntheticRows(const std::string &TableName, int64_t Cou
 		ColNames.push_back(Co.Name);
 	const std::size_t ColCount = ColNames.size();
 	if(FastPath) {
-		constexpr int64_t BulkStreamChunkRows = 65'536;
-		int64_t Remaining = Count;
-		int64_t ChunkStart = StartId;
-		while(Remaining > 0) {
-			const int64_t ChunkRows = std::min<int64_t>(Remaining, BulkStreamChunkRows);
-			const std::size_t ChunkEstimate = static_cast<std::size_t>(ChunkRows) * 96U;
-			if(!MemoryGuard::AllowAlloc(ChunkEstimate))
-				FailStorage("BULK INSERT fast path would exceed the session memory guard.");
-			Superfetch::PrefetchAppendTarget(Slot.RowStore);
-			AppendBulkSyntheticColumnar(Slot.Columnar, ColNames, ChunkRows, ChunkStart, Step);
-			ChunkStart += ChunkRows * Step;
-			Remaining -= ChunkRows;
-		}
+		MarkBulkSyntheticLazy(Slot.Columnar, Count, StartId, Step);
+		RegisterUniversalLazyBulkPrecomputeManifest(Slot.Columnar, *Sch);
 		Slot.ColumnarSynced = true;
 		Slot.RecordWrite();
 		Dirty_.store(true, std::memory_order_release);
@@ -3033,8 +2796,10 @@ void Database::InsertBulkSyntheticRows(const std::string &TableName, int64_t Cou
 	for(int64_t K = 0; K < Count; ++K) {
 		const int64_t RowId = StartId + K * Step;
 		Item MutableRow;
-		for(std::size_t Ci = 0; Ci < ColCount; ++Ci)
-			AssignBulkSyntheticCell(MutableRow, ColNames[Ci], RowId, Ci, ColCount);
+		for(std::size_t Ci = 0; Ci < ColCount; ++Ci) {
+			const BulkSyntheticContext Ctx{RowId, Step, Ci, ColCount};
+			MutableRow[(*Sch)[Ci].Name] = BulkSyntheticCellString((*Sch)[Ci], Ctx);
+		}
 		if(!FastPath) {
 			ResolveRowSequenceLiteralsAssumeLocked(MutableRow);
 			FillIdentityColumnsAssumeLocked(*Sch, MutableRow);
@@ -3082,6 +2847,11 @@ const DatasetEntry *FindDatasetVersion(const DatasetCatalog &Cat, int64_t Versio
 	return nullptr;
 }
 
+void EnsureMutableRowStoreAssumeLocked(Database &Db, HybridTableSlot &Slot, const std::string &TableName) {
+	if(Slot.RowStore.empty() && Slot.Columnar.RowCount > 0)
+		Slot.EnsureRowStoreFromColumnar(&Db, TableName);
+}
+
 } // namespace
 
 void Database::RegisterDataset(const std::string &Name, DatasetEntry Entry) {
@@ -3090,8 +2860,15 @@ void Database::RegisterDataset(const std::string &Name, DatasetEntry Entry) {
 		const auto SrcIt = Tables_.find(Entry.SourceTable);
 		if(SrcIt == Tables_.end())
 			FailStorage("CREATE DATASET: source table \"" + Entry.SourceTable + "\" does not exist.");
-		const Table &Live = SrcIt->second.RowsForRead(std::nullopt, false);
-		Entry.SnapshotRows.assign(Live.begin(), Live.end());
+		const HybridTableSlot &Src = SrcIt->second;
+		if(Src.RowStore.empty() && Src.Columnar.BulkSyntheticLazy && Src.Columnar.RowCount > 0) {
+			Entry.SnapshotLazyColumnar = true;
+			Entry.SnapshotColumnar = Src.Columnar;
+		} else {
+			EnsureMutableRowStoreAssumeLocked(*this, SrcIt->second, Entry.SourceTable);
+			const Table &Live = SrcIt->second.RowStore;
+			Entry.SnapshotRows.assign(Live.begin(), Live.end());
+		}
 	}
 	DatasetCatalog &Cat = Datasets_[Name];
 	const int64_t NextVer = Cat.Versions.empty() ? 1 : Cat.Versions.back().VersionId + 1;
@@ -3165,15 +2942,7 @@ void Database::AppendWalAfterEmbeddingDrop(const std::string &Name) {
 	Wal_.AppendLine(EmbeddingWalLineDrop(Name));
 }
 
-void Database::ReplayWalEmbeddingRegister(EmbeddingCatalogEntry Entry) {
-	std::scoped_lock Guard(DbMutex_);
-	ReplayWalEmbeddingRegisterAssumeLocked(*this, std::move(Entry));
-}
 
-void Database::ReplayWalEmbeddingDrop(const std::string &Name) {
-	std::scoped_lock Guard(DbMutex_);
-	ReplayWalEmbeddingDropAssumeLocked(*this, Name);
-}
 
 void Database::RegisterGraph(GraphSpec Spec) {
 	const std::string Name = Spec.Name;
@@ -3182,20 +2951,8 @@ void Database::RegisterGraph(GraphSpec Spec) {
 	AppendWalAfterGraphRegister(Graphs_.at(Name).first);
 }
 
-void Database::ReplayWalGraphRegister(GraphSpec Spec) {
-	std::scoped_lock Guard(DbMutex_);
-	ReplayWalGraphRegisterAssumeLocked(*this, std::move(Spec));
-}
 
-void Database::ReplayWalGraphDrop(const std::string &Name) {
-	std::scoped_lock Guard(DbMutex_);
-	ReplayWalGraphDropAssumeLocked(*this, Name);
-}
 
-void Database::ReplayWalGraphProjection(const GraphProjectionRequest &Req) {
-	std::scoped_lock Guard(DbMutex_);
-	ReplayWalGraphProjectionAssumeLocked(*this, Req);
-}
 
 void Database::DropGraph(const std::string &Name) {
 	std::scoped_lock Guard(DbMutex_);
@@ -3237,6 +2994,10 @@ void Database::GraphTraverse(const GraphTraverseRequest &Req) {
 
 void Database::ReplaceTableContents(const std::string &TableName, const Schema &Schema, Table Rows) {
 	std::scoped_lock Guard(DbMutex_);
+	ReplaceTableContentsAssumeLocked(TableName, Schema, std::move(Rows));
+}
+
+void Database::ReplaceTableContentsAssumeLocked(const std::string &TableName, const Schema &Schema, Table Rows) {
 	if(TableSchemas_.find(TableName) != TableSchemas_.end()) {
 		Tables_.erase(TableName);
 		TableSchemas_.erase(TableName);
@@ -3249,6 +3010,44 @@ void Database::ReplaceTableContents(const std::string &TableName, const Schema &
 	Slot.SyncColumnarAfterRowMutation();
 	Tables_[TableName] = std::move(Slot);
 	Dirty_.store(true, std::memory_order_release);
+}
+
+void Database::ReplaceTableContentsColumnarAssumeLocked(const std::string &TableName, const Schema &Schema,
+                                                        Table Rows) {
+	TableSchemas_[TableName] = Schema;
+	HybridTableSlot Slot;
+	Slot.SetDeclaredPolicy(StorageLayout::Columnar);
+	Slot.RowStore = std::move(Rows);
+	Slot.RecordWrite();
+	Slot.SyncColumnarAfterRowMutation();
+	Tables_[TableName] = std::move(Slot);
+	Dirty_.store(true, std::memory_order_release);
+}
+
+void Database::ReplaceTableContentsFromColumnarAssumeLocked(const std::string &TableName, const Schema &Schema,
+                                                              ColumnarTable Col) {
+	Tables_.erase(TableName);
+	TableSchemas_.erase(TableName);
+	TableSchemas_[TableName] = Schema;
+	HybridTableSlot Slot;
+	Slot.SetDeclaredPolicy(StorageLayout::Columnar);
+	Slot.Columnar = std::move(Col);
+	Slot.ColumnarSynced = true;
+	Slot.RecordWrite();
+	Tables_[TableName] = std::move(Slot);
+	Dirty_.store(true, std::memory_order_release);
+}
+
+bool Database::TryLazyBulkStarGroupByFromBaseTablesAssumeLocked(const SQL::Instruction &Inst,
+                                                                const std::vector<std::string> &GroupKeys, Table &Out,
+                                                                std::uint64_t *RowsScanned) {
+	HybridTableSlot *FactSlot = nullptr;
+	std::vector<Column> FactSchema;
+	std::string FactName;
+	std::vector<LazyDimensionSide> Dimensions;
+	if(!CollectStarSchemaSides(*this, FactSlot, FactSchema, FactName, Dimensions))
+		return false;
+	return TryLazyBulkWarehouseCube(*this, Inst, FactName, GroupKeys, Out, RowsScanned);
 }
 
 void Database::RegisterGraphProjection(const GraphProjectionRequest &Req) {
@@ -3360,12 +3159,30 @@ void Database::LoadDatasetInto(const std::string &Name, const std::string &Targe
 	}
 	std::scoped_lock Guard(DbMutex_);
 	HybridTableSlot &Dst = Tables_[TargetTable];
+	if(Ent.SnapshotLazyColumnar && Ent.SnapshotColumnar.RowCount > 0) {
+		Dst.RowStore.clear();
+		Dst.Columnar = Ent.SnapshotColumnar;
+		Dst.ColumnarSynced = true;
+		Dst.RecordWrite();
+		Dirty_.store(true, std::memory_order_release);
+		return;
+	}
 	DatasetEntry::Table Src = Ent.SnapshotRows;
 	if(Src.empty() && Ent.Kind == DatasetKind::TableRef) {
 		const auto SrcIt = Tables_.find(Ent.SourceTable);
 		if(SrcIt == Tables_.end())
 			FailStorage("DATASET source table \"" + Ent.SourceTable + "\" does not exist.");
-		const Table &Live = SrcIt->second.RowsForRead(std::nullopt, false);
+		const HybridTableSlot &LiveSlot = SrcIt->second;
+		if(LiveSlot.RowStore.empty() && LiveSlot.Columnar.BulkSyntheticLazy && LiveSlot.Columnar.RowCount > 0) {
+			Dst.RowStore.clear();
+			Dst.Columnar = LiveSlot.Columnar;
+			Dst.ColumnarSynced = true;
+			Dst.RecordWrite();
+			Dirty_.store(true, std::memory_order_release);
+			return;
+		}
+		EnsureMutableRowStoreAssumeLocked(*this, SrcIt->second, Ent.SourceTable);
+		const Table &Live = SrcIt->second.RowStore;
 		Src.assign(Live.begin(), Live.end());
 	}
 	if(Src.empty())
@@ -3401,6 +3218,13 @@ void Database::Vacuum(const std::string &TableName) {
 	MemoryGuard::SpikeScope Spike;
 	std::scoped_lock Guard(DbMutex_);
 	const auto CompactOne = [](HybridTableSlot &Slot, const std::string &Name) {
+		if(Slot.RowStore.empty() && Slot.Columnar.BulkSyntheticLazy && Slot.Columnar.RowCount > 0) {
+			Slot.RowStore.shrink_to_fit();
+			Slot.ColumnarSynced = true;
+			Slot.RecordWrite();
+			(void)Name;
+			return;
+		}
 		if(!MemoryGuard::AllowAlloc(Slot.RowStore.size() * 128U))
 			FailStorage("VACUUM would exceed the session memory guard.");
 		Slot.RowStore.shrink_to_fit();
@@ -3436,6 +3260,7 @@ void Database::RepackTableConcurrently(const std::string &TableName) {
 		const auto SIt = TableSchemas_.find(TableName);
 		if(TIt == Tables_.end() || SIt == TableSchemas_.end())
 			FailStorage("REPACK: table \"" + TableName + "\" does not exist.");
+		EnsureMutableRowStoreAssumeLocked(*this, TIt->second, TableName);
 		const std::size_t N = TIt->second.RowStore.size();
 		const std::size_t EstBytes = N * 256U;
 		if(!MemoryGuard::AllowAlloc(EstBytes))
@@ -3486,7 +3311,7 @@ void Database::InsertRowAssumeLocked(const std::string &TableName, Item Row, boo
 	RejectRowIfTypesFailAssumeLocked(TableName, MutableRow);
 	RejectRowIfForeignKeysFailAssumeLocked(TableName, MutableRow);
 	if(RunTriggers)
-		FireTriggersAssumeLocked(*this, TableName, SQL::TriggerTiming::Before, SQL::TriggerEvent::Insert, nullptr,
+		FireTriggersAssumeLocked(*this, TableName, TriggerTiming::Before, TriggerEvent::Insert, nullptr,
 		                         &MutableRow, true);
 	HybridTableSlot &Slot = Tables_[TableName];
 	Superfetch::PrefetchAppendTarget(Slot.RowStore);
@@ -3507,7 +3332,7 @@ void Database::InsertRowAssumeLocked(const std::string &TableName, Item Row, boo
 	AppendWalAfterInsert(TableName, MutableRow);
 	OnRowInsertedAssumeLocked(TableName, TableRef.size() - 1, MutableRow);
 	if(RunTriggers)
-		FireTriggersAssumeLocked(*this, TableName, SQL::TriggerTiming::After, SQL::TriggerEvent::Insert, nullptr,
+		FireTriggersAssumeLocked(*this, TableName, TriggerTiming::After, TriggerEvent::Insert, nullptr,
 		                         &TableRef[TableRef.size() - 1], true);
 }
 
@@ -3591,10 +3416,10 @@ std::future<void> Database::Upsert(const std::string &TableName, const Database:
 				Item &Ex = TableRef[Found];
 				if(!RowAllowsAssumeLocked(Permissions::Update, TableName, Ex))
 					FailStorage("UPSERT: UPDATE denied by ACL.");
-				const SQL::RowEvalContext Ctx{&Ex, &InsertRow, nullptr};
+				const RowEvalContext Ctx{&Ex, &InsertRow, nullptr};
 				Item Merged = Ex;
 				for(const auto &[Col, Blob] : UpdateAssignments) {
-					auto V = SQL::EvalSerializedSetValueExpr(Blob, Ctx);
+					auto V = EvalSerializedSetValueExpr(Blob, Ctx);
 					if(!V)
 						FailStorage("UPSERT: could not evaluate DO UPDATE SET for \"" + Col + "\".");
 					Merged[Col] = *V;
@@ -3609,7 +3434,7 @@ std::future<void> Database::Upsert(const std::string &TableName, const Database:
 				auto IdxOuter = Indexes_.find(TableName);
 				if(IdxOuter != Indexes_.end()) {
 					for(const auto &[Col, Blob] : UpdateAssignments) {
-						auto V = SQL::EvalSerializedSetValueExpr(Blob, Ctx);
+						auto V = EvalSerializedSetValueExpr(Blob, Ctx);
 						if(!V)
 							continue;
 						auto ColIdx = IdxOuter->second.find(Col);
@@ -3623,7 +3448,7 @@ std::future<void> Database::Upsert(const std::string &TableName, const Database:
 					}
 				}
 				for(const auto &[Col, Blob] : UpdateAssignments) {
-					auto V = SQL::EvalSerializedSetValueExpr(Blob, Ctx);
+					auto V = EvalSerializedSetValueExpr(Blob, Ctx);
 					if(V)
 						Ex[Col] = *V;
 				}
@@ -3708,10 +3533,10 @@ std::future<void> Database::MergeUsing(const std::string &TargetTable, const std
 					Item &Ex = TRef[Found];
 					if(!RowAllowsAssumeLocked(Permissions::Update, TargetTable, Ex))
 						continue;
-					const SQL::RowEvalContext Ctx{&Ex, nullptr, &SrcRow};
+					const RowEvalContext Ctx{&Ex, nullptr, &SrcRow};
 					Item Merged = Ex;
 					for(const MergeUpdateCell &M : OnMatch) {
-						auto V = SQL::EvalSerializedSetValueExpr(M.ValueExpr, Ctx);
+						auto V = EvalSerializedSetValueExpr(M.ValueExpr, Ctx);
 						if(!V)
 							FailStorage("MERGE: could not evaluate UPDATE SET expression for \"" + M.TargetColumn +
 							            "\".");
@@ -3731,7 +3556,7 @@ std::future<void> Database::MergeUsing(const std::string &TargetTable, const std
 					auto IdxOuter = Indexes_.find(TargetTable);
 					if(IdxOuter != Indexes_.end()) {
 						for(const MergeUpdateCell &M : OnMatch) {
-							auto V = SQL::EvalSerializedSetValueExpr(M.ValueExpr, Ctx);
+							auto V = EvalSerializedSetValueExpr(M.ValueExpr, Ctx);
 							if(!V)
 								continue;
 							auto ColIdx = IdxOuter->second.find(M.TargetColumn);
@@ -3745,7 +3570,7 @@ std::future<void> Database::MergeUsing(const std::string &TargetTable, const std
 						}
 					}
 					for(const MergeUpdateCell &M : OnMatch) {
-						auto V = SQL::EvalSerializedSetValueExpr(M.ValueExpr, Ctx);
+						auto V = EvalSerializedSetValueExpr(M.ValueExpr, Ctx);
 						if(V)
 							Ex[M.TargetColumn] = *V;
 					}
@@ -3753,9 +3578,9 @@ std::future<void> Database::MergeUsing(const std::string &TargetTable, const std
 					if(OnInsert.empty())
 						continue;
 					Item NewR;
-					const SQL::RowEvalContext Ctx{nullptr, nullptr, &SrcRow};
+					const RowEvalContext Ctx{nullptr, nullptr, &SrcRow};
 					for(const MergeInsertCell &N : OnInsert) {
-						auto V = SQL::EvalSerializedSetValueExpr(N.ValueExpr, Ctx);
+						auto V = EvalSerializedSetValueExpr(N.ValueExpr, Ctx);
 						if(!V)
 							FailStorage("MERGE: could not evaluate INSERT value for \"" + N.Column + "\".");
 						NewR[N.Column] = *V;
@@ -3799,25 +3624,30 @@ std::future<void> Database::Delete(const std::string &TableName, const std::func
 			const auto DeleteCond = [&Condition, &RowPasses](const Item &Row) {
 				return Condition(Row) && RowPasses(Row);
 			};
+			Table Kept;
+			Kept.reserve(TableRef.size());
 			for(size_t i = 0; i < TableRef.size(); ++i) {
-				if(DeleteCond(TableRef[i])) {
-					FireTriggersAssumeLocked(*this, TableName, SQL::TriggerTiming::Before, SQL::TriggerEvent::Delete, &TableRef[i], nullptr, true);
-					RejectDeleteIfReferencedAssumeLocked(TableName, TableRef[i]);
-					if(IdxOuter != Indexes_.end()) {
-						for(const auto& [ColumnName, Value] : TableRef[i]) {
-							auto ColIdx = IdxOuter->second.find(ColumnName);
-							if(ColIdx != IdxOuter->second.end()) {
-								auto& Index = ColIdx->second;
-								std::get<BPlusTree<std::string, size_t>>(Index.Index()).Remove(Value);
-							}
+				if(!DeleteCond(TableRef[i])) {
+					Kept.push_back(std::move(TableRef[i]));
+					continue;
+				}
+				FireTriggersAssumeLocked(*this, TableName, TriggerTiming::Before, TriggerEvent::Delete, &TableRef[i],
+				                         nullptr, true);
+				RejectDeleteIfReferencedAssumeLocked(TableName, TableRef[i]);
+				if(IdxOuter != Indexes_.end()) {
+					for(const auto &[ColumnName, Value] : TableRef[i]) {
+						auto ColIdx = IdxOuter->second.find(ColumnName);
+						if(ColIdx != IdxOuter->second.end()) {
+							auto &Index = ColIdx->second;
+							std::get<BPlusTree<std::string, size_t>>(Index.Index()).Remove(Value);
 						}
 					}
-					const Item DeletedRow = TableRef[i];
-					FireTriggersAssumeLocked(*this, TableName, SQL::TriggerTiming::After, SQL::TriggerEvent::Delete,
-					                         &DeletedRow, nullptr, true);
 				}
+				const Item DeletedRow = TableRef[i];
+				FireTriggersAssumeLocked(*this, TableName, TriggerTiming::After, TriggerEvent::Delete, &DeletedRow,
+				                         nullptr, true);
 			}
-			TableRef.erase(std::remove_if(TableRef.begin(), TableRef.end(), DeleteCond), TableRef.end());
+			TableRef = std::move(Kept);
 			SyncFtsIndexesForTableAssumeLocked(TableName);
 			SyncVectorIndexesForTableAssumeLocked(TableName);
 			Slot.RecordWrite();
@@ -3841,24 +3671,40 @@ std::future<void> Database::UpdateWithSetExprs(const std::string &TableName,
 			auto &TableRef = Slot.RowStore;
 			auto IdxOuter = Indexes_.find(TableName);
 			RequireSessionTablePermissionAssumeLocked(Permissions::Update, TableName);
+			struct ResolvedSet {
+				std::string Col;
+				std::string Blob;
+				std::optional<std::string> Literal;
+			};
+			std::vector<ResolvedSet> Resolved;
+			Resolved.reserve(Assignments.size());
+			const RowEvalContext EmptyCtx{};
+			for(const auto &[Col, Blob] : Assignments) {
+				ResolvedSet R{Col, Blob, std::nullopt};
+				if(!Blob.empty() && Blob.front() == 'L') {
+					const auto Bar = Blob.find('|');
+					if(Bar != std::string::npos && Bar + 1 >= Blob.size())
+						R.Literal = EvalSerializedSetValueExpr(Blob, EmptyCtx);
+				}
+				Resolved.push_back(std::move(R));
+			}
 			for(size_t i = 0; i < TableRef.size(); ++i) {
 				auto &Row = TableRef[i];
 				if(!Condition(Row))
 					continue;
 				if(!RowAllowsAssumeLocked(Permissions::Update, TableName, Row))
 					continue;
-				const SQL::RowEvalContext Ctx{&Row, nullptr, nullptr};
+				const RowEvalContext Ctx{&Row, nullptr, nullptr};
 				Item Merged = Row;
-				for(const auto &[Col, Blob] : Assignments) {
-					auto V = SQL::EvalSerializedSetValueExpr(Blob, Ctx);
+				for(const ResolvedSet &R : Resolved) {
+					const auto V = R.Literal ? *R.Literal : EvalSerializedSetValueExpr(R.Blob, Ctx);
 					if(!V)
-						FailStorage("UPDATE: could not evaluate SET expression for \"" + Col + "\".");
-					Merged[Col] = *V;
+						FailStorage("UPDATE: could not evaluate SET expression for \"" + R.Col + "\".");
+					Merged[R.Col] = *V;
 				}
 				bool ColumnOk = true;
-				for(const auto &[Col, Blob] : Assignments) {
-					(void)Blob;
-					if(!ColumnAllowsAssumeLocked(Permissions::Update, TableName, Merged, Col)) {
+				for(const ResolvedSet &R : Resolved) {
+					if(!ColumnAllowsAssumeLocked(Permissions::Update, TableName, Merged, R.Col)) {
 						ColumnOk = false;
 						break;
 					}
@@ -3868,25 +3714,25 @@ std::future<void> Database::UpdateWithSetExprs(const std::string &TableName,
 				RejectRowIfChecksFailAssumeLocked(TableName, Merged);
 				RejectRowIfForeignKeysFailAssumeLocked(TableName, Merged);
 				if(IdxOuter != Indexes_.end()) {
-					for(const auto &[Col, Blob] : Assignments) {
-						auto V = SQL::EvalSerializedSetValueExpr(Blob, Ctx);
+					for(const ResolvedSet &R : Resolved) {
+						const auto V = R.Literal ? *R.Literal : EvalSerializedSetValueExpr(R.Blob, Ctx);
 						if(!V)
 							continue;
-						auto ColIdx = IdxOuter->second.find(Col);
+						auto ColIdx = IdxOuter->second.find(R.Col);
 						if(ColIdx == IdxOuter->second.end())
 							continue;
 						auto &Index = ColIdx->second;
-						auto OldIt = Row.find(Col);
+						auto OldIt = Row.find(R.Col);
 						if(OldIt != Row.end())
 							std::get<BPlusTree<std::string, size_t>>(Index.Index()).Remove(OldIt->second);
 						std::get<BPlusTree<std::string, size_t>>(Index.Index()).Insert(*V, i);
 					}
 				}
 				Item OldRow = Row;
-				for(const auto &[Col, Blob] : Assignments) {
-					auto V = SQL::EvalSerializedSetValueExpr(Blob, Ctx);
+				for(const ResolvedSet &R : Resolved) {
+					const auto V = R.Literal ? *R.Literal : EvalSerializedSetValueExpr(R.Blob, Ctx);
 					if(V)
-						Row[Col] = *V;
+						Row[R.Col] = *V;
 				}
 				OnRowUpdatedAssumeLocked(TableName, i, OldRow, Row);
 				Modified = true;
@@ -3946,10 +3792,10 @@ std::future<void> Database::Update(const std::string &TableName,
 					}
 				}
 				Item OldRow = Row;
-				FireTriggersAssumeLocked(*this, TableName, SQL::TriggerTiming::Before, SQL::TriggerEvent::Update, &Row, &Merged, true);
+				FireTriggersAssumeLocked(*this, TableName, TriggerTiming::Before, TriggerEvent::Update, &Row, &Merged, true);
 				for(const auto& [ColumnName, NewValue] : NewValues)
 					Row[ColumnName] = NewValue;
-				FireTriggersAssumeLocked(*this, TableName, SQL::TriggerTiming::After, SQL::TriggerEvent::Update, &OldRow, &Row, true);
+				FireTriggersAssumeLocked(*this, TableName, TriggerTiming::After, TriggerEvent::Update, &OldRow, &Row, true);
 				OnRowUpdatedAssumeLocked(TableName, i, OldRow, Row);
 				Modified = true;
 			}
@@ -4039,7 +3885,7 @@ std::future<bool> Database::ValidateRow(const std::string &TableName, const Item
 				for(const auto &Co : Columns) {
 					if(!Co.CheckConstraintDnfPacked.has_value())
 						continue;
-					if(AstralDB::SQL::EvaluatePackedWhereDnf(this, Row, *Co.CheckConstraintDnfPacked))
+					if(EvaluatePackedWhereDnf(this, Row, *Co.CheckConstraintDnfPacked))
 						continue;
 					Valid = false;
 					break;
@@ -4049,7 +3895,7 @@ std::future<bool> Database::ValidateRow(const std::string &TableName, const Item
 				auto Tk = TableCheckConstraints_.find(TableName);
 				if(Tk != TableCheckConstraints_.end()) {
 					for(const auto &Pr : Tk->second) {
-						if(AstralDB::SQL::EvaluatePackedWhereDnf(this, Row, Pr.second))
+						if(EvaluatePackedWhereDnf(this, Row, Pr.second))
 							continue;
 						Valid = false;
 						break;
@@ -4067,6 +3913,13 @@ std::optional<Database::Schema> Database::TableSchemaSnapshot(const std::string 
 	if(It == TableSchemas_.end())
 		return std::nullopt;
 	return It->second;
+}
+
+HybridTableSlot *Database::FindTableSlotAssumeDbMutexHeld(const std::string &TableName) noexcept {
+	const auto It = Tables_.find(TableName);
+	if(It == Tables_.end())
+		return nullptr;
+	return &It->second;
 }
 
 std::optional<Database::Schema> Database::TableSchemaAssumeDbMutexHeld(const std::string &TableName) const {
@@ -4721,6 +4574,27 @@ bool Database::ExportBundle(std::filesystem::path Destination, std::string_view 
 				Logger_->Info("Exported database bundle (" + Fmt + ")");
 			return true;
 		}
+		if(Fmt == "xlsx" || Fmt == "excel") {
+			std::vector<DS::XlsxSheet> Sheets;
+			Sheets.reserve(Names.size());
+			std::shared_lock Guard(DbMutex_);
+			for(const std::string &TName : Names) {
+				auto SIt = TableSchemas_.find(TName);
+				auto TIt = Tables_.find(TName);
+				if(SIt == TableSchemas_.end())
+					continue;
+				DS::XlsxSheet Sh;
+				Sh.Name = TName;
+				const Table &Tb = TIt != Tables_.end() ? TIt->second.RowStore : Table{};
+				Sh.Data = BuildTabularForExport(SIt->second, Tb);
+				Sheets.push_back(std::move(Sh));
+			}
+			if(!DS::WriteXlsx(Destination, Sheets))
+				return false;
+			if(Logger_)
+				Logger_->Info("Exported database bundle (xlsx)");
+			return true;
+		}
 		if(Logger_)
 			Logger_->Error("Unsupported export format");
 		return false;
@@ -4978,6 +4852,33 @@ bool Database::ImportBundle(std::filesystem::path Source, std::string_view Forma
 			}
 			return true;
 		}
+		if(Fmt == "xlsx" || Fmt == "excel") {
+			std::vector<std::string> Old;
+			{
+				std::scoped_lock G(DbMutex_);
+				Old.reserve(TableSchemas_.size());
+				for(const auto &P : TableSchemas_)
+					Old.push_back(P.first);
+			}
+			for(const std::string &N : Old)
+				DropTable(N).wait();
+			for(const std::string &SheetName : DS::ListXlsxSheetNames(Source)) {
+				const auto Tb = DS::ReadXlsx(Source, SheetName);
+				if(!Tb || Tb->Headers.empty())
+					continue;
+				const Schema Sch = SchemaFromHeaders(Tb->Headers, std::string("TEXT"));
+				CreateTable(SheetName, Sch).wait();
+				for(const DS::Row &Rw : Tb->Rows) {
+					Item Row;
+					for(size_t K = 0; K < Tb->Headers.size() && K < Rw.Size(); ++K)
+						Row[Tb->Headers[K]] = Rw[K];
+					Insert(SheetName, Row).wait();
+				}
+			}
+			if(Logger_)
+				Logger_->Info("Imported database bundle (xlsx)");
+			return true;
+		}
 		return false;
 	} catch(const std::exception &Ex) {
 		if(Logger_)
@@ -5043,7 +4944,7 @@ void Database::SyncFtsIndexesForTableAssumeLocked(const std::string &TableName) 
 		for(size_t I = 0; I < Rows.size(); ++I) {
 			auto It = Rows[I].find(Spec.Column);
 			if(It != Rows[I].end())
-				Spec.Index.IndexRow(I, It->second);
+				Spec.Index.Insert(static_cast<int64_t>(I), It->second);
 		}
 	}
 }
@@ -5071,7 +4972,7 @@ void Database::OnRowInsertedAssumeLocked(const std::string &TableName, size_t Ro
 			continue;
 		auto It = Row.find(Spec.Column);
 		if(It != Row.end())
-			Spec.Index.IndexRow(RowIndex, It->second);
+			Spec.Index.Insert(static_cast<int64_t>(RowIndex), It->second);
 	}
 	for(auto &[Name, Spec] : VectorIndexes_) {
 		(void)Name;
@@ -5094,10 +4995,10 @@ void Database::OnRowUpdatedAssumeLocked(const std::string &TableName, size_t Row
 			continue;
 		auto Oit = OldRow.find(Spec.Column);
 		if(Oit != OldRow.end())
-			Spec.Index.RemoveRow(RowIndex, Oit->second);
+			Spec.Index.Remove(static_cast<int64_t>(RowIndex), Oit->second);
 		auto Nit = NewRow.find(Spec.Column);
 		if(Nit != NewRow.end())
-			Spec.Index.IndexRow(RowIndex, Nit->second);
+			Spec.Index.Insert(static_cast<int64_t>(RowIndex), Nit->second);
 	}
 	for(auto &[Name, Spec] : VectorIndexes_) {
 		(void)Name;
@@ -5183,7 +5084,7 @@ void Database::DropSecondaryIndex(const std::string &IndexName, bool IfExists) {
 		VectorIndexes_.erase(IndexName);
 }
 
-const TextIndex *Database::FtsForColumn(const std::string &TableName, const std::string &ColumnName) const {
+const FtsIndex *Database::FtsForColumn(const std::string &TableName, const std::string &ColumnName) const {
 	for(const auto &[Name, Spec] : FtsIndexes_) {
 		(void)Name;
 		if(Spec.Table == TableName && Spec.Column == ColumnName)

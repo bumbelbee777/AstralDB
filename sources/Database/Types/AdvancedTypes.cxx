@@ -1,6 +1,6 @@
-#include <Database/AdvancedTypes.hxx>
+#include <Database/Types/AdvancedTypes.hxx>
 
-#include <Database/GeoSpatial.hxx>
+#include <Database/Graph/GeoSpatial.hxx>
 #include <DS/glTF.hxx>
 #include <DS/Geometry2D.hxx>
 #include <IO/SIMD.hxx>

@@ -95,7 +95,8 @@ inline std::array<uint8_t, 32> Hash(const std::vector<uint8_t>& Input) {
 	uint32_t Out[8] = {};
 	uint8_t Block[CHUNK_LEN] = {};
 	SimdMemset(Block, 0, CHUNK_LEN);
-	SimdMemcpy(Block, Input.data(), std::min<size_t>(Input.size(), CHUNK_LEN));
+	const std::size_t ChunkBytes = std::min<std::size_t>(Input.size(), CHUNK_LEN);
+	(void)Simd::MemcpySafe(Block, CHUNK_LEN, Input.data(), Input.size(), ChunkBytes);
 	Compress(IV.data(), Block, 0, Flags, Out);
 	std::array<uint8_t, 32> HashOut;
 	for(int i = 0; i < 8; ++i) Store32LE(HashOut.data() + i * 4, Out[i]);

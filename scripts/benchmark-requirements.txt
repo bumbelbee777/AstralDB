@@ -1,7 +1,9 @@
-# For scripts/benchmark_torture_plot.py and scripts/stress_torture_histogram.py
+# For scripts/benchmark_torture_plot.py, scripts/benchmark_nuke_plot.py, and scripts/stress_torture_histogram.py
 # (also auto-installed unless --no-fetch)
 matplotlib>=3.8
 duckdb>=1.0.0
+# Superfetch MLP training (scripts/train_superfetch_mlp.py)
+torch>=2.0.0
 # Optional: MySQL timing (skip with --skip-mysql or if PyMySQL unavailable)
 pymysql>=1.1.0
 # Automated MySQL + benchmark: Docker; run scripts/run_benchmark_with_mysql.ps1 or .sh

@@ -1,4 +1,4 @@
-#include <SQL/BytecodeFormat.hxx>
+#include <SQL/Bytecode/BytecodeFormat.hxx>
 #include <IO/Error.hxx>
 #include <fstream>
 #include <stdexcept>

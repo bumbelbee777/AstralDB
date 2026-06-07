@@ -245,6 +245,28 @@ def _export_procedures(conn, engine: str, *, schema: Optional[str]) -> List[Proc
                 specs.append(ProcedureSpec(name=str(row[0]), sql=str(row[1]), dialect="plsql", source=engine))
         except Exception:
             pass
+    elif engine == "mssql":
+        q = """
+        SELECT ROUTINE_SCHEMA, ROUTINE_NAME, ROUTINE_DEFINITION
+        FROM information_schema.ROUTINES
+        WHERE ROUTINE_TYPE = 'PROCEDURE'
+          AND ROUTINE_SCHEMA = COALESCE(:schema, SCHEMA_NAME())
+        ORDER BY 1, 2
+        """
+        try:
+            for row in conn.execute(text(q), {"schema": schema}):
+                schema_name = str(row[0] or "dbo")
+                name = str(row[1])
+                body = str(row[2] or "").strip()
+                if not body:
+                    continue
+                ddl = (
+                    f"CREATE OR ALTER PROCEDURE [{schema_name}].[{name}]\n"
+                    f"AS\nBEGIN\n{body}\nEND;"
+                )
+                specs.append(ProcedureSpec(name=name, sql=ddl, dialect="tsql", source=engine))
+        except Exception:
+            pass
     return specs
 
 

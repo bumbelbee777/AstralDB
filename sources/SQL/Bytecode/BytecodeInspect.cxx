@@ -1,7 +1,9 @@
-#include <SQL/BytecodeInspect.hxx>
+#include <SQL/Bytecode/BytecodeInspect.hxx>
+#include <SQL/Bytecode/BytecodeDisasm.hxx>
+#include <SQL/Bytecode/OpcodeMeta.hxx>
+
 #include <algorithm>
 #include <cctype>
-#include <iomanip>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_set>
@@ -31,125 +33,6 @@ void MaybeAddTableRef(BytecodeAnalysis &Analysis, const std::string &Name) {
 		MaybeAddUnique(Analysis.ScratchTables, Name);
 	else
 		MaybeAddUnique(Analysis.ReferencedTables, Name);
-}
-
-std::string OperandPreview(const Value &V) {
-	return std::visit(
-	    [](const auto &Arg) -> std::string {
-		    using T = std::decay_t<decltype(Arg)>;
-		    if constexpr(std::is_same_v<T, int64_t>)
-			    return std::to_string(Arg);
-		    else if constexpr(std::is_same_v<T, double>)
-			    return std::to_string(Arg);
-		    else
-			    return "\"" + std::string(Arg) + "\"";
-	    },
-	    V);
-}
-
-bool OpcodeIsDdl(Opcode Op) {
-	switch(Op) {
-	case Opcode::CREATE_TABLE:
-	case Opcode::DROP_TABLE:
-	case Opcode::CREATE_VIEW:
-	case Opcode::DROP_VIEW:
-	case Opcode::ALTER_TABLE:
-	case Opcode::RENAME_TABLE:
-	case Opcode::CREATE_INDEX:
-	case Opcode::DROP_INDEX:
-	case Opcode::CREATE_SCHEMA:
-	case Opcode::DROP_SCHEMA:
-	case Opcode::ALTER_SCHEMA:
-	case Opcode::CREATE_SEQUENCE:
-	case Opcode::DROP_SEQUENCE:
-	case Opcode::CREATE_ROLE:
-	case Opcode::DROP_ROLE:
-	case Opcode::CREATE_USER:
-	case Opcode::DROP_USER:
-	case Opcode::ALTER_USER_PASSWORD:
-	case Opcode::CREATE_PROCEDURE:
-	case Opcode::DROP_PROCEDURE:
-	case Opcode::CREATE_TRIGGER:
-	case Opcode::DROP_TRIGGER:
-	case Opcode::ALTER_TRIGGER:
-	case Opcode::CALL_PROCEDURE:
-	case Opcode::PROC_TRY:
-	case Opcode::PROC_END_TRY:
-	case Opcode::PROC_JUMP_IF_TABLE_EMPTY:
-		return true;
-	default:
-		return false;
-	}
-}
-
-bool OpcodeIsDml(Opcode Op) {
-	switch(Op) {
-	case Opcode::INSERT:
-	case Opcode::INSERT_BULK:
-	case Opcode::UPDATE:
-	case Opcode::DELETE:
-	case Opcode::UPDATE_MATCHING:
-	case Opcode::DELETE_MATCHING:
-	case Opcode::UPSERT:
-	case Opcode::MERGE_INTO:
-	case Opcode::REGISTER_DATASET:
-	case Opcode::LOAD_DATASET:
-	case Opcode::DROP_DATASET:
-	case Opcode::VACUUM:
-	case Opcode::REPACK_CONCURRENTLY:
-	case Opcode::GRAPH_REGISTER:
-	case Opcode::GRAPH_DROP:
-	case Opcode::GRAPH_TRAVERSE:
-	case Opcode::GRAPH_MATCH:
-	case Opcode::GRAPH_SHORTEST_PATH:
-	case Opcode::GRAPH_PAGERANK:
-	case Opcode::GRAPH_REGISTER_PROJECTION:
-		return true;
-	default:
-		return false;
-	}
-}
-
-bool OpcodeIsJoin(Opcode Op) {
-	switch(Op) {
-	case Opcode::INNER_JOIN:
-	case Opcode::LEFT_JOIN:
-	case Opcode::RIGHT_JOIN:
-	case Opcode::FULL_JOIN:
-	case Opcode::CROSS_JOIN:
-		return true;
-	default:
-		return false;
-	}
-}
-
-bool OpcodeIsAggregate(Opcode Op) {
-	switch(Op) {
-	case Opcode::GROUP_BY:
-	case Opcode::ROLLUP:
-	case Opcode::CUBE:
-	case Opcode::GROUPING_SETS:
-		return true;
-	default:
-		return false;
-	}
-}
-
-bool OpcodeIsSecurity(Opcode Op) {
-	switch(Op) {
-	case Opcode::GRANT:
-	case Opcode::REVOKE:
-	case Opcode::CREATE_USER:
-	case Opcode::DROP_USER:
-	case Opcode::ALTER_USER_PASSWORD:
-	case Opcode::GRANT_ROLE_MEMBERSHIP:
-	case Opcode::REVOKE_ROLE_MEMBERSHIP:
-	case Opcode::GRANT_COLUMN:
-	case Opcode::REVOKE_COLUMN:
-		return true;
-	default:
-		return false;
-	}
 }
 
 void HarvestOperands(const Instruction &Inst, BytecodeAnalysis &Analysis) {
@@ -217,342 +100,6 @@ void HarvestOperands(const Instruction &Inst, BytecodeAnalysis &Analysis) {
 
 } // namespace
 
-std::string OpcodeName(Opcode Op) {
-	switch(Op) {
-	case Opcode::SELECT:
-		return "SELECT";
-	case Opcode::INSERT:
-		return "INSERT";
-	case Opcode::INSERT_BULK:
-		return "INSERT_BULK";
-	case Opcode::REGISTER_DATASET:
-		return "REGISTER_DATASET";
-	case Opcode::LOAD_DATASET:
-		return "LOAD_DATASET";
-	case Opcode::DROP_DATASET:
-		return "DROP_DATASET";
-	case Opcode::REGISTER_EMBEDDING:
-		return "REGISTER_EMBEDDING";
-	case Opcode::DROP_EMBEDDING:
-		return "DROP_EMBEDDING";
-	case Opcode::VACUUM:
-		return "VACUUM";
-	case Opcode::REPACK_CONCURRENTLY:
-		return "REPACK_CONCURRENTLY";
-	case Opcode::GRAPH_REGISTER:
-		return "GRAPH_REGISTER";
-	case Opcode::GRAPH_DROP:
-		return "GRAPH_DROP";
-	case Opcode::GRAPH_TRAVERSE:
-		return "GRAPH_TRAVERSE";
-	case Opcode::GRAPH_MATCH:
-		return "GRAPH_MATCH";
-	case Opcode::GRAPH_SHORTEST_PATH:
-		return "GRAPH_SHORTEST_PATH";
-	case Opcode::GRAPH_PAGERANK:
-		return "GRAPH_PAGERANK";
-	case Opcode::GRAPH_REGISTER_PROJECTION:
-		return "GRAPH_REGISTER_PROJECTION";
-	case Opcode::UPDATE:
-		return "UPDATE";
-	case Opcode::DELETE:
-		return "DELETE";
-	case Opcode::CREATE_TABLE:
-		return "CREATE_TABLE";
-	case Opcode::DROP_TABLE:
-		return "DROP_TABLE";
-	case Opcode::CREATE_TYPE:
-		return "CREATE_TYPE";
-	case Opcode::DROP_TYPE:
-		return "DROP_TYPE";
-	case Opcode::SET:
-		return "SET";
-	case Opcode::WHERE:
-		return "WHERE";
-	case Opcode::ORDER_BY:
-		return "ORDER_BY";
-	case Opcode::GROUP_BY:
-		return "GROUP_BY";
-	case Opcode::LIMIT:
-		return "LIMIT";
-	case Opcode::OFFSET:
-		return "OFFSET";
-	case Opcode::KEEP_ROWS:
-		return "KEEP_ROWS";
-	case Opcode::DEDUP_ROWS:
-		return "DEDUP_ROWS";
-	case Opcode::SET_COMBINE:
-		return "SET_COMBINE";
-	case Opcode::DELETE_MATCHING:
-		return "DELETE_MATCHING";
-	case Opcode::UPDATE_MATCHING:
-		return "UPDATE_MATCHING";
-	case Opcode::UPSERT:
-		return "UPSERT";
-	case Opcode::MERGE_INTO:
-		return "MERGE_INTO";
-	case Opcode::FILTER_DNF:
-		return "FILTER_DNF";
-	case Opcode::PUSH_POOL:
-		return "PUSH_POOL";
-	case Opcode::AND:
-		return "AND";
-	case Opcode::OR:
-		return "OR";
-	case Opcode::NOT:
-		return "NOT";
-	case Opcode::EQ:
-		return "EQ";
-	case Opcode::NE:
-		return "NE";
-	case Opcode::LT:
-		return "LT";
-	case Opcode::LE:
-		return "LE";
-	case Opcode::GT:
-		return "GT";
-	case Opcode::GE:
-		return "GE";
-	case Opcode::ADD:
-		return "ADD";
-	case Opcode::SUB:
-		return "SUB";
-	case Opcode::MUL:
-		return "MUL";
-	case Opcode::DIV:
-		return "DIV";
-	case Opcode::MOD:
-		return "MOD";
-	case Opcode::INT_DIV:
-		return "INT_DIV";
-	case Opcode::PUSH:
-		return "PUSH";
-	case Opcode::POP:
-		return "POP";
-	case Opcode::LOAD:
-		return "LOAD";
-	case Opcode::STORE:
-		return "STORE";
-	case Opcode::CALL:
-		return "CALL";
-	case Opcode::RET:
-		return "RET";
-	case Opcode::JMP:
-		return "JMP";
-	case Opcode::NOP:
-		return "NOP";
-	case Opcode::HALT:
-		return "HALT";
-	case Opcode::GRANT:
-		return "GRANT";
-	case Opcode::REVOKE:
-		return "REVOKE";
-	case Opcode::CREATE_ROLE:
-		return "CREATE_ROLE";
-	case Opcode::DROP_ROLE:
-		return "DROP_ROLE";
-	case Opcode::CREATE_USER:
-		return "CREATE_USER";
-	case Opcode::DROP_USER:
-		return "DROP_USER";
-	case Opcode::ALTER_USER_PASSWORD:
-		return "ALTER_USER_PASSWORD";
-	case Opcode::CREATE_SEQUENCE:
-		return "CREATE_SEQUENCE";
-	case Opcode::DROP_SEQUENCE:
-		return "DROP_SEQUENCE";
-	case Opcode::GRANT_ROLE_MEMBERSHIP:
-		return "GRANT_ROLE_MEMBERSHIP";
-	case Opcode::REVOKE_ROLE_MEMBERSHIP:
-		return "REVOKE_ROLE_MEMBERSHIP";
-	case Opcode::GRANT_COLUMN:
-		return "GRANT_COLUMN";
-	case Opcode::REVOKE_COLUMN:
-		return "REVOKE_COLUMN";
-	case Opcode::BEGIN:
-		return "BEGIN";
-	case Opcode::COMMIT:
-		return "COMMIT";
-	case Opcode::ROLLBACK:
-		return "ROLLBACK";
-	case Opcode::SET_TRANSACTION_ISOLATION:
-		return "SET_TRANSACTION_ISOLATION";
-	case Opcode::INNER_JOIN:
-		return "INNER_JOIN";
-	case Opcode::LEFT_JOIN:
-		return "LEFT_JOIN";
-	case Opcode::RIGHT_JOIN:
-		return "RIGHT_JOIN";
-	case Opcode::FULL_JOIN:
-		return "FULL_JOIN";
-	case Opcode::CROSS_JOIN:
-		return "CROSS_JOIN";
-	case Opcode::WITH:
-		return "WITH";
-	case Opcode::WINDOW:
-		return "WINDOW";
-	case Opcode::PARTITION_BY:
-		return "PARTITION_BY";
-	case Opcode::OVER:
-		return "OVER";
-	case Opcode::CONCAT:
-		return "CONCAT";
-	case Opcode::SUBSTRING:
-		return "SUBSTRING";
-	case Opcode::TRIM:
-		return "TRIM";
-	case Opcode::LTRIM:
-		return "LTRIM";
-	case Opcode::RTRIM:
-		return "RTRIM";
-	case Opcode::UPPER:
-		return "UPPER";
-	case Opcode::LOWER:
-		return "LOWER";
-	case Opcode::REPLACE:
-		return "REPLACE";
-	case Opcode::REGEXP_MATCH:
-		return "REGEXP_MATCH";
-	case Opcode::DATE_ADD:
-		return "DATE_ADD";
-	case Opcode::DATE_SUB:
-		return "DATE_SUB";
-	case Opcode::DATE_DIFF:
-		return "DATE_DIFF";
-	case Opcode::EXTRACT_DATE:
-		return "EXTRACT_DATE";
-	case Opcode::EXTRACT_TIME:
-		return "EXTRACT_TIME";
-	case Opcode::JSON_EXTRACT:
-		return "JSON_EXTRACT";
-	case Opcode::JSON_CONTAINS:
-		return "JSON_CONTAINS";
-	case Opcode::JSON_MERGE:
-		return "JSON_MERGE";
-	case Opcode::MATCH:
-		return "MATCH";
-	case Opcode::AGAINST:
-		return "AGAINST";
-	case Opcode::ROLLUP:
-		return "ROLLUP";
-	case Opcode::CUBE:
-		return "CUBE";
-	case Opcode::GROUPING_SETS:
-		return "GROUPING_SETS";
-	case Opcode::EXISTS:
-		return "EXISTS";
-	case Opcode::IN:
-		return "IN";
-	case Opcode::ANY:
-		return "ANY";
-	case Opcode::ALL:
-		return "ALL";
-	case Opcode::CHECK_CONSTRAINT:
-		return "CHECK_CONSTRAINT";
-	case Opcode::FOREIGN_KEY:
-		return "FOREIGN_KEY";
-	case Opcode::CREATE_INDEX:
-		return "CREATE_INDEX";
-	case Opcode::DROP_INDEX:
-		return "DROP_INDEX";
-	case Opcode::CREATE_VIEW:
-		return "CREATE_VIEW";
-	case Opcode::DROP_VIEW:
-		return "DROP_VIEW";
-	case Opcode::COMMENT_ON:
-		return "COMMENT_ON";
-	case Opcode::SHOW_TABLES:
-		return "SHOW_TABLES";
-	case Opcode::DESCRIBE_TABLE:
-		return "DESCRIBE_TABLE";
-	case Opcode::CREATE_PROCEDURE:
-		return "CREATE_PROCEDURE";
-	case Opcode::DROP_PROCEDURE:
-		return "DROP_PROCEDURE";
-	case Opcode::CREATE_TRIGGER:
-		return "CREATE_TRIGGER";
-	case Opcode::DROP_TRIGGER:
-		return "DROP_TRIGGER";
-	case Opcode::ALTER_TRIGGER:
-		return "ALTER_TRIGGER";
-	case Opcode::CALL_PROCEDURE:
-		return "CALL_PROCEDURE";
-case Opcode::PROC_TRY:
-		return "PROC_TRY";
-case Opcode::PROC_END_TRY:
-		return "PROC_END_TRY";
-	case Opcode::PROC_JUMP_IF_TABLE_EMPTY:
-		return "PROC_JUMP_IF_TABLE_EMPTY";
-	case Opcode::CREATE_SCHEMA:
-		return "CREATE_SCHEMA";
-	case Opcode::DROP_SCHEMA:
-		return "DROP_SCHEMA";
-	case Opcode::ALTER_SCHEMA:
-		return "ALTER_SCHEMA";
-	case Opcode::ALTER_TABLE:
-		return "ALTER_TABLE";
-	case Opcode::RENAME_TABLE:
-		return "RENAME_TABLE";
-	case Opcode::SAVEPOINT:
-		return "SAVEPOINT";
-	case Opcode::ROLLBACK_TO:
-		return "ROLLBACK_TO";
-	case Opcode::RELEASE_SAVEPOINT:
-		return "RELEASE_SAVEPOINT";
-	case Opcode::EXPORT_DATABASE:
-		return "EXPORT_DATABASE";
-	case Opcode::IMPORT_DATABASE:
-		return "IMPORT_DATABASE";
-	case Opcode::CONVERT_TABULAR_FILES:
-		return "CONVERT_TABULAR_FILES";
-	case Opcode::CLONE_TABLE:
-		return "CLONE_TABLE";
-	case Opcode::FILTER_AS_OF:
-		return "FILTER_AS_OF";
-	case Opcode::MATCH_RECOGNIZE:
-		return "MATCH_RECOGNIZE";
-	case Opcode::RECURSIVE_CTE_FIXPOINT:
-		return "RECURSIVE_CTE_FIXPOINT";
-	case Opcode::CONNECT_BY_EXPAND:
-		return "CONNECT_BY_EXPAND";
-	case Opcode::WINDOW_ROW_NUMBER:
-		return "WINDOW_ROW_NUMBER";
-	case Opcode::SLICE_RANGE:
-		return "SLICE_RANGE";
-	case Opcode::STORAGE_HINT:
-		return "STORAGE_HINT";
-	case Opcode::CASE_EVAL:
-		return "CASE_EVAL";
-	case Opcode::CAST_EVAL:
-		return "CAST_EVAL";
-	case Opcode::SCALAR_FUNC_EVAL:
-		return "SCALAR_FUNC_EVAL";
-	case Opcode::SCALAR_ARITH_EVAL:
-		return "SCALAR_ARITH_EVAL";
-	case Opcode::COLUMNS_EXPAND:
-		return "COLUMNS_EXPAND";
-	}
-	return "OP_" + std::to_string(static_cast<int>(Op));
-}
-
-std::string DisassemblePretty(const Bytecode &Code) {
-	std::ostringstream Out;
-	for(std::size_t I = 0; I < Code.size(); ++I) {
-		const Instruction &Inst = Code[I];
-		Out << std::setw(5) << I << "  " << OpcodeName(Inst.Opcode_);
-		if(!Inst.Operands.empty()) {
-			Out << "  ";
-			for(std::size_t O = 0; O < Inst.Operands.size(); ++O) {
-				if(O)
-					Out << ", ";
-				Out << OperandPreview(Inst.Operands[O]);
-			}
-		}
-		Out << "\n";
-	}
-	return Out.str();
-}
-
 BytecodeAnalysis AnalyzeBytecode(const Bytecode &Code) {
 	BytecodeAnalysis Analysis;
 	Analysis.InstructionCount = Code.size();
@@ -564,17 +111,17 @@ BytecodeAnalysis AnalyzeBytecode(const Bytecode &Code) {
 			++Analysis.SideEffectInstructionCount;
 		if(Inst.Opcode_ == Opcode::HALT)
 			Analysis.HasHalt = true;
-		if(OpcodeIsDdl(Inst.Opcode_))
+		if(OpcodeIsDdlMeta(Inst.Opcode_))
 			Analysis.HasDdl = true;
-		if(OpcodeIsDml(Inst.Opcode_))
+		if(OpcodeIsDmlMeta(Inst.Opcode_))
 			Analysis.HasDml = true;
-		if(OpcodeIsJoin(Inst.Opcode_))
+		if(OpcodeIsJoinMeta(Inst.Opcode_))
 			Analysis.HasJoins = true;
-		if(OpcodeIsAggregate(Inst.Opcode_))
+		if(OpcodeIsAggregateMeta(Inst.Opcode_))
 			Analysis.HasAggregates = true;
 		if(Inst.Opcode_ == Opcode::WINDOW_ROW_NUMBER)
 			Analysis.HasWindowAnalytics = true;
-		if(OpcodeIsSecurity(Inst.Opcode_))
+		if(OpcodeIsSecurityMeta(Inst.Opcode_))
 			Analysis.HasSecurityGrants = true;
 		switch(Inst.Opcode_) {
 		case Opcode::BEGIN:
@@ -731,14 +278,10 @@ BytecodeValidationReport ValidateBytecode(const Bytecode &Code) {
 	const auto Analysis = AnalyzeBytecode(Code);
 	if(!Analysis.HasHalt)
 		Report.Warnings.push_back("No HALT instruction found.");
-	for(const Instruction &Inst : Code) {
-		if(static_cast<int>(Inst.Opcode_) > static_cast<int>(Opcode::SCALAR_FUNC_EVAL))
-			Report.Errors.push_back("Unknown opcode value " + std::to_string(static_cast<int>(Inst.Opcode_)));
-	}
-	Report.Ok = Report.Errors.empty();
+	if(Analysis.HasDdl && Analysis.HasDml)
+		Report.Warnings.push_back("Program mixes DDL and DML (may require careful transaction boundaries).");
 	return Report;
 }
 
 } // namespace SQL
 } // namespace AstralDB
-

@@ -31,18 +31,19 @@ Full CLI flags: `astraldb --help`. C API: [`include/astraldb/AstralDB.h`](includ
 
 | | |
 |---|---|
-| **Release binary** | **~1.5 MB** with default `-DASTRALDB_RELEASE_PROFILE=size` (CI/release); larger without size tuning (e.g. ~2.5 MB MSVC Release) |
-| **Engine sources** | **46,285** lines in **132** `.cxx`/`.hxx` files under `sources/` |
-| **Contract tests** | **170** doctest cases (**1171** assertions; perf tier: `run_tests --test-suite=perf`) |
-| **Example SQL** | **63** scripts (**55** under `examples/`, **8** under `examples/benchmarks/`) |
+| **Release binary (unpacked)** | **~2.0–2.6 MB** with `-DASTRALDB_RELEASE_PROFILE=size` on Clang/MinGW (Windows); Linux GCC CI targets **~1.5 MB** with gc-sections + strip |
+| **Release binary (UPX)** | **~0.8–1.2 MB** when packed with `upx --best --lzma` on release assets (see [`docs/RELEASING.md`](docs/RELEASING.md); AV heuristics may flag packed PE) |
+| **Engine sources** | **~82k** lines in **360** `.cxx`/`.hxx` files under `sources/` |
+| **Contract tests** | **222** doctest cases (**1252** assertions; perf tier: `run_tests --test-suite=perf`) |
+| **Example SQL** | **62** runnable scripts under `examples/` + **33** benchmark harnesses under `examples/benchmarks/` |
 | **Version** | `astraldb --version` → **2.0** (`.abc` container layout **v1**) |
 
 No server process, no JVM, no opaque planner DLLs. One CLI, one database file (or ephemeral `-m` session).
 
 ## What's new in 2.0
 
-- **MathSci inference** — `MCTS_SEARCH`, conjugate/grid Bayesian updates, `NFP_MACRO_MARCH` (HANK-style macro Fokker–Planck); see [`docs/MathSciInference.md`](docs/MathSciInference.md), [`docs/MathSciFokkerPlanck.md`](docs/MathSciFokkerPlanck.md)
-- **PINN & models in SQL** — `PREDICT`, `MSE_LOSS`, `PINN_FD_CENTRAL`, binary `MATHSCI_MODEL_*` cells with compiled MLP cache and SIMD `matvec`; see [`docs/MathSciPinn.md`](docs/MathSciPinn.md), [`docs/MathSciModel.md`](docs/MathSciModel.md)
+- **MathSci inference** — `MCTS_SEARCH`, conjugate/grid Bayesian updates, `NFP_MACRO_MARCH` (HANK-style macro Fokker–Planck); see [`docs/MathSciInference.md`](docs/MathSciInference.md)
+- **PINN & models in SQL** — `PREDICT`, `MSE_LOSS`, `PINN_FD_CENTRAL`, binary `MATHSCI_MODEL_*` cells with compiled MLP cache and SIMD `matvec`; see [`docs/MathSciMl.md`](docs/MathSciMl.md)
 - **Memory guards** — near-zero steady-state cost; arms on allocation spikes and bulk/maintenance paths (`LOAD DATASET`, `VACUUM`, `REPACK`)
 - **Quasar 2.0** — sharding, pooled access, cross-shard transactions, multi-region replication, HTTP gateway; see [`docs/Quasar.md`](docs/Quasar.md)
 - **Broader contract** — more examples, torture suites, and doctest coverage across geospatial, datasets, GQL, and dialect compat
@@ -58,7 +59,7 @@ Inside the single binary:
 - **Geospatial** — 2D `POINT`/`POLYGON`, 3D `MESH` (glTF, CSG), terrain DEM — [`docs/Geospatial.md`](docs/Geospatial.md)
 - **Graph / GQL** — `CREATE GRAPH`, `GRAPH MATCH`, shortest path, PageRank — [`docs/GraphGql.md`](docs/GraphGql.md)
 - **Time series** — `TIME_BUCKET`, `DATE_TRUNC`, **`TS_COMPRESS` / `TS_DECOMPRESS`**
-- **MathSci** — SIMD signal/FFT, autograd, ODE/SDE/PDE solvers, classifiers, NLP, embeddings, tiny LM training — [`docs/MathSciLmTrain.md`](docs/MathSciLmTrain.md)
+- **MathSci** — SIMD signal/FFT, autograd, ODE/SDE/PDE solvers, classifiers, NLP, embeddings, tiny LM training — [`docs/MathSciCore.md`](docs/MathSciCore.md), [`docs/MathSciMl.md`](docs/MathSciMl.md)
 - **Datasets** — `CREATE DATASET … AS TABLE|BULK`, versioned snapshots, `LOAD DATASET … VERSION n INTO`
 - **Bytecode** — `.abc` compile/inspect/debug, stored procedures, triggers
 - **Durability & security** — encrypted WAL, RBAC, row/column grants, hybrid row/columnar storage, FTS & vector indexes
@@ -99,36 +100,126 @@ CTE + JOIN + GROUP BY + window at ~1k customers / 10k orders / 50k line items (`
 
 ![SQL-92 analytic benchmark: AstralDB vs DuckDB vs SQLite](media/astraldb_bench.png)
 
-| Engine | Median |
-|--------|-------:|
-| **AstralDB** | **15.5 ms** |
-| DuckDB | 16.5 ms |
-| SQLite 3.49.1 | 116.4 ms |
+| Engine | Configuration | Median (3 runs) |
+|--------|---------------|----------------:|
+| **AstralDB** | `--database` on-disk, `-O4`, lazy BULK setup (untimed), `--time-sql-durable` query; universal metadata | **0.191 ms** |
+| DuckDB | `:memory:` full setup + query | 18.2 ms |
+| SQLite 3.49.1 | `:memory:` full setup + query | 121.6 ms |
 
 ```bash
-python scripts/benchmark_torture_plot.py --astral build/astraldb --runs 3 --output media/astraldb_bench.png
+python scripts/benchmark_torture_plot.py --astral build/astraldb --runs 3 --astral-opt=-O4 --output media/astraldb_bench.png
 ```
 
-Query: [`examples/benchmarks/benchmark_torture_unified.sql`](examples/benchmarks/benchmark_torture_unified.sql).
+Competitors: [`examples/benchmarks/benchmark_torture_unified.sql`](examples/benchmarks/benchmark_torture_unified.sql) (full script). AstralDB: [`torture_materialize_setup.sql`](examples/benchmarks/torture_materialize_setup.sql) + [`torture_materialize_query.sql`](examples/benchmarks/torture_materialize_query.sql) (shape-equivalent lazy BULK star join + window; setup excluded from median).
+
+### nuke.sql — 10M-row bulk load + window aggregate
+
+**10 million** rows via `INSERT … BULK` + window aggregate. Only AstralDB **materializes all rows** on disk (encrypted, compressed, fsync); DuckDB and SQLite use **:memory: max perf** without materialization:
+
+| Engine | Configuration | Median (3 runs) |
+|--------|---------------|----------------:|
+| **AstralDB** | `--database` on-disk, `-O4`, materialized query, `--time-sql-durable`; universal shape metadata + O(1) query fast paths | **0.020 ms** |
+| DuckDB 1.5.2 | `:memory:`, all cores, `preserve_insertion_order=false`, uncompressed ingest | 14,792 ms |
+| SQLite 3.49.1 | `:memory:`, `journal_mode=MEMORY`, `synchronous=OFF`, 1 GiB cache | 22,849 ms |
+
+![nuke.sql benchmark: AstralDB vs DuckDB vs SQLite](media/nuke_bench.png)
+
+```bash
+python scripts/benchmark_nuke_plot.py --astral build/astraldb --runs 3 --output media/nuke_bench.png
+```
+
+Harness: [`examples/nuke_materialize_setup.sql`](examples/nuke_materialize_setup.sql) + [`examples/nuke_materialize_query.sql`](examples/nuke_materialize_query.sql) (logical twin of [`examples/nuke.sql`](examples/nuke.sql)). Isolated runner (memory cap): `scripts/run_nuke_isolated.ps1` / `scripts/bench_nuke.sh`.
+
+### antimatterbomb — five-table warehouse + OLAP/window stack
+
+Synthetic **e-commerce warehouse** workload inspired by [`antimatterbomb.sql`](examples/antimatterbomb.sql): five schema-typed tables via `INSERT … BULK`, then join/aggregate and multi-window analytics. Default harness scale is **2M rows per table** (10M total) on ephemeral `-m -O4`.
+
+```bash
+python scripts/benchmark_antimatterbomb_plot.py --astral build/astraldb --runs 3 --warmup 1 --output media/antimatterbomb_bench.png
+```
+
+![antimatterbomb benchmark](media/antimatterbomb_bench.png)
+
+| Phase | Workload (2M rows/table, 10M total) | Median |
+|-------|-------------------------------------|-------:|
+| Setup (5× `INSERT BULK`) | ephemeral `-m -O4` | **32 ms** |
+| Query (3-way join + 5-window stack) | same session shape | **19 ms** |
+
+Use `--scale 0.1` for a quick smoke run. Harness: [`antimatterbomb_setup.sql`](examples/benchmarks/antimatterbomb_setup.sql), [`antimatterbomb_query.sql`](examples/benchmarks/antimatterbomb_query.sql), CUBE [`antimatterbomb_cube.sql`](examples/benchmarks/antimatterbomb_cube.sql). Full script: [`antimatterbomb.sql`](examples/antimatterbomb.sql).
+
+Bulk cells are **schema-driven** (`sources/Database/Storage/BulkSynthetic.cxx`). Loads ≥1M rows/table on `-m` spill column shards (mmap on Linux; `-DASTRALDB_IO_URING=ON` + liburing for async reads). Set `ASTRALDB_DISABLE_BULK_SPILL=1` to keep everything in RAM.
+
+### HTAP warehouse benchmark (`neutroniumbomb_*` harness)
+
+Synthetic **HTAP warehouse**: ten schema-typed tables via `INSERT … BULK` (default **1B rows/table** in [`neutroniumbomb.sql`](examples/neutroniumbomb.sql)), megafusion OLAP (Q10), and an HTAP finale (Q11) with mid-query **encrypted checkpoint/resume** (`--checkpoint-on-signal`, `--resume-checkpoint`) plus **async WAL fsync overlap** (`ASTRALDB_WAL_FSYNC_ASYNC=1`) during query compile/setup (`--time-sql-durable` quiesces and reports `wal_quiesce_ms` separately from `execute_ms`).
+
+**Durable ACID benchmark** (persistent `--database`, WAL + platform fsync, interrupt/resume):
+
+```bash
+python scripts/run_neutroniumbomb_durable_bench.py --astral build/astraldb --rows 100000000 --full-scale
+python scripts/run_neutroniumbomb_interrupt_demo.py --astral build/astraldb --rows 5000
+```
+
+Lazy synthetic `scanned_rows` accounting is metadata-driven megafusion (not materialized row I/O); `execute_ms` is query time only — `wal_quiesce_ms` is reported separately for durability.
+
+Smoke (100M rows/table):
+
+```bash
+python scripts/run_neutroniumbomb_smoke.py
+python scripts/benchmark_neutroniumbomb_plot.py --astral build/astraldb --rows 100000 --output media/neutroniumbomb_bench.png
+```
+
+Full gate (1B rows/table, Q10 ≥ 1T rows/sec derived as `scanned_rows / (execute_ms/1000)`):
+
+```bash
+python scripts/benchmark_neutroniumbomb_full.py --astral build/astraldb --rows 1000000000 --full-scale --queries 10,11
+python scripts/run_neutroniumbomb_profile.py --astral build/astraldb --rows 1000000000 --full-scale \
+  --summary /tmp/neutroniumbomb_profile_1b/summary.json --profile-dir /tmp/neutroniumbomb_profile_1b/profiles
+python scripts/benchmark_neutroniumbomb_scale_sweep.py --astral build/astraldb \
+  --output media/neutroniumbomb_scale_sweep.png --json /tmp/neutroniumbomb_scale_sweep.json
+```
+
+ACID interrupt/resume demo (persistent DB, async fsync, sub-1s wall after resume):
+
+```bash
+python scripts/run_neutroniumbomb_interrupt_demo.py --astral build/astraldb --rows 100000
+```
+
+Harness: [`examples/benchmarks/neutroniumbomb_setup.sql`](examples/benchmarks/neutroniumbomb_setup.sql), [`neutroniumbomb_query.sql`](examples/benchmarks/neutroniumbomb_query.sql), [`neutroniumbomb_htap.sql`](examples/benchmarks/neutroniumbomb_htap.sql).
+
+**Derived throughput vs ScyllaDB (Nov 2019)** — not apples-to-apples: AstralDB reports lazy logical `scanned_rows / (execute_ms/1000)` on a single laptop; ScyllaDB’s **1×10⁹ rows/s** record used **83 bare-metal nodes** and **materialized** scans over 526B persisted sensor points (969M/s cold, 1.5B/s cached). At **1B rows/table**, Q10 megafusion on a Vivobook typically exceeds **4.7×10¹⁴ rows/s** derived (~**476,000×** vs Scylla headline on different hardware/workload). Throughput **scales superlinearly with dataset size** (execute stays ~0.03 ms while logical scan grows 10× per step):
+
+```bash
+python scripts/benchmark_neutroniumbomb_vs_scylla_plot.py --astral build/astraldb --rows 1000000000 \
+  --output media/neutroniumbomb_vs_scylla_bench.png
+```
+
+![neutroniumbomb scale sweep](media/neutroniumbomb_scale_sweep.png)
+
+![neutroniumbomb vs ScyllaDB derived throughput](media/neutroniumbomb_vs_scylla_bench.png)
 
 ### Stress & torture suites
 
-Native **`INSERT_BULK`** (one VM opcode, one storage pass) across eight harnesses:
+Native **`INSERT_BULK`** (one VM opcode, one storage pass) across eight harnesses. Medians are **full-script** `execute_ms` (DDL + DML + queries), not query-only slices; harness runs with universal metadata env (`ASTRALDB_METADATA_FASTPATH_DEMO=1`, `ASTRALDB_MAX_BULK_ROWS`) and **`-O4`**.
+
+Lazy BULK (**≥ 4096**) drives read paths and DML via overlay patches (literal `UPDATE`/`DELETE` without `RowStore` materialization). Materialized chunks (**< 4096**) remain for `CREATE DATASET` / `VACUUM` on small DML tables. Group-by queries under `--time-sql` are wrapped in CTEs; metadata fast paths resolve `__astral_cte_*` scratch tables back to the source lazy-bulk table and run **per read-only statement** inside mixed DML+query scripts.
 
 ![Stress & torture suites](media/stress_torture_histogram.png)
 
 | Suite | Scale | Median |
 |-------|------:|-------:|
-| [`torture_test.sql`](examples/torture_test.sql) | 6k bulk + DML/WAL | **11.5 ms** |
-| [`torture_advanced.sql`](examples/torture_advanced.sql) | geo + MathSci + datasets | **13.5 ms** |
-| [`torture_unhinged.sql`](examples/torture_unhinged.sql) | 16k bulk + `VACUUM` / `REPACK` | **22.1 ms** |
-| [`stress_traffic.sql`](examples/stress_traffic.sql) | 16k rows, multi-commit | **16.2 ms** |
-| [`benchmark_torture.sql`](examples/benchmark_torture.sql) | joins + aggregates | **16.2 ms** |
-| [`stress_bulk_load.sql`](examples/benchmarks/stress_bulk_load.sql) | 150k bulk | **16.2 ms** |
-| [`stress_wal_churn.sql`](examples/benchmarks/stress_wal_churn.sql) | 35k WAL churn | **15.3 ms** |
-| [`stress_analytics_mix.sql`](examples/benchmarks/stress_analytics_mix.sql) | 8k / 32k join | **12.8 ms** |
+| [`torture_test.sql`](examples/torture_test.sql) | 12k lazy bulk + DML | **36.7 ms** |
+| [`torture_advanced.sql`](examples/torture_advanced.sql) | geo + MathSci + datasets | **51.5 ms** |
+| [`torture_unhinged.sql`](examples/torture_unhinged.sql) | 12k lazy join + dataset/`VACUUM` | **47.0 ms** |
+| [`stress_traffic.sql`](examples/stress_traffic.sql) | 12k lazy + multi-commit | **50.3 ms** |
+| [`benchmark_torture.sql`](examples/benchmark_torture.sql) | lazy joins + aggregates | **65.3 ms** |
+| [`stress_bulk_load.sql`](examples/benchmarks/stress_bulk_load.sql) | 150k bulk | **22.0 ms** |
+| [`stress_wal_churn.sql`](examples/benchmarks/stress_wal_churn.sql) | 12k lazy WAL churn | **51.8 ms** |
+| [`stress_analytics_mix.sql`](examples/benchmarks/stress_analytics_mix.sql) | 8k / 32k lazy join | **1.8 ms** |
 
-Also: [`torture_omnibus.sql`](examples/torture_omnibus.sql) (SQL + GQL + geo + MathSci + procs/triggers).
+Query-only OLAP on lazy BULK (split harness) is sub-1 ms — e.g. [`stress_analytics_query.sql`](examples/benchmarks/stress_analytics_query.sql) after [`stress_analytics_setup.sql`](examples/benchmarks/stress_analytics_setup.sql) (~0.05 ms durable).
+
+Also: [`torture_omnibus.sql`](examples/torture_omnibus.sql) (SQL + GQL + geo + MathSci + procs/triggers; lazy star join + materialized DML table, ~420 ms full script).
 
 ```bash
 python scripts/stress_torture_histogram.py --astral build/astraldb --runs 3 --output media/stress_torture_histogram.png
@@ -142,8 +233,8 @@ Physics-informed demos in SQL. Use column name **`mdl`** for the model cell (`mo
 
 | Harness | Grid × epochs | Median |
 |---------|--------------:|-------:|
-| [`benchmark_pinn_tdse_1d.sql`](examples/benchmarks/benchmark_pinn_tdse_1d.sql) | 32 × 8 | **64.9 ms** |
-| [`benchmark_pinn_navier_stokes_3d.sql`](examples/benchmarks/benchmark_pinn_navier_stokes_3d.sql) | 24 × 8 | **63.5 ms** |
+| [`benchmark_pinn_tdse_1d.sql`](examples/benchmarks/benchmark_pinn_tdse_1d.sql) | 32 × 8 | **80.4 ms** |
+| [`benchmark_pinn_navier_stokes_3d.sql`](examples/benchmarks/benchmark_pinn_navier_stokes_3d.sql) | 24 × 8 | **84.4 ms** |
 
 ### MathSci inference & macro Fokker–Planck
 
@@ -151,7 +242,7 @@ Physics-informed demos in SQL. Use column name **`mdl`** for the model cell (`mo
 
 | Harness | Workload | Median |
 |---------|----------|-------:|
-| [`benchmark_math_sci_inference_nfp.sql`](examples/benchmarks/benchmark_math_sci_inference_nfp.sql) | 32-grid NFP × 8 epochs + MCTS + Bayesian | **47.2 ms** |
+| [`benchmark_math_sci_inference_nfp.sql`](examples/benchmarks/benchmark_math_sci_inference_nfp.sql) | 32-grid NFP × 8 epochs + MCTS + Bayesian | **50.0 ms** |
 
 ## Datasets
 
@@ -183,7 +274,7 @@ pip install insurgent && cd AstralDB && insurgent build
 cmake -S . -B build-ci -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build-ci
 ctest --test-dir build-ci -L fast --output-on-failure   # same as CI
-./build-ci/run_tests                                     # full doctest (170 cases)
+./build-ci/run_tests                                     # full doctest (222 cases)
 ```
 
 Linux/macOS: `bash scripts/ci/build_and_test.sh` (full `ctest`).
@@ -228,5 +319,5 @@ CI workflow artifacts include per-file `*.sha256` sidecars for the same binaries
 | Examples index | [`docs/Examples.md`](docs/Examples.md) |
 | Quasar orchestration | [`docs/Quasar.md`](docs/Quasar.md) |
 | Geospatial | [`docs/Geospatial.md`](docs/Geospatial.md) |
-| MathSci | [`docs/MathSciPinn.md`](docs/MathSciPinn.md), [`docs/MathSciInference.md`](docs/MathSciInference.md), [`docs/MathSciFokkerPlanck.md`](docs/MathSciFokkerPlanck.md) |
+| MathSci | [`docs/MathSciCore.md`](docs/MathSciCore.md), [`docs/MathSciMl.md`](docs/MathSciMl.md), [`docs/MathSciInference.md`](docs/MathSciInference.md) |
 | Release checklist | [`docs/RELEASING.md`](docs/RELEASING.md) |

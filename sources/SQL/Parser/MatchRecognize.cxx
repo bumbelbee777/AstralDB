@@ -1,6 +1,6 @@
-#include <SQL/MatchRecognize.hxx>
+#include <SQL/Parser/MatchRecognize.hxx>
 
-#include <SQL/Bytecode.hxx>
+#include <SQL/Bytecode/Bytecode.hxx>
 
 #include <algorithm>
 #include <cctype>

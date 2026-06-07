@@ -12,8 +12,9 @@ project_dirs:
   - sources/IO
   - sources/DS
 output: bin/libastraldb_core.a
+# InsurgeNT invokes the compiler from the repo root; use -Isources (not -I../sources) in subprojects.
 compiler_flags:
-  global: "-Wall -Wextra -Werror -fstack-protector-strong -fpie -Isources -Ithird_party -Itests"
+  global: "-Wall -Wextra -Werror -fstack-protector-strong -fpie -Isources -Ithird_party -Iinclude -Itests"
   common: "-Os"
   cpp: "-ffunction-sections -fdata-sections"
   ar: ""

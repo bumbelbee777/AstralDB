@@ -52,6 +52,24 @@ bc_tools.log
 tmp*.sql
 tmp*.cxx
 tmp.abc
+/_err.txt
+/_q1_bc.txt
+/q10_out.txt
+/out.abc
+_tmp_*/
+upx.exe
+upx-*/
+*.db
+*.db.wal
+*.query.ckpt
+nuke_profile.json
+
+# Benchmark debug artifacts (regenerate via scripts/*_plot.py, run_*_profile.py)
+media/amb_*/
+media/_*/
+media/q6q10_*/
+media/q9_profile_sweep/
+media/**/*.json
 
 # IDE / local tooling
 .vscode/
@@ -59,6 +77,6 @@ tmp.abc
 app/
 .codegraph/
 
-# Cursor (keep rules in repo; ignore local state)
+# Cursor
 .cursor/*
-!.cursor/rules/
+.cursor/rules/
