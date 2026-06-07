@@ -230,7 +230,9 @@ bool WalZeroCopyIoEnabled() noexcept {
 }
 
 void PlatformDataSync(int Fd) noexcept {
-#if defined(__APPLE__)
+#if defined(_WIN32)
+	(void)Fd;
+#elif defined(__APPLE__)
 	(void)::fsync(Fd);
 #else
 	(void)::fdatasync(Fd);

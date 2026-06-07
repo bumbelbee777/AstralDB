@@ -8,7 +8,7 @@
 #include <iomanip>
 #include <sstream>
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -29,7 +29,7 @@ namespace {
 struct MmapView {
 	const std::byte *Data = nullptr;
 	std::size_t Size = 0;
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 	int Fd = -1;
 #endif
 #if defined(_WIN32)
@@ -40,7 +40,7 @@ struct MmapView {
 	~MmapView() { Unmap(); }
 
 	void Unmap() {
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 		if(Data && Size)
 			::munmap(const_cast<std::byte *>(Data), Size);
 		if(Fd >= 0)
@@ -63,7 +63,7 @@ struct MmapView {
 
 	bool MapFile(const std::filesystem::path &Path) {
 		Unmap();
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 		Fd = ::open(Path.string().c_str(), O_RDONLY);
 		if(Fd < 0)
 			return false;
@@ -77,7 +77,9 @@ struct MmapView {
 			return false;
 		}
 		Data = static_cast<const std::byte *>(P);
+#if defined(__linux__)
 		::madvise(P, Size, MADV_SEQUENTIAL);
+#endif
 		return true;
 #endif
 #if defined(_WIN32)

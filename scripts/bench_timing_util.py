@@ -39,6 +39,7 @@ def resolve_astral_executable(repo_root: Path) -> Optional[Path]:
 
 TIME_RX = re.compile(
     r"parse\+compile_ms=([\d.]+)\s+"
+    r"(?:query_compile_ms=[\d.]+\s+)?"
     r"(?:execute_median_ms=([\d.]+)\s+execute_min_ms=([\d.]+)\s+execute_max_ms=([\d.]+)\s+)?"
     r"execute_ms=([\d.]+)\s+total_ms=([\d.]+)"
     r"(?:\s+runs=(\d+))?"

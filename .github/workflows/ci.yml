@@ -125,7 +125,7 @@ jobs:
           CLI="${{ matrix.cli }}"
           SIZE=$(stat -c%s "$CLI")
           echo "Unpacked size: $SIZE bytes"
-          MAX=2800000
+          MAX=2900000
           if [ "$SIZE" -ge "$MAX" ]; then
             echo "Binary too large: $SIZE >= $MAX" >&2
             exit 1

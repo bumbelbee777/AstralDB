@@ -50,7 +50,8 @@ SUITE_WALL_MS_BUDGET = 60_000.0
 BULK_RX = re.compile(r"BULK\s+\d+", re.IGNORECASE)
 QUERY_RX = re.compile(r"^-- Query (\d+):", re.MULTILINE)
 SUITE_TIME_RX = re.compile(
-    r"\[time-sql\] query=(\S+)\s+parse\+compile_ms=([\d.]+)\s+execute_ms=([\d.]+)\s+total_ms=([\d.]+)"
+    r"\[time-sql\] query=(\S+)\s+parse\+compile_ms=([\d.]+)\s+(?:query_compile_ms=[\d.]+\s+)?"
+    r"execute_ms=([\d.]+)\s+total_ms=([\d.]+)"
     r"(?:\s+scanned_rows=(\d+))?(?:\s+result_rows=(\d+))?"
 )
 
@@ -195,6 +196,10 @@ def main() -> int:
     )
     print(f"suite wall_ms={wall_ms:.1f}  exit={rc}")
 
+    if rc != 0:
+        print(blob[-8000:], file=sys.stderr)
+        return rc
+
     rps_floors = ROWS_PER_SEC_FLOOR if args.full_scale or args.rows >= 1_000_000_000 else SMOKE_ROWS_PER_SEC_FLOOR
     validation_errors: list[str] = []
 
@@ -202,6 +207,7 @@ def main() -> int:
         timing = timings.get(name)
         if timing is None:
             print(f"  {name}: MISSING timing", file=sys.stderr)
+            print(blob[-8000:], file=sys.stderr)
             return -1
         rps = rows_per_sec(timing)
         rps_s = f"{rps:,.0f}" if rps is not None else "?"
@@ -227,7 +233,6 @@ def main() -> int:
                 validation_errors.append(f"{name}: rows_per_sec={rps} expected>={scaled_floor:.0e}")
 
     if rc != 0:
-        print(blob[-4000:], file=sys.stderr)
         return rc
     if validation_errors:
         for err in validation_errors:
