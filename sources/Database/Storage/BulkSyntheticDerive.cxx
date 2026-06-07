@@ -4,19 +4,13 @@
 #include <Database/Storage/ColumnarStorage.hxx>
 #include <Database/Storage/PredicateKind.hxx>
 #include <Database/Storage/StarJoinCubeBulk.hxx>
-
-#include <cstdlib>
+#include <IO/EnvUtil.hxx>
 
 namespace AstralDB {
 
 namespace {
 
 thread_local bool g_ShapeReadOnlyQueryContext = false;
-
-[[nodiscard]] bool EnvTruthy(const char *Name) noexcept {
-	const char *E = std::getenv(Name);
-	return E != nullptr && E[0] != '0' && E[0] != '\0';
-}
 
 [[nodiscard]] std::uint32_t ClosedFormPassRatePermille(const std::uint64_t KindMask) noexcept {
 	if(KindMask == 0)

@@ -14,6 +14,9 @@
 #include <thread>
 #include <vector>
 
+#if defined(_SC_LEVEL1_DCACHE_LINESIZE)
+#include <unistd.h>
+#endif
 #if defined(_MSC_VER)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -114,7 +117,7 @@ uint64_t ReadTsc() noexcept {
 void DetectHardware() {
 	g_Hw.LogicalCores = (std::max)(1u, std::thread::hardware_concurrency());
 	g_Hw.CacheLineBytes = 64;
-#if defined(__unix__) || defined(__APPLE__)
+#if defined(_SC_LEVEL1_DCACHE_LINESIZE)
 	if(long L = sysconf(_SC_LEVEL1_DCACHE_LINESIZE); L > 0)
 		g_Hw.CacheLineBytes = static_cast<std::size_t>(L);
 #endif

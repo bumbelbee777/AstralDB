@@ -505,9 +505,9 @@ void RunREPL(AstralDB::Logger& Logger, const std::filesystem::path& SessionDbPat
 			continue;
 		} else if (Input == "clear") {
 			#ifdef _WIN32
-			system("cls");
+			(void)system("cls");
 			#else
-			system("clear");
+			(void)system("clear");
 			#endif
 			continue;
 		}

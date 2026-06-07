@@ -14,6 +14,9 @@ set_property(CACHE ASTRALDB_SIMD PROPERTY STRINGS auto off avx512 avx2 sse42 sse
 
 set(ASTRALDB_LINK_DIR "${CMAKE_CURRENT_LIST_DIR}/link")
 
+include(CheckLinkerFlag)
+check_linker_flag(CXX "-Wl,--icf=safe" LINKER_SUPPORTS_ICF_SAFE)
+
 function(astraldb_is_release_config out_var)
 	if(CMAKE_CONFIGURATION_TYPES)
 		set(${out_var} "$<CONFIG:Release>" PARENT_SCOPE)
@@ -78,7 +81,7 @@ function(astraldb_apply_release_profile target)
 			target_link_options(${target} PRIVATE
 				"$<$<CONFIG:Release>:-Wl,--gc-sections>"
 				"$<$<CONFIG:Release>:-Wl,-O2>")
-			if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+			if(LINKER_SUPPORTS_ICF_SAFE)
 				target_link_options(${target} PRIVATE
 					"$<$<CONFIG:Release>:-Wl,--icf=safe>")
 			endif()
@@ -280,6 +283,9 @@ function(astraldb_apply_target_options target)
 	astraldb_apply_simd(${target})
 	astraldb_apply_lto(${target})
 	astraldb_apply_strip(${target})
+	if(WIN32)
+		target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
+	endif()
 endfunction()
 
 function(astraldb_apply_executable_options target)
