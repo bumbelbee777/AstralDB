@@ -51,7 +51,7 @@ bool EmitFilterDense(std::vector<std::uint8_t> &Out, FilterCompareOp Op, int64_t
 	Emit(Out, {MatchJccForOp(Op), 0x00});
 	Emit(Out, {0xEB, 0x00});
 	const std::size_t Match = Out.size();
-	Emit(Out, {0x4F, 0x89, 0x1C, 0xC1}); // mov [r9 + rax*8], r11
+	Emit(Out, {0x4D, 0x89, 0x1C, 0xC1}); // mov [r9 + rax*8], r11
 	Emit(Out, {0x48, 0xFF, 0xC0});       // inc rax
 	const std::size_t Skip = Out.size();
 	Out[JccMatch + 1] = static_cast<std::uint8_t>(Match - (JccMatch + 2));
@@ -152,7 +152,7 @@ bool EmitFilterDense(std::vector<std::uint8_t> &Out, FilterCompareOp Op, int64_t
 	Emit(Out, {MatchJccForOp(Op), 0x00});
 	Emit(Out, {0xEB, 0x00});
 	const std::size_t Match = Out.size();
-	Emit(Out, {0x4A, 0x89, 0x1C, 0xC1}); // mov [rcx + rax*8], r11
+	Emit(Out, {0x4C, 0x89, 0x1C, 0xC1}); // mov [rcx + rax*8], r11
 	Emit(Out, {0x48, 0xFF, 0xC0});       // inc rax
 	const std::size_t Skip = Out.size();
 	Out[JccMatch + 1] = static_cast<std::uint8_t>(Match - (JccMatch + 2));

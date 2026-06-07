@@ -67,7 +67,8 @@ bool MakeExecutable(void *Base, std::size_t Size) {
 #elif defined(__APPLE__) && defined(__arm64__)
 	(void)Base;
 	(void)Size;
-	return pthread_jit_write_protect_np(1) == 0;
+	pthread_jit_write_protect_np(1);
+	return true;
 #else
 	return ::mprotect(Base, Size, PROT_READ | PROT_EXEC) == 0;
 #endif
@@ -80,7 +81,8 @@ bool MakeWritable(void *Base, std::size_t Size) {
 #elif defined(__APPLE__) && defined(__arm64__)
 	(void)Base;
 	(void)Size;
-	return pthread_jit_write_protect_np(0) == 0;
+	pthread_jit_write_protect_np(0);
+	return true;
 #else
 	return ::mprotect(Base, Size, PROT_READ | PROT_WRITE) == 0;
 #endif
