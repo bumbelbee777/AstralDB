@@ -223,26 +223,22 @@ function(astraldb_apply_llvm_strip target)
 	if(NOT _kind STREQUAL "EXECUTABLE")
 		return()
 	endif()
+	if(APPLE)
+		return()
+	endif()
 	find_program(LLVM_STRIP NAMES llvm-strip strip)
 	if(NOT LLVM_STRIP)
 		return()
 	endif()
-	if(WIN32 OR APPLE)
-		add_custom_command(TARGET ${target} POST_BUILD
-			COMMAND ${LLVM_STRIP} --strip-all "$<TARGET_FILE:${target}>"
-			COMMENT "llvm-strip ${target}"
-			VERBATIM)
-	else()
-		add_custom_command(TARGET ${target} POST_BUILD
-			COMMAND ${LLVM_STRIP}
-			        --strip-all
-			        --remove-section=.comment
-			        --remove-section=.note
-			        --remove-section=.note.gnu.build-id
-			        "$<TARGET_FILE:${target}>"
-			COMMENT "llvm-strip ${target}"
-			VERBATIM)
-	endif()
+	add_custom_command(TARGET ${target} POST_BUILD
+		COMMAND ${LLVM_STRIP}
+		        --strip-all
+		        --remove-section=.comment
+		        --remove-section=.note
+		        --remove-section=.note.gnu.build-id
+		        "$<TARGET_FILE:${target}>"
+		COMMENT "llvm-strip ${target}"
+		VERBATIM)
 endfunction()
 
 function(astraldb_apply_upx_pack target)

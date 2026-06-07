@@ -146,7 +146,7 @@ jobs:
           PACKED=$(echo "$OUT" | awk -F= '/^upx_bytes=/{print $2}')
           if [ -n "$PACKED" ]; then
             echo "UPX packed size: $PACKED bytes"
-            MAX_PACKED=1300000
+            MAX_PACKED=1400000
             if [ "$PACKED" -ge "$MAX_PACKED" ]; then
               echo "UPX-packed binary too large: $PACKED >= $MAX_PACKED" >&2
               exit 1

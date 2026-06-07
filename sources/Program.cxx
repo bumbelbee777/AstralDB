@@ -1198,8 +1198,10 @@ int main(int Argc, char** Argv) {
 				ApplyCliSessionAuth(Interpreter.MutatingDatabase(), CliUser, CliPassword);
 				ApplyCliAuditLog(Interpreter.MutatingDatabase(), CliAuditFile);
 				Interpreter.Execute(SetupCode);
-				if(Interpreter.PrimaryDatabase())
-					AstralDB::DrainJoinFactStarPrecomputeJobs(*Interpreter.PrimaryDatabase());
+				if(Interpreter.PrimaryDatabase()) {
+					if(std::getenv("ASTRALDB_SKIP_SETUP_STAR_PRECOMPUTE") == nullptr)
+						AstralDB::DrainJoinFactStarPrecomputeJobs(*Interpreter.PrimaryDatabase());
+				}
 				KickWalIoOverlap(Interpreter.PrimaryDatabase());
 				int FailRc = 0;
 				for(const auto &[Label, QueryPath] : Entries) {

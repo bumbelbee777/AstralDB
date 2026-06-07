@@ -2775,10 +2775,6 @@ void Database::InsertBulkSyntheticRows(const std::string &TableName, int64_t Cou
 		FailStorage("INSERT_BULK requires a non-empty table schema.");
 	HybridTableSlot &Slot = Tit->second;
 	Table &TableRef = Slot.RowStore;
-	const size_t Begin = TableRef.size();
-	if(Begin > TableRef.max_size() - static_cast<size_t>(Count))
-		FailStorage("INSERT_BULK: row count would overflow table capacity.");
-	TableRef.reserve(Begin + static_cast<size_t>(Count));
 	std::vector<std::string> ColNames;
 	ColNames.reserve(Sch->size());
 	for(const Column &Co : *Sch)
@@ -2792,6 +2788,10 @@ void Database::InsertBulkSyntheticRows(const std::string &TableName, int64_t Cou
 		Dirty_.store(true, std::memory_order_release);
 		return;
 	}
+	const size_t Begin = TableRef.size();
+	if(Begin > TableRef.max_size() - static_cast<size_t>(Count))
+		FailStorage("INSERT_BULK: row count would overflow table capacity.");
+	TableRef.reserve(Begin + static_cast<size_t>(Count));
 	const auto IdxOuter = Indexes_.find(TableName);
 	for(int64_t K = 0; K < Count; ++K) {
 		const int64_t RowId = StartId + K * Step;

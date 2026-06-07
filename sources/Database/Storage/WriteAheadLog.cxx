@@ -229,15 +229,15 @@ bool WalZeroCopyIoEnabled() noexcept {
 	return WalAsyncFsyncEnabled();
 }
 
+#if !defined(_WIN32)
 void PlatformDataSync(int Fd) noexcept {
-#if defined(_WIN32)
-	(void)Fd;
-#elif defined(__APPLE__)
+#if defined(__APPLE__)
 	(void)::fsync(Fd);
 #else
 	(void)::fdatasync(Fd);
 #endif
 }
+#endif
 
 void PlatformFsyncFile(const std::filesystem::path &Path) {
 #if defined(_WIN32)

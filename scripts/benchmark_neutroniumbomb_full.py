@@ -80,12 +80,19 @@ def bench_env(rows_per_table: int, *, full_scale: bool) -> dict[str, str]:
     env.setdefault("ASTRALDB_SEMISTRUCTURED_PARALLEL", "1")
     env.setdefault("ASTRALDB_ASYNC_PRECOMPUTE", "1")
     env.setdefault("ASTRALDB_SUPERFETCH_ASYNC", "1")
+    env.setdefault("ASTRALDB_METADATA_FASTPATH_DEMO", "1")
     env["ASTRALDB_MAX_BULK_ROWS"] = str(max(rows_per_table, 10_000_000))
     if full_scale:
         env.setdefault("ASTRALDB_DISABLE_BULK_SPILL", "0")
         env.setdefault("ASTRALDB_MEMORY_CAP_GB", "128")
     else:
         env.setdefault("ASTRALDB_DISABLE_BULK_SPILL", "1")
+    if os.getenv("GITHUB_ACTIONS") == "true":
+        env.pop("ASTRALDB_ASYNC_PRECOMPUTE", None)
+        env.pop("ASTRALDB_SUPERFETCH_ASYNC", None)
+        env["ASTRALDB_SKIP_SETUP_STAR_PRECOMPUTE"] = "1"
+        env["ASTRALDB_DEFER_Q1_TAIL"] = "1"
+        env["ASTRALDB_MEMORY_CAP_GB"] = "6"
     return env
 
 
