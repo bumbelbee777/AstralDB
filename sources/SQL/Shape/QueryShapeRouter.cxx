@@ -1,5 +1,6 @@
 #include <SQL/Shape/QueryShapeRouter.hxx>
 
+#include <Database/Storage/BulkSyntheticDerive.hxx>
 #include <Database/Storage/ShapeWorkloadRegistry.hxx>
 #include <SQL/Shape/ShapeComposition.hxx>
 #include <SQL/Bulk/BulkDominantAmb.hxx>
@@ -94,7 +95,7 @@ ShapeRouteDecision ClassifyQueryShape(BytecodeInterpreter &Vm, const Bytecode &C
 }
 
 bool TryExecuteShapeRoute(BytecodeInterpreter &Vm, const Bytecode &Code, const ShapeRouteDecision &Decision) noexcept {
-	SetShapeReadOnlyQueryContext(AstralDB::BytecodeIsReadOnlyQuery(Code));
+	ShapeReadOnlyQueryContextGuard Context(AstralDB::BytecodeIsReadOnlyQuery(Code));
 	switch(Decision.RouteTier) {
 	case ShapeRouteTier::MetadataO1:
 		return TryExecuteDominantBulkQueryMetadata(Vm, Code);

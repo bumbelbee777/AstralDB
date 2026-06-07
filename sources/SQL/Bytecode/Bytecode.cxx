@@ -24,6 +24,7 @@
 #include <Database/Storage/ColumnarLazyBulk.hxx>
 #include <Database/Storage/Microkernels.hxx>
 #include <Database/Storage/BulkShapePlan.hxx>
+#include <Database/Storage/BulkSyntheticDerive.hxx>
 #include <DS/JSON.hxx>
 #include <SQL/Parser/MatchRecognize.hxx>
 #include <SQL/Parser/TextSearch.hxx>
@@ -2212,6 +2213,7 @@ void BytecodeInterpreter::ResetVmState() {
 	Savepoints_.clear();
 	MemSavepoints_.clear();
 	ResetTimeSqlStats();
+	SetShapeReadOnlyQueryContext(false);
 }
 
 void BytecodeInterpreter::ResetExecutionSession(std::optional<std::filesystem::path> NewDatabasePath,

@@ -147,7 +147,7 @@ bool EmitFilterDense(std::vector<std::uint8_t> &Out, FilterCompareOp Op, int64_t
 	Emit(Out, {0x0F, 0x84, 0x00, 0x00, 0x00, 0x00});
 	const std::size_t Loop = Out.size();
 	Emit(Out, {0x4C, 0x8B, 0x17});       // mov r10, [rdi]
-	Emit(Out, {0x4C, 0x39, 0xD2});       // cmp r10, rdx
+	Emit(Out, {0x4C, 0x3B, 0xD2});       // cmp r10, rdx
 	const std::size_t JccMatch = Out.size();
 	Emit(Out, {MatchJccForOp(Op), 0x00});
 	Emit(Out, {0xEB, 0x00});

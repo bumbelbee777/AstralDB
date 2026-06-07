@@ -181,7 +181,7 @@ bool FusionPass::Run(Tree<ASTNode> &Ast, const SqlSessionConfig *SessionCfg) {
 	for(auto &Root : Ast.Nodes_)
 		Any = FuseSubtree(Root.get(), SessionCfg, MinConfidence, Scorer) || Any;
 	ShapeCompositionPass Composition;
-	Any = Composition.Run(Ast) || Any;
+	Composition.Run(Ast);
 	return Any;
 }
 

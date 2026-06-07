@@ -4,10 +4,20 @@
 #include <cstring>
 
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <pthread.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#ifndef MAP_JIT
+#define MAP_JIT 0x0800
+#endif
 #else
 #include <sys/mman.h>
 #include <unistd.h>
@@ -37,6 +47,11 @@ void *MapFreshPage(std::size_t Size) {
 #if defined(_WIN32)
 	void *P = VirtualAlloc(nullptr, Size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 	return P;
+#elif defined(__APPLE__) && defined(__arm64__)
+	void *P = ::mmap(nullptr, Size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+	if(P == MAP_FAILED)
+		return nullptr;
+	return P;
 #else
 	void *P = ::mmap(nullptr, Size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if(P == MAP_FAILED)
@@ -49,6 +64,10 @@ bool MakeExecutable(void *Base, std::size_t Size) {
 #if defined(_WIN32)
 	DWORD Old = 0;
 	return VirtualProtect(Base, Size, PAGE_EXECUTE_READ, &Old) != 0;
+#elif defined(__APPLE__) && defined(__arm64__)
+	(void)Base;
+	(void)Size;
+	return pthread_jit_write_protect_np(1) == 0;
 #else
 	return ::mprotect(Base, Size, PROT_READ | PROT_EXEC) == 0;
 #endif
@@ -58,6 +77,10 @@ bool MakeWritable(void *Base, std::size_t Size) {
 #if defined(_WIN32)
 	DWORD Old = 0;
 	return VirtualProtect(Base, Size, PAGE_READWRITE, &Old) != 0;
+#elif defined(__APPLE__) && defined(__arm64__)
+	(void)Base;
+	(void)Size;
+	return pthread_jit_write_protect_np(0) == 0;
 #else
 	return ::mprotect(Base, Size, PROT_READ | PROT_WRITE) == 0;
 #endif
@@ -81,7 +104,7 @@ JitExecPage::~JitExecPage() {
 }
 
 bool JitExecPage::AppendRegion(const std::size_t MinMapped) {
-	const std::size_t NewMap = std::max(PageSize, AlignUp(MinMapped, PageSize));
+	const std::size_t NewMap = (std::max)(PageSize, AlignUp(MinMapped, PageSize));
 	void *Fresh = MapFreshPage(NewMap);
 	if(!Fresh)
 		return false;

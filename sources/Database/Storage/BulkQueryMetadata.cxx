@@ -709,7 +709,7 @@ MetadataFastPathHit MatchBulkQueryMetadata(const ColumnarTable &Col, const BulkQ
                                            const bool ReadOnlyQuery) noexcept {
 	if(!Col.BulkSyntheticLazy || Col.RowCount == 0)
 		return {};
-	SetShapeReadOnlyQueryContext(ReadOnlyQuery);
+	ShapeReadOnlyQueryContextGuard Context(ReadOnlyQuery);
 	if(!MetadataEligible(Col, ReadOnlyQuery))
 		return {};
 

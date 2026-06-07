@@ -43,6 +43,15 @@ void SetShapeReadOnlyQueryContext(bool ReadOnly) noexcept;
 
 [[nodiscard]] bool ShapeReadOnlyQueryContext() noexcept;
 
+/** Restores read-only shape context on scope exit (metadata matchers set it per query). */
+class ShapeReadOnlyQueryContextGuard {
+public:
+	explicit ShapeReadOnlyQueryContextGuard(bool ReadOnly) { SetShapeReadOnlyQueryContext(ReadOnly); }
+	~ShapeReadOnlyQueryContextGuard() { SetShapeReadOnlyQueryContext(false); }
+	ShapeReadOnlyQueryContextGuard(const ShapeReadOnlyQueryContextGuard &) = delete;
+	ShapeReadOnlyQueryContextGuard &operator=(const ShapeReadOnlyQueryContextGuard &) = delete;
+};
+
 void RegisterSyntheticMetadata(ColumnarTable &Col, BulkSyntheticPassFamily Family, std::uint64_t KindMask,
                                int64_t FkModA, int64_t FkModB) noexcept;
 

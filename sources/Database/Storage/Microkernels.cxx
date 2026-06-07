@@ -250,15 +250,31 @@ void MaterializeLazyBulkPrefix(const ColumnarTable &Col, const std::vector<Datab
 }
 
 void EnsureLazyBulkWindowFormatted(ColumnarTable &Col, std::size_t MaxRows) noexcept {
-	if(Col.BulkSyntheticSlidingSumColumn.empty() || Col.BulkSyntheticSlidingSumByRow.empty())
+	if(Col.BulkSyntheticSlidingSumColumn.empty())
 		return;
-	const std::size_t Cap = std::min({MaxRows, Col.RowCount, Col.BulkSyntheticSlidingSumByRow.size()});
+	const std::size_t Cap = std::min(MaxRows, Col.RowCount);
 	if(Cap == 0)
 		return;
+	const int64_t PartMod = Col.BulkPartitionMod > 0 ? Col.BulkPartitionMod : 997;
+	const bool SingletonPart =
+	    Col.BulkSyntheticLazy && Col.BulkSyntheticPhysicalOrder &&
+	    BulkSyntheticFkPartitionsSingletonPerRow(Col.BulkStep, PartMod);
+	if(Col.BulkSyntheticSlidingSumByRow.size() < Cap && SingletonPart) {
+		Col.BulkSyntheticSlidingSumByRow.resize(Cap);
+		BulkSyntheticFillDecimalByRowRange(Col.BulkStartId, Col.BulkStep, Cap, Col.BulkSyntheticSlidingSumByRow.data());
+	}
 	auto &Fmt = Col.FormattedColumns[Col.BulkSyntheticSlidingSumColumn];
 	if(Fmt.Lengths.size() >= Cap)
 		return;
-	FormatDoubleSimd::FormatRoundedColumn(Col.BulkSyntheticSlidingSumByRow.data(), Cap, Fmt, WorkloadClass::OlapWindow);
+	if(Col.BulkSyntheticSlidingSumByRow.size() >= Cap) {
+		FormatDoubleSimd::FormatRoundedColumn(Col.BulkSyntheticSlidingSumByRow.data(), Cap, Fmt, WorkloadClass::OlapWindow);
+	} else if(SingletonPart) {
+		std::vector<double> Scratch(Cap);
+		BulkSyntheticFillDecimalByRowRange(Col.BulkStartId, Col.BulkStep, Cap, Scratch.data());
+		FormatDoubleSimd::FormatRoundedColumn(Scratch.data(), Cap, Fmt, WorkloadClass::OlapWindow);
+	} else {
+		return;
+	}
 	if(const char *PushFd = EnvGetMk("ASTRALDB_CLIENT_PUSH_FD")) {
 		char *End = nullptr;
 		const long FdNum = std::strtol(PushFd, &End, 10);
