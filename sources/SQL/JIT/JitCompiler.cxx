@@ -108,6 +108,27 @@ bool VerifyFilterDense(JitFilterDenseFn Fn, FilterCompareOp Op, int64_t Literal)
 	return true;
 }
 
+bool VerifySum(JitSumFn Fn) {
+	if(!Fn)
+		return false;
+	const int64_t Sample[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+	return Fn(Sample, 10) == 55;
+}
+
+bool VerifyMin(JitMinFn Fn) {
+	if(!Fn)
+		return false;
+	const int64_t Sample[] = {4, -2, 9, 1};
+	return Fn(Sample, 4) == -2;
+}
+
+bool VerifyMax(JitMaxFn Fn) {
+	if(!Fn)
+		return false;
+	const int64_t Sample[] = {4, -2, 9, 1};
+	return Fn(Sample, 4) == 9;
+}
+
 } // namespace
 
 JitCompiler &JitCompiler::Instance() {
@@ -156,6 +177,9 @@ JitSumFn JitCompiler::CompileSum() {
 		SumFn_ = PublishKernel<JitSumFn>(Code, CodePage_);
 #endif
 
+	if(SumFn_ && !VerifySum(SumFn_))
+		SumFn_ = nullptr;
+
 	if(!SumFn_)
 		SumFn_ = InterpretedSum;
 	return SumFn_;
@@ -174,6 +198,9 @@ JitMinFn JitCompiler::CompileMin() {
 		MinFn_ = PublishKernel<JitMinFn>(Code, CodePage_);
 #endif
 
+	if(MinFn_ && !VerifyMin(MinFn_))
+		MinFn_ = nullptr;
+
 	if(!MinFn_)
 		MinFn_ = InterpretedMin;
 	return MinFn_;
@@ -191,6 +218,9 @@ JitMaxFn JitCompiler::CompileMax() {
 	if(EmitArm64MaxKernel(Code) && !Code.empty())
 		MaxFn_ = PublishKernel<JitMaxFn>(Code, CodePage_);
 #endif
+
+	if(MaxFn_ && !VerifyMax(MaxFn_))
+		MaxFn_ = nullptr;
 
 	if(!MaxFn_)
 		MaxFn_ = InterpretedMax;

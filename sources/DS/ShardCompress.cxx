@@ -1,13 +1,14 @@
 #include <DS/ShardCompress.hxx>
 #include <DS/LZ4.hxx>
 
-#if defined(_WIN32) && defined(_MSC_VER)
+#if defined(_WIN32) && defined(_MSC_VER) && !defined(__clang__)
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
 #include <compressapi.h>
 #pragma comment(lib, "cabinet.lib")
+#define ASTRALDB_WIN_LZX 1
 #endif
 
 namespace AstralDB {
@@ -36,7 +37,7 @@ bool UnpackFrame(std::string_view Blob, ColumnShardCompression &Mode, std::strin
 	return true;
 }
 
-#if defined(_WIN32) && defined(_MSC_VER)
+#if defined(ASTRALDB_WIN_LZX)
 std::string WinCompress(std::string_view Plain, COMPRESS_ALGORITHM Algorithm) {
 	if(Plain.empty())
 		return PackFrame(ColumnShardCompression::Lzx, {});
@@ -89,7 +90,7 @@ std::string ShardCompress(std::string_view Plain, ColumnShardCompression Mode) {
 	case ColumnShardCompression::Off:
 		return PackFrame(ColumnShardCompression::Off, std::string(Plain));
 	case ColumnShardCompression::Lzx:
-#if defined(_WIN32) && defined(_MSC_VER)
+#if defined(ASTRALDB_WIN_LZX)
 		if(auto Lzx = WinCompress(Plain, COMPRESS_ALGORITHM_LZX))
 			return Lzx;
 #endif
@@ -111,7 +112,7 @@ std::string ShardDecompress(std::string_view Blob, ColumnShardCompression ModeHi
 		return std::string(Payload);
 	if(Mode == ColumnShardCompression::Lz4)
 		return LZ4Decompress(std::string(Payload));
-#if defined(_WIN32) && defined(_MSC_VER)
+#if defined(ASTRALDB_WIN_LZX)
 	return WinDecompress(Payload, COMPRESS_ALGORITHM_LZX);
 #else
 	return LZ4Decompress(std::string(Payload));
