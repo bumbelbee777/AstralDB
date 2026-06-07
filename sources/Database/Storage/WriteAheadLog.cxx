@@ -229,6 +229,14 @@ bool WalZeroCopyIoEnabled() noexcept {
 	return WalAsyncFsyncEnabled();
 }
 
+void PlatformDataSync(int Fd) noexcept {
+#if defined(__APPLE__)
+	(void)::fsync(Fd);
+#else
+	(void)::fdatasync(Fd);
+#endif
+}
+
 void PlatformFsyncFile(const std::filesystem::path &Path) {
 #if defined(_WIN32)
 	HANDLE H = CreateFileW(Path.wstring().c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
@@ -241,7 +249,7 @@ void PlatformFsyncFile(const std::filesystem::path &Path) {
 	const int Fd = ::open(Path.c_str(), O_RDONLY);
 	if(Fd < 0)
 		return;
-	(void)::fdatasync(Fd);
+	PlatformDataSync(Fd);
 	::close(Fd);
 #endif
 }
@@ -296,7 +304,7 @@ void WriteAheadLog::PlatformFsyncWalIoUnlocked() {
 		}
 #else
 		if(WalIoFd_ >= 0) {
-			(void)::fdatasync(WalIoFd_);
+			PlatformDataSync(WalIoFd_);
 			return;
 		}
 #endif

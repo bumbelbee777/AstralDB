@@ -444,8 +444,10 @@ int64_t MinKernelI64(const int64_t *A, size_t Count) {
 	size_t I = 0;
 	int64x2_t M = vld1q_s64(A);
 	I += 2;
-	for(; I + 2 <= Count; I += 2)
-		M = vminq_s64(M, vld1q_s64(A + I));
+	for(; I + 2 <= Count; I += 2) {
+		const int64x2_t V = vld1q_s64(A + I);
+		M = vbslq_s64(vcltq_s64(V, M), V, M);
+	}
 	int64_t Acc = std::min(vgetq_lane_s64(M, 0), vgetq_lane_s64(M, 1));
 	for(; I < Count; ++I)
 		Acc = std::min(Acc, A[I]);
@@ -458,8 +460,10 @@ int64_t MaxKernelI64(const int64_t *A, size_t Count) {
 	size_t I = 0;
 	int64x2_t M = vld1q_s64(A);
 	I += 2;
-	for(; I + 2 <= Count; I += 2)
-		M = vmaxq_s64(M, vld1q_s64(A + I));
+	for(; I + 2 <= Count; I += 2) {
+		const int64x2_t V = vld1q_s64(A + I);
+		M = vbslq_s64(vcgtq_s64(V, M), V, M);
+	}
 	int64_t Acc = std::max(vgetq_lane_s64(M, 0), vgetq_lane_s64(M, 1));
 	for(; I < Count; ++I)
 		Acc = std::max(Acc, A[I]);

@@ -199,10 +199,13 @@ bool ApplyLazyScalarProjection(ColumnarTable &Col, const std::vector<Database::C
 					AllConst = false;
 					break;
 				}
+				std::string ColNameStorage;
 				std::string_view ColName = Pay;
 				const std::size_t Dot = Pay.find('.');
-				if(Dot != std::string::npos)
-					ColName = Pay.substr(Dot + 1);
+				if(Dot != std::string::npos) {
+					ColNameStorage = Pay.substr(Dot + 1);
+					ColName = ColNameStorage;
+				}
 				if(const auto It = Rhs.find(std::string(ColName)); It != Rhs.end()) {
 					ResolvedArgs.emplace_back(0, It->second);
 					continue;
