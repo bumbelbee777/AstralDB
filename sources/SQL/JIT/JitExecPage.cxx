@@ -24,6 +24,33 @@
 #include <unistd.h>
 #endif
 
+#if defined(__APPLE__)
+
+struct AstralDbJitMemcpyCtx {
+	void *Dest = nullptr;
+	const std::uint8_t *Src = nullptr;
+	std::size_t Size = 0;
+};
+
+extern "C" int AstralDbJitMemcpyCallback(void *Arg) {
+	auto *Ctx = static_cast<AstralDbJitMemcpyCtx *>(Arg);
+	if(!Ctx || !Ctx->Dest || !Ctx->Src || Ctx->Size == 0)
+		return -1;
+	std::memcpy(Ctx->Dest, Ctx->Src, Ctx->Size);
+	return 0;
+}
+
+#if defined(__aarch64__) || defined(__arm64__)
+#ifndef PTHREAD_JIT_WRITE_ALLOW_CALLBACKS_NP
+#define PTHREAD_JIT_WRITE_ALLOW_CALLBACKS_NP(name)                                                                     \
+	__attribute__((used)) static const char __astraldb_jit_write_cb_##name[] __attribute__((                             \
+	    section("__DATA,__jit_write_callback"))) = #name
+#endif
+PTHREAD_JIT_WRITE_ALLOW_CALLBACKS_NP(AstralDbJitMemcpyCallback)
+#endif
+
+#endif
+
 namespace AstralDB {
 namespace SQL {
 
@@ -39,7 +66,6 @@ void FlushIcache(void *Ptr, std::size_t Size) {
 #if defined(_WIN32)
 	FlushInstructionCache(GetCurrentProcess(), Ptr, Size);
 #elif defined(__APPLE__)
-	/* Apple silicon: invalidate after RX transition; no dcache flush (can SIGBUS). */
 	sys_icache_invalidate(Ptr, Size);
 #else
 	__builtin___clear_cache(static_cast<char *>(Ptr), static_cast<char *>(Ptr) + Size);
@@ -47,7 +73,27 @@ void FlushIcache(void *Ptr, std::size_t Size) {
 }
 
 #if defined(__APPLE__)
-void SetJitWriteProtect(bool Writable) { pthread_jit_write_protect_np(Writable ? 0 : 1); }
+
+bool ApplePublishBytes(void *Entry, const std::uint8_t *Code, std::size_t Size) {
+	AstralDbJitMemcpyCtx Ctx{Entry, Code, Size};
+#if defined(__aarch64__) || defined(__arm64__)
+	if(pthread_jit_write_with_callback_np(AstralDbJitMemcpyCallback, &Ctx) != 0)
+		return false;
+#else
+	pthread_jit_write_protect_np(0);
+	std::memcpy(Entry, Code, Size);
+	pthread_jit_write_protect_np(1);
+#endif
+	FlushIcache(Entry, Size);
+	return true;
+}
+
+void ApplePrepareForUnmap() {
+#if !defined(__aarch64__) && !defined(__arm64__)
+	pthread_jit_write_protect_np(1);
+#endif
+}
+
 #endif
 
 void *MapFreshPage(std::size_t Size) {
@@ -73,7 +119,6 @@ bool MakeExecutable(void *Base, std::size_t Size) {
 #elif defined(__APPLE__)
 	(void)Base;
 	(void)Size;
-	SetJitWriteProtect(false);
 	return true;
 #else
 	return ::mprotect(Base, Size, PROT_READ | PROT_EXEC) == 0;
@@ -87,7 +132,6 @@ bool MakeWritable(void *Base, std::size_t Size) {
 #elif defined(__APPLE__)
 	(void)Base;
 	(void)Size;
-	SetJitWriteProtect(true);
 	return true;
 #else
 	return ::mprotect(Base, Size, PROT_READ | PROT_WRITE) == 0;
@@ -98,8 +142,7 @@ void UnmapPage(void *Base, std::size_t Size) {
 	if(!Base || Size == 0)
 		return;
 #if defined(__APPLE__)
-	/* munmap(MAP_JIT) requires the region to be execute-only first. */
-	SetJitWriteProtect(false);
+	ApplePrepareForUnmap();
 #endif
 #if defined(_WIN32)
 	VirtualFree(Base, 0, MEM_RELEASE);
@@ -135,12 +178,17 @@ void *JitExecPage::BumpInCurrent(const std::uint8_t *Code, const std::size_t Siz
 		return BumpInCurrent(Code, Size);
 	}
 	void *Entry = static_cast<std::uint8_t *>(R.Base) + R.Used;
+#if defined(__APPLE__)
+	if(!ApplePublishBytes(Entry, Code, Size))
+		return nullptr;
+#else
 	if(!MakeWritable(R.Base, R.Mapped))
 		return nullptr;
 	std::memcpy(Entry, Code, Size);
 	if(!MakeExecutable(R.Base, R.Mapped))
 		return nullptr;
 	FlushIcache(Entry, Size);
+#endif
 	R.Used = Need;
 	return Entry;
 }

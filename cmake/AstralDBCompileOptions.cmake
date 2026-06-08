@@ -287,11 +287,30 @@ function(astraldb_apply_target_options target)
 	endif()
 endfunction()
 
+function(astraldb_apply_macos_jit_entitlements target)
+	if(NOT APPLE)
+		return()
+	endif()
+	get_target_property(_kind ${target} TYPE)
+	if(NOT _kind STREQUAL "EXECUTABLE")
+		return()
+	endif()
+	set(_ent "${CMAKE_SOURCE_DIR}/cmake/macos-jit.entitlements")
+	if(NOT EXISTS "${_ent}")
+		return()
+	endif()
+	add_custom_command(TARGET ${target} POST_BUILD
+		COMMAND codesign -s - --entitlements "${_ent}" --force "$<TARGET_FILE:${target}>"
+		COMMENT "Ad-hoc sign ${target} (MAP_JIT)"
+		VERBATIM)
+endfunction()
+
 function(astraldb_apply_executable_options target)
 	astraldb_apply_target_options(${target})
 	astraldb_apply_link_script(${target})
 	astraldb_apply_llvm_strip(${target})
 	astraldb_apply_upx_pack(${target})
+	astraldb_apply_macos_jit_entitlements(${target})
 endfunction()
 
 # Call once at configure time (e.g. -DASTRALDB_RELEASE_DIST=ON on release CI jobs).
