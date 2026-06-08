@@ -110,17 +110,15 @@ static const int64_t kProbeSample[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
 
 #if defined(__aarch64__) || defined(__arm64__)
 __attribute__((noinline)) static int64_t invoke_sum_unauth(const void *entry, const int64_t *values, size_t count) {
-	register const int64_t *arg0 asm("x0") = values;
-	register size_t arg1 asm("x1") = count;
-	register const void *jit asm("x16") = entry;
-	(void)arg0;
-	(void)arg1;
-	(void)jit;
 	int64_t out = 0;
-	__asm__ volatile("blr x16\n"
+	/* mov x16,%3 must run before mov x0,%1 (entry arrives in x0 under AAPCS64). */
+	__asm__ volatile("mov x16, %3\n"
+	                 "mov x0, %1\n"
+	                 "mov x1, %2\n"
+	                 "blr x16\n"
 	                 "mov %0, x0\n"
 	                 : "=r"(out)
-	                 :
+	                 : "r"(values), "r"(count), "r"(entry)
 	                 : "x0", "x1", "x16", "x30", "memory", "cc");
 	return out;
 }
@@ -352,15 +350,15 @@ int main(void) {
 	if(pthread_jit_write_protect_supported_np()) {
 		strategies[n++] = (strategy_t){"MAP_JIT+pthread", publish_mapjit_toggle};
 		strategies[n++] = (strategy_t){"MAP_JIT+RWX", publish_mapjit_rwx};
-		strategies[n++] = (strategy_t){"anon+mprotect", publish_mprotect};
+		strategies[n++] = (strategy_t){"MAP_JIT+mprotect", publish_mprotect};
 	} else {
-		fprintf(stderr, "[probe] supported_np=0: prefer anon+mprotect (VMAPPLE/CI)\n");
+		fprintf(stderr, "[probe] supported_np=0: prefer MAP_JIT+mprotect (VMAPPLE/CI)\n");
 		fflush(stderr);
-		strategies[n++] = (strategy_t){"anon+mprotect", publish_mprotect};
+		strategies[n++] = (strategy_t){"MAP_JIT+mprotect", publish_mprotect};
 		strategies[n++] = (strategy_t){"MAP_JIT+RWX", publish_mapjit_rwx};
 	}
 #else
-	strategies[n++] = (strategy_t){"anon+mprotect", publish_mprotect};
+	strategies[n++] = (strategy_t){"MAP_JIT+mprotect", publish_mprotect};
 #endif
 
 	int last_rc = 1;
