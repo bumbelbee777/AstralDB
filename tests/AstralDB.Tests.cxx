@@ -4086,7 +4086,7 @@ TEST_CASE("JIT: compiled sum matches reference") {
 	auto &Jit = AstralDB::SQL::JitCompiler::Instance();
 	const auto Fn = Jit.CompileSum();
 	REQUIRE(Fn != nullptr);
-	REQUIRE(Jit.LastCompileWasNative());
+	AstralTest::RequireJitNative(Jit);
 	const int64_t Got = Fn(Values.data(), Values.size());
 	REQUIRE(Got == 55);
 }
@@ -4097,7 +4097,7 @@ TEST_CASE("JIT: dense filter all compare ops") {
 	auto &Jit = AstralDB::SQL::JitCompiler::Instance();
 	const auto GtFn = Jit.CompileFilterDense(AstralDB::FilterCompareOp::Gt, 3);
 	REQUIRE(GtFn != nullptr);
-	REQUIRE(Jit.LastCompileWasNative());
+	AstralTest::RequireJitNative(Jit);
 	const std::size_t N = GtFn(Values.data(), Values.size(), 3, Idx.data());
 	REQUIRE(N == 3);
 	REQUIRE(Idx[0] == 1);
@@ -4109,10 +4109,10 @@ TEST_CASE("JIT: min and max kernels") {
 	const std::vector<int64_t> Values{4, -2, 9, 1};
 	auto &Jit = AstralDB::SQL::JitCompiler::Instance();
 	const auto MinFn = Jit.CompileMin();
-	REQUIRE(Jit.LastCompileWasNative());
+	AstralTest::RequireJitNative(Jit);
 	REQUIRE(MinFn(Values.data(), Values.size()) == -2);
 	const auto MaxFn = Jit.CompileMax();
-	REQUIRE(Jit.LastCompileWasNative());
+	AstralTest::RequireJitNative(Jit);
 	REQUIRE(MaxFn(Values.data(), Values.size()) == 9);
 }
 

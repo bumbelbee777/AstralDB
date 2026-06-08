@@ -39,7 +39,7 @@ void FlushIcache(void *Ptr, std::size_t Size) {
 #if defined(_WIN32)
 	FlushInstructionCache(GetCurrentProcess(), Ptr, Size);
 #elif defined(__APPLE__)
-	sys_dcache_flush(Ptr, Size);
+	/* Apple silicon: invalidate after RX transition; no dcache flush (can SIGBUS). */
 	sys_icache_invalidate(Ptr, Size);
 #else
 	__builtin___clear_cache(static_cast<char *>(Ptr), static_cast<char *>(Ptr) + Size);
@@ -57,8 +57,6 @@ void *MapFreshPage(std::size_t Size) {
 	void *P = ::mmap(nullptr, Size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
 	if(P == MAP_FAILED)
 		return nullptr;
-	/* MAP_JIT pages start non-writable; enable writes before first memcpy. */
-	SetJitWriteProtect(true);
 	return P;
 #else
 	void *P = ::mmap(nullptr, Size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -99,6 +97,10 @@ bool MakeWritable(void *Base, std::size_t Size) {
 void UnmapPage(void *Base, std::size_t Size) {
 	if(!Base || Size == 0)
 		return;
+#if defined(__APPLE__)
+	/* munmap(MAP_JIT) requires the region to be execute-only first. */
+	SetJitWriteProtect(false);
+#endif
 #if defined(_WIN32)
 	VirtualFree(Base, 0, MEM_RELEASE);
 #else
@@ -136,9 +138,9 @@ void *JitExecPage::BumpInCurrent(const std::uint8_t *Code, const std::size_t Siz
 	if(!MakeWritable(R.Base, R.Mapped))
 		return nullptr;
 	std::memcpy(Entry, Code, Size);
-	FlushIcache(Entry, Size);
 	if(!MakeExecutable(R.Base, R.Mapped))
 		return nullptr;
+	FlushIcache(Entry, Size);
 	R.Used = Need;
 	return Entry;
 }

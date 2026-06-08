@@ -3,6 +3,7 @@
 #include <Database/Storage/ColumnFilterSimd.hxx>
 #include <Database/Storage/VectorizedOps.hxx>
 
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 
@@ -131,6 +132,30 @@ bool VerifyMax(JitMaxFn Fn) {
 
 } // namespace
 
+void JitCompiler::DumpLastCompiledKernel() const {
+	std::fprintf(stderr, "[jit] kernel=%s size=%zu\n", LastKernelName_.c_str(), LastKernelBytes_.size());
+	for(std::size_t I = 0; I < LastKernelBytes_.size(); ++I) {
+		if(I % 16 == 0)
+			std::fprintf(stderr, "[jit] %04zx:", I);
+		std::fprintf(stderr, " %02x", LastKernelBytes_[I]);
+		if(I % 16 == 15 || I + 1 == LastKernelBytes_.size())
+			std::fprintf(stderr, "\n");
+	}
+	std::fflush(stderr);
+}
+
+void JitCompiler::NoteCompiledKernel(const char *Name, const std::vector<std::uint8_t> &Code) {
+	LastKernelName_ = Name ? Name : "?";
+	LastKernelBytes_ = Code;
+#if defined(__APPLE__)
+	DumpLastCompiledKernel();
+#else
+	const char *Dump = std::getenv("ASTRALDB_JIT_DUMP");
+	if(Dump && Dump[0] != '0' && Dump[0] != 'n' && Dump[0] != 'N')
+		DumpLastCompiledKernel();
+#endif
+}
+
 JitCompiler &JitCompiler::Instance() {
 	static JitCompiler Inst;
 	return Inst;
@@ -147,15 +172,22 @@ JitFilterDenseFn JitCompiler::CompileFilterDense(FilterCompareOp Op, int64_t Lit
 	std::vector<std::uint8_t> Code;
 	JitFilterDenseFn Fn = nullptr;
 #if defined(__x86_64__) || defined(_M_X64)
-	if(EmitX86_64FilterDenseKernel(Op, Literal, Code) && !Code.empty())
+	if(EmitX86_64FilterDenseKernel(Op, Literal, Code) && !Code.empty()) {
+		NoteCompiledKernel("filter_dense", Code);
 		Fn = PublishKernel<JitFilterDenseFn>(Code, CodePage_);
+	}
 #elif defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
-	if(EmitArm64FilterDenseKernel(Op, Literal, Code) && !Code.empty())
+	if(EmitArm64FilterDenseKernel(Op, Literal, Code) && !Code.empty()) {
+		NoteCompiledKernel("filter_dense", Code);
 		Fn = PublishKernel<JitFilterDenseFn>(Code, CodePage_);
+	}
 #endif
 
-	if(Fn && !VerifyFilterDense(Fn, Op, Literal))
+	if(Fn && !VerifyFilterDense(Fn, Op, Literal)) {
+		std::fprintf(stderr, "[jit] verify failed: filter_dense\n");
+		std::fflush(stderr);
 		Fn = nullptr;
+	}
 
 	LastCompileNative_ = Fn != nullptr;
 	if(!Fn)
@@ -171,15 +203,22 @@ JitSumFn JitCompiler::CompileSum() {
 
 	std::vector<std::uint8_t> Code;
 #if defined(__x86_64__) || defined(_M_X64)
-	if(EmitX86_64SumKernel(Code) && !Code.empty())
+	if(EmitX86_64SumKernel(Code) && !Code.empty()) {
+		NoteCompiledKernel("sum", Code);
 		SumFn_ = PublishKernel<JitSumFn>(Code, CodePage_);
+	}
 #elif defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
-	if(EmitArm64SumKernel(Code) && !Code.empty())
+	if(EmitArm64SumKernel(Code) && !Code.empty()) {
+		NoteCompiledKernel("sum", Code);
 		SumFn_ = PublishKernel<JitSumFn>(Code, CodePage_);
+	}
 #endif
 
-	if(SumFn_ && !VerifySum(SumFn_))
+	if(SumFn_ && !VerifySum(SumFn_)) {
+		std::fprintf(stderr, "[jit] verify failed: sum\n");
+		std::fflush(stderr);
 		SumFn_ = nullptr;
+	}
 
 	LastCompileNative_ = SumFn_ != nullptr;
 	if(!SumFn_)
@@ -193,15 +232,22 @@ JitMinFn JitCompiler::CompileMin() {
 
 	std::vector<std::uint8_t> Code;
 #if defined(__x86_64__) || defined(_M_X64)
-	if(EmitX86_64MinKernel(Code) && !Code.empty())
+	if(EmitX86_64MinKernel(Code) && !Code.empty()) {
+		NoteCompiledKernel("min", Code);
 		MinFn_ = PublishKernel<JitMinFn>(Code, CodePage_);
+	}
 #elif defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
-	if(EmitArm64MinKernel(Code) && !Code.empty())
+	if(EmitArm64MinKernel(Code) && !Code.empty()) {
+		NoteCompiledKernel("min", Code);
 		MinFn_ = PublishKernel<JitMinFn>(Code, CodePage_);
+	}
 #endif
 
-	if(MinFn_ && !VerifyMin(MinFn_))
+	if(MinFn_ && !VerifyMin(MinFn_)) {
+		std::fprintf(stderr, "[jit] verify failed: min\n");
+		std::fflush(stderr);
 		MinFn_ = nullptr;
+	}
 
 	LastCompileNative_ = MinFn_ != nullptr;
 	if(!MinFn_)
@@ -215,15 +261,22 @@ JitMaxFn JitCompiler::CompileMax() {
 
 	std::vector<std::uint8_t> Code;
 #if defined(__x86_64__) || defined(_M_X64)
-	if(EmitX86_64MaxKernel(Code) && !Code.empty())
+	if(EmitX86_64MaxKernel(Code) && !Code.empty()) {
+		NoteCompiledKernel("max", Code);
 		MaxFn_ = PublishKernel<JitMaxFn>(Code, CodePage_);
+	}
 #elif defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
-	if(EmitArm64MaxKernel(Code) && !Code.empty())
+	if(EmitArm64MaxKernel(Code) && !Code.empty()) {
+		NoteCompiledKernel("max", Code);
 		MaxFn_ = PublishKernel<JitMaxFn>(Code, CodePage_);
+	}
 #endif
 
-	if(MaxFn_ && !VerifyMax(MaxFn_))
+	if(MaxFn_ && !VerifyMax(MaxFn_)) {
+		std::fprintf(stderr, "[jit] verify failed: max\n");
+		std::fflush(stderr);
 		MaxFn_ = nullptr;
+	}
 
 	LastCompileNative_ = MaxFn_ != nullptr;
 	if(!MaxFn_)

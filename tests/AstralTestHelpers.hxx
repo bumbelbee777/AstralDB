@@ -1,4 +1,5 @@
 #pragma once
+#include <SQL/JIT/JitCompiler.hxx>
 #include <doctest/doctest.h>
 #include <chrono>
 #include <cstdio>
@@ -7,6 +8,11 @@
 namespace AstralTest {
 using doctest::Approx;
 inline void AssertSqlOk(bool Ok, const char *Msg = "") { REQUIRE_MESSAGE(Ok, Msg); }
+inline void RequireJitNative(AstralDB::SQL::JitCompiler &Jit) {
+	if(!Jit.LastCompileWasNative())
+		Jit.DumpLastCompiledKernel();
+	REQUIRE(Jit.LastCompileWasNative());
+}
 class PerfSection {
 	const char *L_;
 	std::chrono::steady_clock::time_point T0_;

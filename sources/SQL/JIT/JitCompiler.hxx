@@ -61,8 +61,14 @@ public:
 	/** True when the most recent Compile* published native machine code (not interpreter fallback). */
 	bool LastCompileWasNative() const noexcept { return LastCompileNative_; }
 
+	const std::string &LastCompiledKernelName() const noexcept { return LastKernelName_; }
+	const std::vector<std::uint8_t> &LastCompiledKernelBytes() const noexcept { return LastKernelBytes_; }
+	void DumpLastCompiledKernel() const;
+
 private:
 	JitCompiler() = default;
+
+	void NoteCompiledKernel(const char *Name, const std::vector<std::uint8_t> &Code);
 
 	std::unordered_map<JitFilterCacheKey, JitFilterDenseFn, JitFilterCacheKeyHash> FilterCache_;
 	JitSumFn SumFn_ = nullptr;
@@ -70,6 +76,8 @@ private:
 	JitMaxFn MaxFn_ = nullptr;
 	std::unique_ptr<JitExecPage> CodePage_;
 	bool LastCompileNative_ = false;
+	std::string LastKernelName_;
+	std::vector<std::uint8_t> LastKernelBytes_;
 };
 
 bool EmitX86_64FilterDenseKernel(FilterCompareOp Op, int64_t Literal, std::vector<std::uint8_t> &Out);

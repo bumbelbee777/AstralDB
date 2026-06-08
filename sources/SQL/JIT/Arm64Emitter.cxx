@@ -14,6 +14,9 @@ void EmitU32(std::vector<std::uint8_t> &Out, std::uint32_t Insn) {
 	Out.push_back(static_cast<std::uint8_t>((Insn >> 24) & 0xFF));
 }
 
+/** Indirect-call landing pad (Apple silicon / BTI). */
+void EmitBtiC(std::vector<std::uint8_t> &Out) { EmitU32(Out, 0xD503245Fu); }
+
 void PatchU32(std::vector<std::uint8_t> &Out, std::size_t At, std::uint32_t Insn) {
 	Out[At + 0] = static_cast<std::uint8_t>(Insn & 0xFF);
 	Out[At + 1] = static_cast<std::uint8_t>((Insn >> 8) & 0xFF);
@@ -64,6 +67,7 @@ std::uint32_t SkipCondForOp(FilterCompareOp Op) {
 /** x0=Values, x1=Count, x2=Literal, x3=OutIndices; returns x0=match count. */
 bool EmitFilterDense(std::vector<std::uint8_t> &Out, FilterCompareOp Op) {
 	Out.clear();
+	EmitBtiC(Out);
 	EmitU32(Out, 0xAA1F03E4u); // mov x4, xzr (match count)
 	EmitU32(Out, 0xAA1F03E5u); // mov x5, xzr (row index)
 	const std::size_t CbzAt = Out.size();
@@ -92,6 +96,7 @@ bool EmitFilterDense(std::vector<std::uint8_t> &Out, FilterCompareOp Op) {
 /** x0=Values, x1=Count; returns x0=sum. */
 bool EmitSum(std::vector<std::uint8_t> &Out) {
 	Out.clear();
+	EmitBtiC(Out);
 	EmitU32(Out, 0xAA1F03E2u); // mov x2, xzr
 	const std::size_t CbzAt = Out.size();
 	EmitU32(Out, 0xB4000001u); // cbz x1, done (patched)
@@ -112,6 +117,7 @@ bool EmitSum(std::vector<std::uint8_t> &Out) {
 /** x0=Values, x1=Count; returns x0=min. */
 bool EmitMin(std::vector<std::uint8_t> &Out) {
 	Out.clear();
+	EmitBtiC(Out);
 	EmitU32(Out, 0xF9400002u); // ldr x2, [x0]
 	EmitU32(Out, 0xD1000421u); // sub x1, x1, #1
 	const std::size_t CbzAt = Out.size();
@@ -138,6 +144,7 @@ bool EmitMin(std::vector<std::uint8_t> &Out) {
 /** x0=Values, x1=Count; returns x0=max. */
 bool EmitMax(std::vector<std::uint8_t> &Out) {
 	Out.clear();
+	EmitBtiC(Out);
 	EmitU32(Out, 0xF9400002u); // ldr x2, [x0]
 	EmitU32(Out, 0xD1000421u); // sub x1, x1, #1
 	const std::size_t CbzAt = Out.size();
