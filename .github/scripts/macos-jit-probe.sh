@@ -16,7 +16,7 @@ echo "=== sign run_tests ==="
 bash "$SIGN" "$ENT" "$RUN_TESTS"
 
 echo "=== build + sign jit_probe ==="
-clang -O0 "${ROOT}/tools/jit_aarch64_probe.c" -o "$PROBE"
+clang -O0 -arch arm64 "${ROOT}/tools/jit_aarch64_probe.c" -o "$PROBE"
 bash "$SIGN" "$ENT" "$PROBE"
 
 echo "=== execute jit_probe ==="

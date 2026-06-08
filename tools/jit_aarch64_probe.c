@@ -1,5 +1,4 @@
-/* Minimal ARM64 sum-kernel probe (same bytecode as AstralDB JIT CompileSum on Apple Silicon).
- * Linux: mmap + mprotect. macOS: MAP_JIT (toggle or RWX per pthread_jit_write_protect_supported_np). */
+/* Minimal ARM64 sum-kernel probe (same bytecode as AstralDB JIT CompileSum on Apple Silicon). */
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -11,6 +10,26 @@
 #ifndef MAP_JIT
 #define MAP_JIT 0x0800
 #endif
+
+static int apple_jit_uses_toggle(void) {
+#if defined(__aarch64__) || defined(__arm64__)
+	return 1;
+#else
+	return pthread_jit_write_protect_supported_np() != 0;
+#endif
+}
+
+static int apple_jit_mmap_prot(void) {
+#if defined(__aarch64__) || defined(__arm64__)
+	return PROT_READ | PROT_WRITE | PROT_EXEC;
+#else
+	int prot = PROT_READ | PROT_WRITE;
+	if(!apple_jit_uses_toggle())
+		prot |= PROT_EXEC;
+	return prot;
+#endif
+}
+
 #else
 #include <sys/mman.h>
 #include <unistd.h>
@@ -30,12 +49,11 @@ static void flush_icache(void *ptr, size_t size) {
 
 static int publish_code(void **out_page, size_t map_bytes, const uint8_t *code, size_t code_size, sum_fn *out_fn) {
 #if defined(__APPLE__)
-	const int toggle = pthread_jit_write_protect_supported_np();
-	printf("jit_write_protect_toggle=%d\n", toggle);
-	int prot = PROT_READ | PROT_WRITE;
-	if(!toggle)
-		prot |= PROT_EXEC;
-	void *page = mmap(NULL, map_bytes, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+	const int toggle = apple_jit_uses_toggle();
+	fprintf(stderr, "jit_write_protect_toggle=%d supported_np=%d\n", toggle,
+	        pthread_jit_write_protect_supported_np());
+	fflush(stderr);
+	void *page = mmap(NULL, map_bytes, apple_jit_mmap_prot(), MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
 	if(page == MAP_FAILED) {
 		perror("mmap MAP_JIT");
 		return 1;
@@ -74,7 +92,7 @@ int main(void) {
 		return rc;
 	}
 #if defined(__APPLE__)
-	if(pthread_jit_write_protect_supported_np()) {
+	if(apple_jit_uses_toggle()) {
 		pthread_jit_write_protect_np(1);
 		__asm__ __volatile__("isb" ::: "memory");
 	}
@@ -82,6 +100,7 @@ int main(void) {
 	const int64_t sample[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
 	const int64_t got = fn(sample, 10);
 	printf("sum=%lld expect=55\n", (long long)got);
+	fflush(stdout);
 	munmap(page, 4096);
 	return got == 55 ? 0 : 3;
 }
