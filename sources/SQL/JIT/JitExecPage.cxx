@@ -87,12 +87,10 @@ void AppleReleaseJitRegion() {
 
 #endif
 
+#if !defined(__APPLE__)
 void *MapFreshPage(std::size_t Size) {
 #if defined(_WIN32)
 	return VirtualAlloc(nullptr, Size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-#elif defined(__APPLE__)
-	(void)Size;
-	return AppleEnsureJitRegion() ? AppleJitBase : nullptr;
 #else
 	void *P = ::mmap(nullptr, Size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if(P == MAP_FAILED)
@@ -100,6 +98,7 @@ void *MapFreshPage(std::size_t Size) {
 	return P;
 #endif
 }
+#endif
 
 #if !defined(__APPLE__)
 bool MakeExecutable(void *Base, std::size_t Size) {
@@ -119,23 +118,17 @@ bool MakeWritable(void *Base, std::size_t Size) {
 	return ::mprotect(Base, Size, PROT_READ | PROT_WRITE) == 0;
 #endif
 }
-#endif
-
 void UnmapPage(void *Base, std::size_t Size) {
 	if(!Base || Size == 0)
 		return;
-#if defined(__APPLE__)
-	(void)Base;
-	(void)Size;
-	AppleReleaseJitRegion();
-#else
 #if defined(_WIN32)
 	VirtualFree(Base, 0, MEM_RELEASE);
 #else
 	::munmap(Base, Size);
 #endif
-#endif
 }
+
+#endif
 
 } // namespace
 
