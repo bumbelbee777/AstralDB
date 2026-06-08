@@ -300,10 +300,10 @@ function(astraldb_apply_macos_jit_entitlements target)
 		return()
 	endif()
 	add_custom_command(TARGET ${target} POST_BUILD
-		COMMAND codesign -s - --entitlements "${_ent}" --options runtime --timestamp=none --force
-			"$<TARGET_FILE:${target}>"
+		COMMAND codesign -s - --entitlements "${_ent}" --options runtime --generate-entitlement-der
+			--timestamp=none --force "$<TARGET_FILE:${target}>"
 		COMMAND codesign --verify --strict --deep "$<TARGET_FILE:${target}>"
-		COMMENT "Ad-hoc sign ${target} (MAP_JIT + hardened runtime)"
+		COMMENT "Ad-hoc sign ${target} (MAP_JIT + DER entitlements)"
 		VERBATIM)
 endfunction()
 

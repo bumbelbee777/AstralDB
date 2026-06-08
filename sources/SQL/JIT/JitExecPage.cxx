@@ -12,7 +12,6 @@
 #endif
 #include <windows.h>
 #elif defined(__APPLE__)
-#include <libkern/OSCacheControl.h>
 #include <pthread.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -47,11 +46,8 @@ void FlushIcache(void *Ptr, std::size_t Size) {
 #if defined(_WIN32)
 	FlushInstructionCache(GetCurrentProcess(), Ptr, Size);
 #elif defined(__APPLE__)
+	(void)Size;
 	__builtin___clear_cache(static_cast<char *>(Ptr), static_cast<char *>(Ptr) + Size);
-	sys_icache_invalidate(Ptr, Size);
-#if defined(__aarch64__) || defined(__arm64__)
-	__asm__ __volatile__("isb" ::: "memory");
-#endif
 #else
 	__builtin___clear_cache(static_cast<char *>(Ptr), static_cast<char *>(Ptr) + Size);
 #endif
@@ -72,10 +68,15 @@ bool AppleEnsureJitRegion() {
 }
 
 bool ApplePublishBytes(void *Entry, const std::uint8_t *Code, std::size_t Size) {
-	pthread_jit_write_protect_np(0);
+	if(pthread_jit_write_protect_supported_np())
+		pthread_jit_write_protect_np(0);
 	std::memcpy(Entry, Code, Size);
-	pthread_jit_write_protect_np(1);
 	FlushIcache(Entry, Size);
+	if(pthread_jit_write_protect_supported_np())
+		pthread_jit_write_protect_np(1);
+#if defined(__aarch64__) || defined(__arm64__)
+	__asm__ __volatile__("isb" ::: "memory");
+#endif
 	return true;
 }
 
