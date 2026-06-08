@@ -26,8 +26,8 @@ codesign --verify --strict "$EXE"
 TMP=$(mktemp)
 trap 'rm -f "$TMP"' EXIT
 codesign -d --entitlements "$TMP" "$EXE" 2>/dev/null || true
-if [[ ! -s "$TMP" ]] || ! grep -q 'com.apple.security.cs.allow-jit' "$TMP"; then
-	echo "allow-jit entitlement not present after signing $EXE" >&2
+if [[ ! -s "$TMP" ]] || ! grep -qE 'com.apple.security.cs.allow-(jit|unsigned-executable-memory)' "$TMP"; then
+	echo "JIT entitlement not present after signing $EXE" >&2
 	echo "extracted entitlements:" >&2
 	cat "$TMP" >&2 || true
 	exit 1

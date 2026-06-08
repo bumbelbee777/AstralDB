@@ -10,27 +10,9 @@
 #ifndef MAP_JIT
 #define MAP_JIT 0x0800
 #endif
-
-static int apple_jit_uses_toggle(void) {
-#if defined(__aarch64__) || defined(__arm64__)
-	return 1;
-#else
-	return pthread_jit_write_protect_supported_np() != 0;
 #endif
-}
 
-static int apple_jit_mmap_prot(void) {
-#if defined(__aarch64__) || defined(__arm64__)
-	return PROT_READ | PROT_WRITE | PROT_EXEC;
-#else
-	int prot = PROT_READ | PROT_WRITE;
-	if(!apple_jit_uses_toggle())
-		prot |= PROT_EXEC;
-	return prot;
-#endif
-}
-
-#else
+#ifndef __APPLE__
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -47,60 +29,79 @@ static void flush_icache(void *ptr, size_t size) {
 	__builtin___clear_cache((char *)ptr, (char *)ptr + size);
 }
 
-static int publish_code(void **out_page, size_t map_bytes, const uint8_t *code, size_t code_size, sum_fn *out_fn) {
+static int64_t run_sum(sum_fn fn) {
+	const int64_t sample[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+	return fn(sample, 10);
+}
+
 #if defined(__APPLE__)
-	const int toggle = apple_jit_uses_toggle();
-	fprintf(stderr, "jit_write_protect_toggle=%d supported_np=%d\n", toggle,
-	        pthread_jit_write_protect_supported_np());
-	fflush(stderr);
-	void *page = mmap(NULL, map_bytes, apple_jit_mmap_prot(), MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+static int publish_mapjit_toggle(void **out_page, size_t map_bytes, const uint8_t *code, size_t code_size,
+                                 sum_fn *out_fn) {
+	int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+	void *page = mmap(NULL, map_bytes, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
 	if(page == MAP_FAILED) {
-		perror("mmap MAP_JIT");
+		perror("mmap MAP_JIT toggle");
 		return 1;
 	}
-	if(toggle)
-		pthread_jit_write_protect_np(0);
+	pthread_jit_write_protect_np(0);
 	memcpy(page, code, code_size);
 	flush_icache(page, code_size);
-	if(toggle) {
-		pthread_jit_write_protect_np(1);
-		__asm__ __volatile__("isb" ::: "memory");
-	}
+	pthread_jit_write_protect_np(1);
+	__asm__ __volatile__("isb" ::: "memory");
 	*out_page = page;
 	*out_fn = (sum_fn)page;
 	return 0;
-#else
-	void *page = mmap(NULL, map_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if(page == MAP_FAILED)
-		return 1;
-	memcpy(page, code, code_size);
-	if(mprotect(page, map_bytes, PROT_READ | PROT_EXEC) != 0)
-		return 2;
-	flush_icache(page, code_size);
-	*out_page = page;
-	*out_fn = (sum_fn)page;
-	return 0;
+}
+
 #endif
+
+static int publish_mprotect(void **out_page, size_t map_bytes, const uint8_t *code, size_t code_size, sum_fn *out_fn) {
+	void *page = mmap(NULL, map_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if(page == MAP_FAILED) {
+		perror("mmap anon");
+		return 2;
+	}
+	memcpy(page, code, code_size);
+	flush_icache(page, code_size);
+	if(mprotect(page, map_bytes, PROT_READ | PROT_EXEC) != 0) {
+		perror("mprotect RX");
+		munmap(page, map_bytes);
+		return 3;
+	}
+	*out_page = page;
+	*out_fn = (sum_fn)page;
+	return 0;
 }
 
 int main(void) {
 	void *page = NULL;
 	sum_fn fn = NULL;
-	const int rc = publish_code(&page, 4096, kSumKernel, sizeof kSumKernel, &fn);
+	int rc = 0;
+
+#if defined(__APPLE__)
+	const int supported = pthread_jit_write_protect_supported_np();
+	fprintf(stderr, "supported_np=%d\n", supported);
+	fflush(stderr);
+
+	if(supported) {
+		fprintf(stderr, "strategy=MAP_JIT+pthread\n");
+		rc = publish_mapjit_toggle(&page, 4096, kSumKernel, sizeof kSumKernel, &fn);
+	} else {
+		fprintf(stderr, "strategy=mprotect (pthread is no-op on this host)\n");
+		rc = publish_mprotect(&page, 4096, kSumKernel, sizeof kSumKernel, &fn);
+	}
+#else
+	rc = publish_mprotect(&page, 4096, kSumKernel, sizeof kSumKernel, &fn);
+#endif
+
 	if(rc != 0) {
 		fprintf(stderr, "publish failed rc=%d\n", rc);
 		return rc;
 	}
-#if defined(__APPLE__)
-	if(apple_jit_uses_toggle()) {
-		pthread_jit_write_protect_np(1);
-		__asm__ __volatile__("isb" ::: "memory");
-	}
-#endif
-	const int64_t sample[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
-	const int64_t got = fn(sample, 10);
+
+	const int64_t got = run_sum(fn);
 	printf("sum=%lld expect=55\n", (long long)got);
 	fflush(stdout);
 	munmap(page, 4096);
-	return got == 55 ? 0 : 3;
+	return got == 55 ? 0 : 4;
 }

@@ -15,33 +15,26 @@ namespace SQL {
 
 #if defined(__APPLE__)
 
-/** Apple Silicon always needs per-thread W^X toggling even if supported_np() is false. */
-inline bool AppleJitUsesWriteToggle() noexcept {
-#if defined(__aarch64__) || defined(__arm64__)
-	return true;
-#else
+/** MAP_JIT + pthread toggle (Apple Silicon with working supported_np). */
+inline bool AppleJitUsesMapJitToggle() noexcept {
 	return pthread_jit_write_protect_supported_np() != 0;
-#endif
 }
 
 inline int AppleJitMmapProt() noexcept {
 #if defined(__aarch64__) || defined(__arm64__)
 	return PROT_READ | PROT_WRITE | PROT_EXEC;
 #else
-	int Prot = PROT_READ | PROT_WRITE;
-	if(!AppleJitUsesWriteToggle())
-		Prot |= PROT_EXEC;
-	return Prot;
+	return PROT_READ | PROT_WRITE;
 #endif
 }
 
 inline void AppleJitBeginWrite() noexcept {
-	if(AppleJitUsesWriteToggle())
+	if(AppleJitUsesMapJitToggle())
 		pthread_jit_write_protect_np(0);
 }
 
 inline void AppleJitEndWrite() noexcept {
-	if(AppleJitUsesWriteToggle()) {
+	if(AppleJitUsesMapJitToggle()) {
 		pthread_jit_write_protect_np(1);
 #if defined(__aarch64__) || defined(__arm64__)
 		__asm__ __volatile__("isb" ::: "memory");
@@ -50,8 +43,16 @@ inline void AppleJitEndWrite() noexcept {
 }
 
 inline void AppleJitEnsureExecute() noexcept {
-	if(AppleJitUsesWriteToggle())
+	if(AppleJitUsesMapJitToggle())
 		pthread_jit_write_protect_np(1);
+}
+
+inline bool AppleMprotectWritable(void *Base, std::size_t Size) noexcept {
+	return ::mprotect(Base, Size, PROT_READ | PROT_WRITE) == 0;
+}
+
+inline bool AppleMprotectExecutable(void *Base, std::size_t Size) noexcept {
+	return ::mprotect(Base, Size, PROT_READ | PROT_EXEC) == 0;
 }
 
 #endif

@@ -26,7 +26,6 @@ namespace SQL {
 
 namespace {
 
-/** Apple allows only one MAP_JIT region per process; one bump allocator backs all kernels. */
 #if defined(__APPLE__)
 constexpr std::size_t AppleJitMapBytes = 65536;
 void *AppleJitBase = nullptr;
@@ -53,20 +52,36 @@ void FlushIcache(void *Ptr, std::size_t Size) {
 bool AppleEnsureJitRegion() {
 	if(AppleJitBase)
 		return true;
-	void *P = ::mmap(nullptr, AppleJitMapBytes, AppleJitMmapProt(), MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
-	if(P == MAP_FAILED)
-		return false;
-	AppleJitBase = P;
+	if(AppleJitUsesMapJitToggle()) {
+		void *P = ::mmap(nullptr, AppleJitMapBytes, AppleJitMmapProt(), MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+		if(P == MAP_FAILED)
+			return false;
+		AppleJitBase = P;
+	} else {
+		void *P = ::mmap(nullptr, AppleJitMapBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if(P == MAP_FAILED)
+			return false;
+		AppleJitBase = P;
+	}
 	AppleJitMapped = AppleJitMapBytes;
 	AppleJitUsed = 0;
 	return true;
 }
 
-bool ApplePublishBytes(void *Entry, const std::uint8_t *Code, std::size_t Size) {
-	AppleJitBeginWrite();
+bool ApplePublishBytes(void *Entry, const std::uint8_t *Code, std::size_t Size, void *Base, std::size_t Mapped) {
+	if(AppleJitUsesMapJitToggle()) {
+		AppleJitBeginWrite();
+		std::memcpy(Entry, Code, Size);
+		FlushIcache(Entry, Size);
+		AppleJitEndWrite();
+		return true;
+	}
+	if(!AppleMprotectWritable(Base, Mapped))
+		return false;
 	std::memcpy(Entry, Code, Size);
 	FlushIcache(Entry, Size);
-	AppleJitEndWrite();
+	if(!AppleMprotectExecutable(Base, Mapped))
+		return false;
 	return true;
 }
 
@@ -174,7 +189,7 @@ void *JitExecPage::BumpInCurrent(const std::uint8_t *Code, const std::size_t Siz
 #endif
 	void *Entry = static_cast<std::uint8_t *>(R.Base) + R.Used;
 #if defined(__APPLE__)
-	if(!ApplePublishBytes(Entry, Code, Size))
+	if(!ApplePublishBytes(Entry, Code, Size, R.Base, R.Mapped))
 		return nullptr;
 #else
 	if(!MakeWritable(R.Base, R.Mapped))
