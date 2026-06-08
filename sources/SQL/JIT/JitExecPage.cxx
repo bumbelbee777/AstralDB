@@ -24,37 +24,18 @@
 #include <unistd.h>
 #endif
 
-#if defined(__APPLE__)
-
-struct AstralDbJitMemcpyCtx {
-	void *Dest = nullptr;
-	const std::uint8_t *Src = nullptr;
-	std::size_t Size = 0;
-};
-
-extern "C" int AstralDbJitMemcpyCallback(void *Arg) {
-	auto *Ctx = static_cast<AstralDbJitMemcpyCtx *>(Arg);
-	if(!Ctx || !Ctx->Dest || !Ctx->Src || Ctx->Size == 0)
-		return -1;
-	std::memcpy(Ctx->Dest, Ctx->Src, Ctx->Size);
-	return 0;
-}
-
-#if defined(__aarch64__) || defined(__arm64__)
-#ifndef PTHREAD_JIT_WRITE_ALLOW_CALLBACKS_NP
-#define PTHREAD_JIT_WRITE_ALLOW_CALLBACKS_NP(name)                                                                     \
-	__attribute__((used)) static const char __astraldb_jit_write_cb_##name[] __attribute__((                             \
-	    section("__DATA,__jit_write_callback"))) = #name;
-#endif
-PTHREAD_JIT_WRITE_ALLOW_CALLBACKS_NP(AstralDbJitMemcpyCallback);
-#endif
-
-#endif
-
 namespace AstralDB {
 namespace SQL {
 
 namespace {
+
+/** Apple allows only one MAP_JIT region per process; one bump allocator backs all kernels. */
+#if defined(__APPLE__)
+constexpr std::size_t AppleJitMapBytes = 65536;
+void *AppleJitBase = nullptr;
+std::size_t AppleJitMapped = 0;
+std::size_t AppleJitUsed = 0;
+#endif
 
 std::size_t AlignUp(std::size_t Value, std::size_t Align) {
 	return (Value + Align - 1) & ~(Align - 1);
@@ -74,24 +55,34 @@ void FlushIcache(void *Ptr, std::size_t Size) {
 
 #if defined(__APPLE__)
 
-bool ApplePublishBytes(void *Entry, const std::uint8_t *Code, std::size_t Size) {
-	AstralDbJitMemcpyCtx Ctx{Entry, Code, Size};
-#if defined(__aarch64__) || defined(__arm64__)
-	if(pthread_jit_write_with_callback_np(AstralDbJitMemcpyCallback, &Ctx) != 0)
+bool AppleEnsureJitRegion() {
+	if(AppleJitBase)
+		return true;
+	void *P = ::mmap(nullptr, AppleJitMapBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+	if(P == MAP_FAILED)
 		return false;
-#else
+	AppleJitBase = P;
+	AppleJitMapped = AppleJitMapBytes;
+	AppleJitUsed = 0;
+	return true;
+}
+
+bool ApplePublishBytes(void *Entry, const std::uint8_t *Code, std::size_t Size) {
 	pthread_jit_write_protect_np(0);
 	std::memcpy(Entry, Code, Size);
 	pthread_jit_write_protect_np(1);
-#endif
 	FlushIcache(Entry, Size);
 	return true;
 }
 
-void ApplePrepareForUnmap() {
-#if !defined(__aarch64__) && !defined(__arm64__)
+void AppleReleaseJitRegion() {
+	if(!AppleJitBase)
+		return;
 	pthread_jit_write_protect_np(1);
-#endif
+	::munmap(AppleJitBase, AppleJitMapped);
+	AppleJitBase = nullptr;
+	AppleJitMapped = 0;
+	AppleJitUsed = 0;
 }
 
 #endif
@@ -100,10 +91,8 @@ void *MapFreshPage(std::size_t Size) {
 #if defined(_WIN32)
 	return VirtualAlloc(nullptr, Size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 #elif defined(__APPLE__)
-	void *P = ::mmap(nullptr, Size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
-	if(P == MAP_FAILED)
-		return nullptr;
-	return P;
+	(void)Size;
+	return AppleEnsureJitRegion() ? AppleJitBase : nullptr;
 #else
 	void *P = ::mmap(nullptr, Size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if(P == MAP_FAILED)
@@ -136,29 +125,48 @@ void UnmapPage(void *Base, std::size_t Size) {
 	if(!Base || Size == 0)
 		return;
 #if defined(__APPLE__)
-	ApplePrepareForUnmap();
-#endif
+	(void)Base;
+	(void)Size;
+	AppleReleaseJitRegion();
+#else
 #if defined(_WIN32)
 	VirtualFree(Base, 0, MEM_RELEASE);
 #else
 	::munmap(Base, Size);
+#endif
 #endif
 }
 
 } // namespace
 
 JitExecPage::~JitExecPage() {
+#if defined(__APPLE__)
+	if(!Regions_.empty())
+		AppleReleaseJitRegion();
+	Regions_.clear();
+#else
 	for(const Region &R : Regions_)
 		UnmapPage(R.Base, R.Mapped);
+#endif
 }
 
 bool JitExecPage::AppendRegion(const std::size_t MinMapped) {
+#if defined(__APPLE__)
+	(void)MinMapped;
+	if(!Regions_.empty())
+		return true;
+	if(!AppleEnsureJitRegion())
+		return false;
+	Regions_.push_back(Region{AppleJitBase, AppleJitMapped, AppleJitUsed});
+	return true;
+#else
 	const std::size_t NewMap = (std::max)(PageSize, AlignUp(MinMapped, PageSize));
 	void *Fresh = MapFreshPage(NewMap);
 	if(!Fresh)
 		return false;
 	Regions_.push_back(Region{Fresh, NewMap, 0});
 	return true;
+#endif
 }
 
 void *JitExecPage::BumpInCurrent(const std::uint8_t *Code, const std::size_t Size) {
@@ -166,11 +174,16 @@ void *JitExecPage::BumpInCurrent(const std::uint8_t *Code, const std::size_t Siz
 		return nullptr;
 	Region &R = Regions_.back();
 	const std::size_t Need = AlignUp(R.Used + Size, 16);
+#if defined(__APPLE__)
+	if(Need > R.Mapped)
+		return nullptr;
+#else
 	if(Need > R.Mapped) {
 		if(!AppendRegion(Need))
 			return nullptr;
 		return BumpInCurrent(Code, Size);
 	}
+#endif
 	void *Entry = static_cast<std::uint8_t *>(R.Base) + R.Used;
 #if defined(__APPLE__)
 	if(!ApplePublishBytes(Entry, Code, Size))
@@ -184,6 +197,9 @@ void *JitExecPage::BumpInCurrent(const std::uint8_t *Code, const std::size_t Siz
 	FlushIcache(Entry, Size);
 #endif
 	R.Used = Need;
+#if defined(__APPLE__)
+	AppleJitUsed = R.Used;
+#endif
 	return Entry;
 }
 
