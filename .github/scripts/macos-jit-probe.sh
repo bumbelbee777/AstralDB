@@ -40,7 +40,7 @@ echo "=== sign run_tests ==="
 bash "$SIGN" "$ENT" "$RUN_TESTS"
 
 echo "=== build + sign jit_probe ==="
-clang -O0 -arch arm64 -Wall -Wextra "${ROOT}/tools/jit_aarch64_probe.c" -o "$PROBE"
+clang -O0 -arch arm64 -Wall -Wextra -mbranch-protection=none "${ROOT}/tools/jit_aarch64_probe.c" -o "$PROBE"
 file "$PROBE" || true
 bash "$SIGN" "$ENT" "$PROBE"
 
@@ -55,7 +55,7 @@ if [[ "$RC" -ne 0 ]]; then
 	echo "[macos-jit-probe] FAILED — last 40 log lines:" >&2
 	tail -n 40 "$LOG" >&2 || true
 	echo "[macos-jit-probe] hints:" >&2
-	echo "  - exit 139: sum invoke crashed (use direct Fn() call, not custom blr asm)" >&2
+	echo "  - exit 139: use blr x16 via register asm (typed Fn() may PAC-authenticate and fault)" >&2
 	echo "  - rc=13 + signal 11: execute fault (signing/entitlements/W^X)" >&2
 	echo "  - rc=12 on ret-smoke: execute OK but wrong exit check (fixed in probe)" >&2
 	echo "  - rc=12 on sum test: ran but wrong sum (bytecode bug)" >&2

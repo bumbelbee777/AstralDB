@@ -106,15 +106,37 @@ static void print_vm_prot(void *page) {
 }
 #endif
 
+static const int64_t kProbeSample[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+
+#if defined(__aarch64__) || defined(__arm64__)
+__attribute__((noinline)) static int64_t invoke_sum_unauth(const void *entry, const int64_t *values, size_t count) {
+	register const int64_t *arg0 asm("x0") = values;
+	register size_t arg1 asm("x1") = count;
+	register const void *jit asm("x16") = entry;
+	(void)arg0;
+	(void)arg1;
+	(void)jit;
+	int64_t out = 0;
+	__asm__ volatile("blr x16\n"
+	                 "mov %0, x0\n"
+	                 : "=r"(out)
+	                 :
+	                 : "x0", "x1", "x16", "x30", "memory", "cc");
+	return out;
+}
+#endif
+
 static int invoke_sum(sum_fn fn, int64_t *out_got) {
 	*out_got = -1;
-	const int64_t sample[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
-	/* AAPCS64 matches JIT ABI (x0=values, x1=count); same path as JitInvokeSum. */
-	const int64_t got = fn(sample, 10);
+#if defined(__aarch64__) || defined(__arm64__)
+	const int64_t got = invoke_sum_unauth((const void *)fn, kProbeSample, 10);
+#else
+	const int64_t got = fn(kProbeSample, 10);
+#endif
 	*out_got = got;
 	if(got == 55)
 		return 0;
-	fprintf(stderr, "  sum invoke got=%lld (expected 55) sample=%p fn=%p\n", (long long)got, (void *)sample,
+	fprintf(stderr, "  sum invoke got=%lld (expected 55) sample=%p fn=%p\n", (long long)got, (void *)kProbeSample,
 	        (void *)fn);
 	fflush(stderr);
 	return 12;
@@ -200,18 +222,52 @@ static int publish_mapjit_rwx(void **out_page, size_t map_bytes, const uint8_t *
 		munmap(page, map_bytes);
 		return 4;
 	}
+#if defined(__aarch64__) || defined(__arm64__)
+	__asm__ __volatile__("isb" ::: "memory");
+#endif
 	*out_page = page;
 	*out_fn = (sum_fn)page;
 	return 0;
 }
 #endif
 
+static int republish_code(void *page, size_t map_bytes, const uint8_t *code, size_t code_size) {
+	errno = 0;
+	if(mprotect(page, map_bytes, PROT_READ | PROT_WRITE) != 0) {
+		log_errno("mprotect(RW) republish");
+		return 4;
+	}
+	memcpy(page, code, code_size);
+	flush_icache(page, code_size);
+	errno = 0;
+	if(mprotect(page, map_bytes, PROT_READ | PROT_EXEC) != 0) {
+		log_errno("mprotect(RX) republish");
+		return 4;
+	}
+#if defined(__aarch64__) || defined(__arm64__)
+	__asm__ __volatile__("isb" ::: "memory");
+#endif
+	return 0;
+}
+
 static int publish_mprotect(void **out_page, size_t map_bytes, const uint8_t *code, size_t code_size, sum_fn *out_fn) {
 	errno = 0;
-	void *page = mmap(NULL, map_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	void *page = mmap(NULL, map_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS
+#if defined(__APPLE__)
+	                      | MAP_JIT
+#endif
+	                  ,
+	                  -1, 0);
 	if(page == MAP_FAILED) {
-		log_errno("mmap(anon|RW)");
-		return 3;
+#if defined(__APPLE__)
+		page = mmap(NULL, map_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if(page == MAP_FAILED) {
+#endif
+			log_errno("mmap(anon|RW)");
+			return 3;
+#if defined(__APPLE__)
+		}
+#endif
 	}
 	memcpy(page, code, code_size);
 	flush_icache(page, code_size);
@@ -221,34 +277,12 @@ static int publish_mprotect(void **out_page, size_t map_bytes, const uint8_t *co
 		munmap(page, map_bytes);
 		return 4;
 	}
+#if defined(__aarch64__) || defined(__arm64__)
+	__asm__ __volatile__("isb" ::: "memory");
+#endif
 	*out_page = page;
 	*out_fn = (sum_fn)page;
 	return 0;
-}
-
-static int try_ret_smoke(const strategy_t *st) {
-	void *page = NULL;
-	sum_fn fn = NULL;
-	fprintf(stderr, "[probe] ret-smoke strategy=%s\n", st->name);
-	fflush(stderr);
-	const int prc = st->publish(&page, 4096, kRetKernel, sizeof kRetKernel, &fn);
-	if(prc != 0) {
-		fprintf(stderr, "  ret-smoke publish rc=%d\n", prc);
-		fflush(stderr);
-		return prc;
-	}
-#if defined(__APPLE__)
-	print_vm_prot(page);
-	const int irc = invoke_ret_in_child(fn);
-#else
-	((void (*)(void))fn)();
-	const int irc = 0;
-#endif
-	if(irc == 13)
-		fprintf(stderr, "  ret-smoke: execute fault before sum kernel (JIT pages not runnable)\n");
-	munmap(page, 4096);
-	fflush(stderr);
-	return irc;
 }
 
 static int try_strategy(const strategy_t *st) {
@@ -257,19 +291,35 @@ static int try_strategy(const strategy_t *st) {
 	fprintf(stderr, "[probe] try strategy=%s\n", st->name);
 	fflush(stderr);
 
-	const int smoke = try_ret_smoke(st);
+	const int prc = st->publish(&page, 4096, kRetKernel, sizeof kRetKernel, &fn);
+	if(prc != 0) {
+		fprintf(stderr, "  ret publish rc=%d\n", prc);
+		fflush(stderr);
+		return prc;
+	}
+	fprintf(stderr, "[probe] ret-smoke strategy=%s\n", st->name);
+#if defined(__APPLE__)
+	print_vm_prot(page);
+	const int smoke = invoke_ret_in_child(fn);
+#else
+	((void (*)(void))fn)();
+	const int smoke = 0;
+#endif
 	if(smoke != 0) {
 		fprintf(stderr, "  skip sum kernel (ret-smoke failed rc=%d)\n", smoke);
+		munmap(page, 4096);
 		fflush(stderr);
 		return smoke;
 	}
 
-	const int prc = st->publish(&page, 4096, kSumKernel, sizeof kSumKernel, &fn);
-	if(prc != 0) {
-		fprintf(stderr, "  publish rc=%d\n", prc);
+	const int repub = republish_code(page, 4096, kSumKernel, sizeof kSumKernel);
+	if(repub != 0) {
+		fprintf(stderr, "  sum republish rc=%d\n", repub);
+		munmap(page, 4096);
 		fflush(stderr);
-		return prc;
+		return repub;
 	}
+	fn = (sum_fn)page;
 	fprintf(stderr, "  page=%p fn=%p code_size=%zu\n", page, (void *)fn, sizeof kSumKernel);
 	hexdump("kernel", page, sizeof kSumKernel);
 #if defined(__APPLE__)

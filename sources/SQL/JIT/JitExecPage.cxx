@@ -74,8 +74,13 @@ bool AppleEnsureJitRegion() {
 		AppleJitBase = P;
 		AppleMode = AppleJitMode::MapJitToggle;
 	} else {
-		// VMAPPLE / supported_np=0: MAP_JIT pages stay RW-only; anon+mprotect is runnable.
-		void *P = ::mmap(nullptr, AppleJitMapBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		// VMAPPLE / supported_np=0: MAP_JIT tags the region; publish via anon+mprotect.
+		void *P = ::mmap(nullptr, AppleJitMapBytes, PROT_READ | PROT_WRITE,
+		                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+		if(P == MAP_FAILED) {
+			JitTracef("mmap MAP_JIT|RW failed, falling back to plain anon");
+			P = ::mmap(nullptr, AppleJitMapBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		}
 		if(P == MAP_FAILED) {
 			JitTracef("mmap anon failed");
 			return false;
@@ -109,6 +114,9 @@ bool ApplePublishBytes(void *Entry, const std::uint8_t *Code, std::size_t Size, 
 			JitTracef("mprotect RX failed entry=%p size=%zu", Entry, Size);
 			return false;
 		}
+#if defined(__aarch64__) || defined(__arm64__)
+		__asm__ __volatile__("isb" ::: "memory");
+#endif
 		return true;
 	}
 	JitTracef("ApplePublishBytes unknown mode");

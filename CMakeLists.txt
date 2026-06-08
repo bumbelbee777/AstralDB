@@ -238,6 +238,10 @@ if(ASTRALDB_LTO)
     set_source_files_properties(${_astraldb_jit_no_lto} PROPERTIES SKIP_LTO TRUE)
     set_source_files_properties(${_astraldb_jit_no_lto} PROPERTIES
         COMPILE_OPTIONS "$<$<CONFIG:Release>:-fno-lto>")
+    if(APPLE)
+        set_source_files_properties(sources/SQL/JIT/JitInvoke.cxx PROPERTIES
+            COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-mbranch-protection=none>")
+    endif()
 endif()
 
 add_library(astraldb_c STATIC
