@@ -271,7 +271,7 @@ function(astraldb_apply_upx_pack target)
 			return()
 		endif()
 		add_custom_command(TARGET ${target} POST_BUILD
-			COMMAND "${_pack_sh}" "$<TARGET_FILE:${target}>"
+			COMMAND bash "${_pack_sh}" "$<TARGET_FILE:${target}>"
 			COMMENT "UPX pack ${target}"
 			VERBATIM)
 	endif()

@@ -39,11 +39,16 @@ void FlushIcache(void *Ptr, std::size_t Size) {
 #if defined(_WIN32)
 	FlushInstructionCache(GetCurrentProcess(), Ptr, Size);
 #elif defined(__APPLE__)
+	sys_dcache_flush(Ptr, Size);
 	sys_icache_invalidate(Ptr, Size);
 #else
 	__builtin___clear_cache(static_cast<char *>(Ptr), static_cast<char *>(Ptr) + Size);
 #endif
 }
+
+#if defined(__APPLE__)
+bool SetJitWriteProtect(bool Writable) { return pthread_jit_write_protect_np(Writable ? 0 : 1) == 0; }
+#endif
 
 void *MapFreshPage(std::size_t Size) {
 #if defined(_WIN32)
@@ -52,6 +57,11 @@ void *MapFreshPage(std::size_t Size) {
 	void *P = ::mmap(nullptr, Size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
 	if(P == MAP_FAILED)
 		return nullptr;
+	/* MAP_JIT pages start non-writable; enable writes before first memcpy. */
+	if(!SetJitWriteProtect(true)) {
+		::munmap(P, Size);
+		return nullptr;
+	}
 	return P;
 #else
 	void *P = ::mmap(nullptr, Size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -68,8 +78,7 @@ bool MakeExecutable(void *Base, std::size_t Size) {
 #elif defined(__APPLE__)
 	(void)Base;
 	(void)Size;
-	pthread_jit_write_protect_np(1);
-	return true;
+	return SetJitWriteProtect(false);
 #else
 	return ::mprotect(Base, Size, PROT_READ | PROT_EXEC) == 0;
 #endif
@@ -82,8 +91,7 @@ bool MakeWritable(void *Base, std::size_t Size) {
 #elif defined(__APPLE__)
 	(void)Base;
 	(void)Size;
-	pthread_jit_write_protect_np(0);
-	return true;
+	return SetJitWriteProtect(true);
 #else
 	return ::mprotect(Base, Size, PROT_READ | PROT_WRITE) == 0;
 #endif
