@@ -9,6 +9,9 @@ PROBE="${ROOT}/build-ci/jit_probe"
 
 chmod +x "$SIGN"
 
+echo "=== runner arch ==="
+uname -m
+
 echo "=== sign run_tests ==="
 bash "$SIGN" "$ENT" "$RUN_TESTS"
 

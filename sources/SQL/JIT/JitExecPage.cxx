@@ -58,7 +58,10 @@ void FlushIcache(void *Ptr, std::size_t Size) {
 bool AppleEnsureJitRegion() {
 	if(AppleJitBase)
 		return true;
-	void *P = ::mmap(nullptr, AppleJitMapBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+	int Prot = PROT_READ | PROT_WRITE;
+	if(!pthread_jit_write_protect_supported_np())
+		Prot |= PROT_EXEC;
+	void *P = ::mmap(nullptr, AppleJitMapBytes, Prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
 	if(P == MAP_FAILED)
 		return false;
 	AppleJitBase = P;
@@ -83,7 +86,8 @@ bool ApplePublishBytes(void *Entry, const std::uint8_t *Code, std::size_t Size) 
 void AppleReleaseJitRegion() {
 	if(!AppleJitBase)
 		return;
-	pthread_jit_write_protect_np(1);
+	if(pthread_jit_write_protect_supported_np())
+		pthread_jit_write_protect_np(1);
 	::munmap(AppleJitBase, AppleJitMapped);
 	AppleJitBase = nullptr;
 	AppleJitMapped = 0;

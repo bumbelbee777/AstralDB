@@ -1,5 +1,5 @@
 /* Minimal ARM64 sum-kernel probe (same bytecode as AstralDB JIT CompileSum on Apple Silicon).
- * Linux: mmap + mprotect. macOS: MAP_JIT + pthread_jit_write_protect_np. */
+ * Linux: mmap + mprotect. macOS: MAP_JIT (toggle or RWX per pthread_jit_write_protect_supported_np). */
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -24,24 +24,30 @@ static const uint8_t kSumKernel[] = {
 
 typedef int64_t (*sum_fn)(const int64_t *, size_t);
 
-static void flush_icache_writable(void *ptr, size_t size) {
+static void flush_icache(void *ptr, size_t size) {
 	__builtin___clear_cache((char *)ptr, (char *)ptr + size);
 }
 
 static int publish_code(void **out_page, size_t map_bytes, const uint8_t *code, size_t code_size, sum_fn *out_fn) {
 #if defined(__APPLE__)
-	if(!pthread_jit_write_protect_supported_np()) {
-		fprintf(stderr, "pthread_jit_write_protect_supported_np() is false\n");
-		return 10;
-	}
-	void *page = mmap(NULL, map_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
-	if(page == MAP_FAILED)
+	const int toggle = pthread_jit_write_protect_supported_np();
+	printf("jit_write_protect_toggle=%d\n", toggle);
+	int prot = PROT_READ | PROT_WRITE;
+	if(!toggle)
+		prot |= PROT_EXEC;
+	void *page = mmap(NULL, map_bytes, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+	if(page == MAP_FAILED) {
+		perror("mmap MAP_JIT");
 		return 1;
-	pthread_jit_write_protect_np(0);
+	}
+	if(toggle)
+		pthread_jit_write_protect_np(0);
 	memcpy(page, code, code_size);
-	flush_icache_writable(page, code_size);
-	pthread_jit_write_protect_np(1);
-	__asm__ __volatile__("isb" ::: "memory");
+	flush_icache(page, code_size);
+	if(toggle) {
+		pthread_jit_write_protect_np(1);
+		__asm__ __volatile__("isb" ::: "memory");
+	}
 	*out_page = page;
 	*out_fn = (sum_fn)page;
 	return 0;
@@ -52,7 +58,7 @@ static int publish_code(void **out_page, size_t map_bytes, const uint8_t *code, 
 	memcpy(page, code, code_size);
 	if(mprotect(page, map_bytes, PROT_READ | PROT_EXEC) != 0)
 		return 2;
-	flush_icache_writable(page, code_size);
+	flush_icache(page, code_size);
 	*out_page = page;
 	*out_fn = (sum_fn)page;
 	return 0;
@@ -68,8 +74,10 @@ int main(void) {
 		return rc;
 	}
 #if defined(__APPLE__)
-	pthread_jit_write_protect_np(1);
-	__asm__ __volatile__("isb" ::: "memory");
+	if(pthread_jit_write_protect_supported_np()) {
+		pthread_jit_write_protect_np(1);
+		__asm__ __volatile__("isb" ::: "memory");
+	}
 #endif
 	const int64_t sample[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
 	const int64_t got = fn(sample, 10);
