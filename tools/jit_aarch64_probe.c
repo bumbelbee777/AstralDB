@@ -1,15 +1,27 @@
-/* Minimal ARM64 sum-kernel probe (same bytecode as AstralDB JIT CompileSum on Apple Silicon). */
+/* macOS/arm64 JIT probe: tries publish strategies; verbose stderr on every failure. */
+#include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
 #if defined(__APPLE__)
+#include <mach/mach.h>
 #include <pthread.h>
+#include <signal.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #ifndef MAP_JIT
 #define MAP_JIT 0x0800
 #endif
+#ifndef CS_OPS_STATUS
+#define CS_OPS_STATUS 0
+#endif
+#ifndef CS_RUNTIME
+#define CS_RUNTIME 0x00010000u
+#endif
+extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 #endif
 
 #ifndef __APPLE__
@@ -17,6 +29,7 @@
 #include <unistd.h>
 #endif
 
+static const uint8_t kRetKernel[] = {0x5f, 0x24, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6};
 static const uint8_t kSumKernel[] = {
 	0x5f, 0x24, 0x03, 0xd5, 0xe2, 0x03, 0x1f, 0xaa, 0xc1, 0x00, 0x00, 0xb4, 0x03, 0x00, 0x40, 0xf9,
 	0x42, 0x00, 0x03, 0x8b, 0x00, 0x20, 0x00, 0x91, 0x21, 0x04, 0x00, 0xd1, 0x81, 0xff, 0xff, 0x54,
@@ -25,22 +38,149 @@ static const uint8_t kSumKernel[] = {
 
 typedef int64_t (*sum_fn)(const int64_t *, size_t);
 
+static void log_errno(const char *step) {
+	fprintf(stderr, "  FAIL %s: errno=%d (%s)\n", step, errno, strerror(errno));
+	fflush(stderr);
+}
+
 static void flush_icache(void *ptr, size_t size) {
 	__builtin___clear_cache((char *)ptr, (char *)ptr + size);
 }
 
-static int64_t run_sum(sum_fn fn) {
-	const int64_t sample[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
-	return fn(sample, 10);
+static void hexdump(const char *label, const void *ptr, size_t size) {
+	const uint8_t *B = (const uint8_t *)ptr;
+	fprintf(stderr, "  %s (%zu bytes):\n", label, size);
+	for(size_t I = 0; I < size; ++I) {
+		if(I % 16 == 0)
+			fprintf(stderr, "    %04zx:", I);
+		fprintf(stderr, " %02x", B[I]);
+		if(I % 16 == 15 || I + 1 == size)
+			fprintf(stderr, "\n");
+	}
+	fflush(stderr);
 }
+
+#if defined(__APPLE__)
+static void print_host(void) {
+	char ver[256] = {0};
+	FILE *F = popen("sw_vers -productVersion 2>/dev/null", "r");
+	if(F) {
+		if(fgets(ver, sizeof ver, F))
+			fprintf(stderr, "[probe] macOS=%s", ver);
+		pclose(F);
+	}
+	fprintf(stderr, "[probe] pid=%d ppid=%d arch=", (int)getpid(), (int)getppid());
+#if defined(__aarch64__) || defined(__arm64__)
+	fprintf(stderr, "arm64");
+#else
+	fprintf(stderr, "other");
+#endif
+	fprintf(stderr, " supported_np=%d\n", pthread_jit_write_protect_supported_np());
+	uint32_t flags = 0;
+	if(csops(getpid(), CS_OPS_STATUS, &flags, sizeof(flags)) == 0)
+		fprintf(stderr, "[probe] csops_status=0x%x hardened_runtime=%d\n", flags, (flags & CS_RUNTIME) != 0);
+	else
+		log_errno("csops");
+	fflush(stderr);
+}
+
+static void print_vm_prot(void *page) {
+	mach_vm_address_t addr = (mach_vm_address_t)page;
+	mach_vm_size_t region_size = 0;
+	natural_t depth = 0;
+	struct vm_region_submap_info_64 info;
+	mach_msg_type_number_t info_count = VM_REGION_SUBMAP_INFO_COUNT_64;
+	memset(&info, 0, sizeof info);
+	const kern_return_t kr =
+	    vm_region_recurse_64(mach_task_self(), &addr, &region_size, &depth, (vm_region_info_t)&info, &info_count);
+	if(kr != KERN_SUCCESS) {
+		fprintf(stderr, "  vm_region_recurse_64 kr=%d for page=%p\n", kr, page);
+		fflush(stderr);
+		return;
+	}
+	fprintf(stderr,
+	        "  vm page=%p region=[%llx..%llx) cur_prot=0x%x max_prot=0x%x user_tag=%u\n", page,
+	        (unsigned long long)addr, (unsigned long long)(addr + region_size), info.protection, info.max_protection,
+	        info.user_tag);
+	fflush(stderr);
+}
+#endif
+
+#if defined(__aarch64__) || defined(__arm64__)
+static int64_t blr_sum(const void *target, const int64_t *values, size_t count) {
+	int64_t out = 0;
+	__asm__ volatile("mov x0, %2\n"
+	                 "mov x1, %3\n"
+	                 "blr %1\n"
+	                 "mov %0, x0\n"
+	                 : "=r"(out)
+	                 : "r"(target), "r"(values), "r"(count)
+	                 : "x0", "x1", "x30", "memory", "cc");
+	return out;
+}
+#endif
+
+static int invoke_in_child(sum_fn fn, int64_t *out_got) {
+	*out_got = -1;
+#if defined(__APPLE__)
+	fflush(NULL);
+	const pid_t pid = fork();
+	if(pid < 0) {
+		log_errno("fork");
+		return 10;
+	}
+	if(pid == 0) {
+		const int64_t sample[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+#if defined(__aarch64__) || defined(__arm64__)
+		const int64_t got = blr_sum((const void *)fn, sample, 10);
+#else
+		const int64_t got = fn(sample, 10);
+#endif
+		_exit(got == 55 ? 0 : 2);
+	}
+	int status = 0;
+	if(waitpid(pid, &status, 0) < 0) {
+		log_errno("waitpid");
+		return 11;
+	}
+	if(WIFEXITED(status)) {
+		const int code = WEXITSTATUS(status);
+		if(code == 0) {
+			*out_got = 55;
+			return 0;
+		}
+		fprintf(stderr, "  child exit=%d (expected 0 with sum=55, or 2 with wrong sum)\n", code);
+		fflush(stderr);
+		return 12;
+	}
+	if(WIFSIGNALED(status)) {
+		const int sig = WTERMSIG(status);
+		fprintf(stderr, "  child signal=%d (%s) at fn=%p\n", sig, strsignal(sig), (void *)fn);
+		fflush(stderr);
+		return 13;
+	}
+	fprintf(stderr, "  child unknown wait status=0x%x\n", status);
+	fflush(stderr);
+	return 14;
+#else
+	const int64_t sample[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+	*out_got = fn(sample, 10);
+	return *out_got == 55 ? 0 : 15;
+#endif
+}
+
+typedef struct {
+	const char *name;
+	int (*publish)(void **page, size_t map_bytes, const uint8_t *code, size_t code_size, sum_fn *out_fn);
+} strategy_t;
 
 #if defined(__APPLE__)
 static int publish_mapjit_toggle(void **out_page, size_t map_bytes, const uint8_t *code, size_t code_size,
                                  sum_fn *out_fn) {
-	int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
-	void *page = mmap(NULL, map_bytes, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+	errno = 0;
+	void *page = mmap(NULL, map_bytes, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
 	if(page == MAP_FAILED) {
-		perror("mmap MAP_JIT toggle");
+		log_errno("mmap(MAP_JIT|RWE)");
 		return 1;
 	}
 	pthread_jit_write_protect_np(0);
@@ -53,55 +193,144 @@ static int publish_mapjit_toggle(void **out_page, size_t map_bytes, const uint8_
 	return 0;
 }
 
-#endif
-
-static int publish_mprotect(void **out_page, size_t map_bytes, const uint8_t *code, size_t code_size, sum_fn *out_fn) {
-	void *page = mmap(NULL, map_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+static int publish_mapjit_rwx(void **out_page, size_t map_bytes, const uint8_t *code, size_t code_size, sum_fn *out_fn) {
+	errno = 0;
+	void *page = mmap(NULL, map_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
 	if(page == MAP_FAILED) {
-		perror("mmap anon");
+		log_errno("mmap(MAP_JIT|RW)");
 		return 2;
 	}
 	memcpy(page, code, code_size);
 	flush_icache(page, code_size);
-	if(mprotect(page, map_bytes, PROT_READ | PROT_EXEC) != 0) {
-		perror("mprotect RX");
-		munmap(page, map_bytes);
+	*out_page = page;
+	*out_fn = (sum_fn)page;
+	return 0;
+}
+#endif
+
+static int publish_mprotect(void **out_page, size_t map_bytes, const uint8_t *code, size_t code_size, sum_fn *out_fn) {
+	errno = 0;
+	void *page = mmap(NULL, map_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if(page == MAP_FAILED) {
+		log_errno("mmap(anon|RW)");
 		return 3;
+	}
+	memcpy(page, code, code_size);
+	flush_icache(page, code_size);
+	errno = 0;
+	if(mprotect(page, map_bytes, PROT_READ | PROT_EXEC) != 0) {
+		log_errno("mprotect(RX)");
+		munmap(page, map_bytes);
+		return 4;
 	}
 	*out_page = page;
 	*out_fn = (sum_fn)page;
 	return 0;
 }
 
-int main(void) {
+static int try_ret_smoke(const strategy_t *st) {
 	void *page = NULL;
 	sum_fn fn = NULL;
-	int rc = 0;
-
+	fprintf(stderr, "[probe] ret-smoke strategy=%s\n", st->name);
+	fflush(stderr);
+	const int prc = st->publish(&page, 4096, kRetKernel, sizeof kRetKernel, &fn);
+	if(prc != 0) {
+		fprintf(stderr, "  ret-smoke publish rc=%d\n", prc);
+		fflush(stderr);
+		return prc;
+	}
 #if defined(__APPLE__)
-	const int supported = pthread_jit_write_protect_supported_np();
-	fprintf(stderr, "supported_np=%d\n", supported);
+	print_vm_prot(page);
+#endif
+	int64_t got = 0;
+	const int irc = invoke_in_child(fn, &got);
+	if(irc == 13)
+		fprintf(stderr, "  ret-smoke: execute fault before sum kernel (JIT pages not runnable)\n");
+	munmap(page, 4096);
+	fflush(stderr);
+	return irc;
+}
+
+static int try_strategy(const strategy_t *st) {
+	void *page = NULL;
+	sum_fn fn = NULL;
+	fprintf(stderr, "[probe] try strategy=%s\n", st->name);
 	fflush(stderr);
 
-	if(supported) {
-		fprintf(stderr, "strategy=MAP_JIT+pthread\n");
-		rc = publish_mapjit_toggle(&page, 4096, kSumKernel, sizeof kSumKernel, &fn);
-	} else {
-		fprintf(stderr, "strategy=mprotect (pthread is no-op on this host)\n");
-		rc = publish_mprotect(&page, 4096, kSumKernel, sizeof kSumKernel, &fn);
+	const int smoke = try_ret_smoke(st);
+	if(smoke != 0) {
+		fprintf(stderr, "  skip sum kernel (ret-smoke failed rc=%d)\n", smoke);
+		fflush(stderr);
+		return smoke;
 	}
-#else
-	rc = publish_mprotect(&page, 4096, kSumKernel, sizeof kSumKernel, &fn);
+
+	const int prc = st->publish(&page, 4096, kSumKernel, sizeof kSumKernel, &fn);
+	if(prc != 0) {
+		fprintf(stderr, "  publish rc=%d\n", prc);
+		fflush(stderr);
+		return prc;
+	}
+	fprintf(stderr, "  page=%p fn=%p code_size=%zu\n", page, (void *)fn, sizeof kSumKernel);
+	hexdump("kernel", page, sizeof kSumKernel);
+#if defined(__APPLE__)
+	print_vm_prot(page);
 #endif
 
-	if(rc != 0) {
-		fprintf(stderr, "publish failed rc=%d\n", rc);
-		return rc;
+	int64_t got = 0;
+	const int irc = invoke_in_child(fn, &got);
+	if(irc == 0) {
+		printf("ok strategy=%s sum=%lld\n", st->name, (long long)got);
+		fflush(stdout);
+		munmap(page, 4096);
+		return 0;
+	}
+	if(irc == 13)
+		fprintf(stderr, "  sum invoke crashed (publish OK, execute blocked or bad code)\n");
+	else if(irc == 12)
+		fprintf(stderr, "  sum invoke returned wrong value (execute OK, bytecode/logic issue)\n");
+	munmap(page, 4096);
+	fflush(stderr);
+	return irc;
+}
+
+int main(void) {
+#if defined(__APPLE__)
+	print_host();
+#endif
+
+	static const strategy_t kStrategies[] = {
+#if defined(__APPLE__)
+	    {"MAP_JIT+pthread", publish_mapjit_toggle},
+	    {"MAP_JIT+RWX", publish_mapjit_rwx},
+#endif
+	    {"anon+mprotect", publish_mprotect},
+	};
+	const size_t n = sizeof kStrategies / sizeof kStrategies[0];
+
+	int last_rc = 1;
+	for(size_t I = 0; I < n; ++I) {
+#if defined(__APPLE__)
+		if(I == 0 && !pthread_jit_write_protect_supported_np()) {
+			fprintf(stderr, "[probe] skip MAP_JIT+pthread (supported_np=0)\n");
+			fflush(stderr);
+			continue;
+		}
+#endif
+		const int rc = try_strategy(&kStrategies[I]);
+		if(rc == 0)
+			return 0;
+		last_rc = rc;
+		fprintf(stderr, "[probe] strategy %s failed rc=%d\n", kStrategies[I].name, rc);
+		fflush(stderr);
 	}
 
-	const int64_t got = run_sum(fn);
-	printf("sum=%lld expect=55\n", (long long)got);
-	fflush(stdout);
-	munmap(page, 4096);
-	return got == 55 ? 0 : 4;
+	fprintf(stderr, "[probe] ALL STRATEGIES FAILED last_rc=%d\n", last_rc);
+	fprintf(stderr, "[probe] rc key: 1=mmap_MAP_JIT_RWE 2=mmap_MAP_JIT_RW 3=mmap_anon 4=mprotect "
+	                "10=fork 11=waitpid 12=wrong_sum 13=signal 14=wait_unknown\n");
+#if defined(__APPLE__)
+	fprintf(stderr, "[probe] if rc=13 and hardened_runtime=1: drop --options runtime from codesign\n");
+	fprintf(stderr, "[probe] if rc=13 and hardened_runtime=0: VM may block JIT; check entitlements DER\n");
+#endif
+	fflush(stderr);
+	return last_rc;
 }

@@ -15,7 +15,6 @@ namespace SQL {
 
 #if defined(__APPLE__)
 
-/** MAP_JIT + pthread toggle (Apple Silicon with working supported_np). */
 inline bool AppleJitUsesMapJitToggle() noexcept {
 	return pthread_jit_write_protect_supported_np() != 0;
 }

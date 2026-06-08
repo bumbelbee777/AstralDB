@@ -1,5 +1,6 @@
 #pragma once
 #include <SQL/JIT/JitCompiler.hxx>
+#include <SQL/JIT/JitDiagnostics.hxx>
 #include <doctest/doctest.h>
 #include <chrono>
 #include <cstdio>
@@ -9,9 +10,16 @@ namespace AstralTest {
 using doctest::Approx;
 inline void AssertSqlOk(bool Ok, const char *Msg = "") { REQUIRE_MESSAGE(Ok, Msg); }
 inline void RequireJitNative(AstralDB::SQL::JitCompiler &Jit) {
-	if(!Jit.LastCompileWasNative())
+	if(!Jit.LastCompileWasNative()) {
+		std::fprintf(stderr, "[jit] native compile/verify failed kernel=%s native=%d\n",
+		             Jit.LastCompiledKernelName().c_str(), Jit.LastCompileWasNative() ? 1 : 0);
 		Jit.DumpLastCompiledKernel();
-	REQUIRE(Jit.LastCompileWasNative());
+		AstralDB::SQL::PrintAppleJitDiagnostics();
+		std::fprintf(stderr, "[jit] export ASTRALDB_JIT_TRACE=1 for publish-step traces\n");
+		std::fflush(stderr);
+	}
+	REQUIRE_MESSAGE(Jit.LastCompileWasNative(),
+	                "JIT kernel did not compile/verify as native (see [jit] / [jit-diag] stderr above)");
 }
 class PerfSection {
 	const char *L_;

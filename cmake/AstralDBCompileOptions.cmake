@@ -303,7 +303,7 @@ function(astraldb_apply_macos_jit_entitlements target)
 	add_custom_command(TARGET ${target} POST_BUILD
 		COMMAND chmod +x "${_sign_sh}"
 		COMMAND bash "${_sign_sh}" "${_ent}" "$<TARGET_FILE:${target}>"
-		COMMENT "Ad-hoc sign ${target} (MAP_JIT + DER entitlements)"
+		COMMENT "Ad-hoc sign ${target} (JIT entitlements, no hardened runtime)"
 		VERBATIM)
 endfunction()
 

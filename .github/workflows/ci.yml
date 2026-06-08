@@ -172,7 +172,16 @@ jobs:
         if: runner.os == 'macOS'
         run: bash .github/scripts/macos-jit-probe.sh
 
+      - name: Upload macOS JIT probe log
+        if: failure() && runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-jit-probe-log
+          path: build-ci/jit_probe.log
+          if-no-files-found: ignore
+
       - name: Test
+        if: runner.os != 'macOS' || success()
         run: ${{ matrix.test }}
 
       - name: SHA256 checksum (CLI)

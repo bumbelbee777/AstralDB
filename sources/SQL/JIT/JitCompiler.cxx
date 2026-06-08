@@ -1,6 +1,7 @@
 #include <SQL/JIT/JitCompiler.hxx>
 
 #include <SQL/JIT/JitInvoke.hxx>
+#include <SQL/JIT/JitDiagnostics.hxx>
 #include <Database/Storage/ColumnFilterSimd.hxx>
 #include <Database/Storage/VectorizedOps.hxx>
 
@@ -114,7 +115,16 @@ bool VerifySum(JitSumFn Fn) {
 	if(!Fn)
 		return false;
 	const int64_t Sample[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
-	return JitInvokeSum(Fn, Sample, 10) == 55;
+	const int64_t Got = JitInvokeSum(Fn, Sample, 10);
+	if(Got != 55) {
+		std::fprintf(stderr, "[jit] VerifySum failed got=%lld expect=55 fn=%p\n", static_cast<long long>(Got),
+		             reinterpret_cast<const void *>(Fn));
+#if defined(__APPLE__)
+		PrintAppleJitDiagnostics();
+#endif
+		std::fflush(stderr);
+	}
+	return Got == 55;
 }
 
 bool VerifyMin(JitMinFn Fn) {
