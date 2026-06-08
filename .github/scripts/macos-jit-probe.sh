@@ -55,7 +55,7 @@ if [[ "$RC" -ne 0 ]]; then
 	echo "[macos-jit-probe] FAILED — last 40 log lines:" >&2
 	tail -n 40 "$LOG" >&2 || true
 	echo "[macos-jit-probe] hints:" >&2
-	echo "  - rc=13 + signal 11 on sum: blr target must use x16 (AAPCS64 x0 collision)" >&2
+	echo "  - exit 139: sum invoke crashed (use direct Fn() call, not custom blr asm)" >&2
 	echo "  - rc=13 + signal 11: execute fault (signing/entitlements/W^X)" >&2
 	echo "  - rc=12 on ret-smoke: execute OK but wrong exit check (fixed in probe)" >&2
 	echo "  - rc=12 on sum test: ran but wrong sum (bytecode bug)" >&2
