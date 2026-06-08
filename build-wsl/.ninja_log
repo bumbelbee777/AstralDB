@@ -1,0 +1,4 @@
+# ninja log v7
+1852	2879	1780917383279822900	CMakeFiles/astraldb_core.dir/sources/Database/Dialect/DualTable.cxx.o	726691ac1db46af6
+1915	3946	1780917383346327200	CMakeFiles/astraldb_core.dir/sources/Database/Index/TextSearch.cxx.o	8d3cf5665f865ce0
+1901	4066	1780917383325023700	CMakeFiles/astraldb_core.dir/sources/Database/Text/PatternMatch.cxx.o	8746968c87996111

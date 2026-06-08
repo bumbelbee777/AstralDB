@@ -155,6 +155,7 @@ add_library(astraldb_core STATIC
     sources/SQL/NewVM/VliwRegisterAlloc.cxx
     sources/SQL/NewVM/VliwExecutor.cxx
     sources/SQL/JIT/JitCompiler.cxx
+    sources/SQL/JIT/JitInvoke.cxx
     sources/SQL/JIT/JitRuntime.cxx
     sources/SQL/JIT/JitExecPage.cxx
     sources/SQL/JIT/HotPathDetector.cxx
@@ -225,6 +226,18 @@ if(ASTRALDB_IO_URING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 astraldb_apply_target_options(astraldb_core)
+if(APPLE AND ASTRALDB_LTO)
+    set(_astraldb_jit_no_lto
+        sources/SQL/JIT/JitCompiler.cxx
+        sources/SQL/JIT/JitInvoke.cxx
+        sources/SQL/JIT/JitExecPage.cxx
+        sources/SQL/JIT/JitRuntime.cxx
+        sources/SQL/JIT/Arm64Emitter.cxx
+    )
+    set_source_files_properties(${_astraldb_jit_no_lto} PROPERTIES SKIP_LTO TRUE)
+    set_source_files_properties(${_astraldb_jit_no_lto} PROPERTIES
+        COMPILE_OPTIONS "$<$<CONFIG:Release>:-fno-lto>")
+endif()
 
 add_library(astraldb_c STATIC
     sources/API/AstralDbC.cxx

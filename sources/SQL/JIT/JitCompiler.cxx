@@ -1,5 +1,6 @@
 #include <SQL/JIT/JitCompiler.hxx>
 
+#include <SQL/JIT/JitInvoke.hxx>
 #include <Database/Storage/ColumnFilterSimd.hxx>
 #include <Database/Storage/VectorizedOps.hxx>
 
@@ -98,7 +99,7 @@ bool VerifyFilterDense(JitFilterDenseFn Fn, FilterCompareOp Op, int64_t Literal)
 	const int64_t Sample[] = {1, 5, 3, 5, 9};
 	std::size_t GotIdx[5]{};
 	std::size_t RefIdx[5]{};
-	const std::size_t Got = Fn(Sample, 5, Literal, GotIdx);
+	const std::size_t Got = JitInvokeFilter(Fn, Sample, 5, Literal, GotIdx);
 	const std::size_t Expect = FilterDenseInterpreted(Op, Literal, Sample, 5, RefIdx);
 	if(Got != Expect)
 		return false;
@@ -113,21 +114,21 @@ bool VerifySum(JitSumFn Fn) {
 	if(!Fn)
 		return false;
 	const int64_t Sample[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
-	return Fn(Sample, 10) == 55;
+	return JitInvokeSum(Fn, Sample, 10) == 55;
 }
 
 bool VerifyMin(JitMinFn Fn) {
 	if(!Fn)
 		return false;
 	const int64_t Sample[] = {4, -2, 9, 1};
-	return Fn(Sample, 4) == -2;
+	return JitInvokeMin(Fn, Sample, 4) == -2;
 }
 
 bool VerifyMax(JitMaxFn Fn) {
 	if(!Fn)
 		return false;
 	const int64_t Sample[] = {4, -2, 9, 1};
-	return Fn(Sample, 4) == 9;
+	return JitInvokeMax(Fn, Sample, 4) == 9;
 }
 
 } // namespace

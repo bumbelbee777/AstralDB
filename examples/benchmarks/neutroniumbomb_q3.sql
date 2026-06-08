@@ -1,4 +1,4 @@
--- Query 3: Eight overlapping windows on orders
+-- Query 3: Eight overlapping windows
 SELECT
     order_id,
     cust_id,
@@ -16,3 +16,4 @@ FROM orders
 WHERE order_date >= '2024-01-01'
 ORDER BY cust_id, order_date
 LIMIT 1000000;
+

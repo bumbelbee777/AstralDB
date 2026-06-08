@@ -1,4 +1,4 @@
--- Query 9: Semistructured scan on customers
+-- Query 9: Semistructured
 SELECT
     cust_id,
     JSON_EXTRACT(profile, '$.preferences.theme') AS theme,
@@ -13,3 +13,4 @@ WHERE JSON_EXTRACT(profile, '$.active') = true
   AND bio MATCH 'SELECT|INSERT|UPDATE|DELETE'
 ORDER BY relevance DESC
 LIMIT 100000;
+

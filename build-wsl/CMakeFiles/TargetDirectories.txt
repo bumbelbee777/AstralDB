@@ -1,0 +1,11 @@
+/mnt/c/Users/bumbe/Downloads/AstralDB/build-wsl/CMakeFiles/astraldb_core.dir
+/mnt/c/Users/bumbe/Downloads/AstralDB/build-wsl/CMakeFiles/astraldb_c.dir
+/mnt/c/Users/bumbe/Downloads/AstralDB/build-wsl/CMakeFiles/astraldb.dir
+/mnt/c/Users/bumbe/Downloads/AstralDB/build-wsl/CMakeFiles/astraldb_tests.dir
+/mnt/c/Users/bumbe/Downloads/AstralDB/build-wsl/CMakeFiles/test.dir
+/mnt/c/Users/bumbe/Downloads/AstralDB/build-wsl/CMakeFiles/edit_cache.dir
+/mnt/c/Users/bumbe/Downloads/AstralDB/build-wsl/CMakeFiles/rebuild_cache.dir
+/mnt/c/Users/bumbe/Downloads/AstralDB/build-wsl/CMakeFiles/list_install_components.dir
+/mnt/c/Users/bumbe/Downloads/AstralDB/build-wsl/CMakeFiles/install.dir
+/mnt/c/Users/bumbe/Downloads/AstralDB/build-wsl/CMakeFiles/install/local.dir
+/mnt/c/Users/bumbe/Downloads/AstralDB/build-wsl/CMakeFiles/install/strip.dir

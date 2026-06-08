@@ -1,7 +1,14 @@
 # neutroniumbomb timed query suite (label<TAB>path)
+# Full monolithic script: examples/neutroniumbomb.sql (setup + Q0–Q11)
 Q0	examples/benchmarks/neutroniumbomb_q0.sql
 Q1	examples/benchmarks/neutroniumbomb_q1.sql
+Q2	examples/benchmarks/neutroniumbomb_q2.sql
 Q3	examples/benchmarks/neutroniumbomb_q3.sql
+Q4	examples/benchmarks/neutroniumbomb_q4.sql
+Q5	examples/benchmarks/neutroniumbomb_q5.sql
+Q6	examples/benchmarks/neutroniumbomb_q6.sql
+Q7	examples/benchmarks/neutroniumbomb_q7.sql
+Q8	examples/benchmarks/neutroniumbomb_q8.sql
 Q9	examples/benchmarks/neutroniumbomb_q9.sql
 Q10	examples/benchmarks/neutroniumbomb_query.sql
 Q11	examples/benchmarks/neutroniumbomb_htap.sql

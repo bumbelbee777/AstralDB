@@ -1,4 +1,4 @@
--- Query 1: Star join + CUBE + windows (superset with suppliers)
+-- Query 1: Star join + CUBE + windows + suppliers
 WITH order_analytics AS (
     SELECT
         c.cust_id,
@@ -33,3 +33,4 @@ WHERE month IS NOT NULL
 GROUP BY country, category, supplier_country, month
 ORDER BY country, month, avg_total DESC
 LIMIT 1000;
+
