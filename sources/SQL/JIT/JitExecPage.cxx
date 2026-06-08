@@ -32,15 +32,13 @@ constexpr std::size_t AppleJitMapBytes = 65536;
 void *AppleJitBase = nullptr;
 std::size_t AppleJitMapped = 0;
 std::size_t AppleJitUsed = 0;
-enum class AppleJitMode { MapJitToggle, MapJitRwx, Mprotect };
+enum class AppleJitMode { MapJitToggle, Mprotect };
 AppleJitMode AppleMode = AppleJitMode::Mprotect;
 
 const char *AppleJitModeName(AppleJitMode Mode) {
 	switch(Mode) {
 	case AppleJitMode::MapJitToggle:
 		return "MAP_JIT+pthread";
-	case AppleJitMode::MapJitRwx:
-		return "MAP_JIT+RWX";
 	case AppleJitMode::Mprotect:
 		return "anon+mprotect";
 	}
@@ -76,20 +74,14 @@ bool AppleEnsureJitRegion() {
 		AppleJitBase = P;
 		AppleMode = AppleJitMode::MapJitToggle;
 	} else {
-		void *P = ::mmap(nullptr, AppleJitMapBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
-		if(P != MAP_FAILED) {
-			AppleJitBase = P;
-			AppleMode = AppleJitMode::MapJitRwx;
-		} else {
-			JitTracef("mmap MAP_JIT+RWX failed, falling back to anon+mprotect");
-			P = ::mmap(nullptr, AppleJitMapBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-			if(P == MAP_FAILED) {
-				JitTracef("mmap anon failed");
-				return false;
-			}
-			AppleJitBase = P;
-			AppleMode = AppleJitMode::Mprotect;
+		// VMAPPLE / supported_np=0: MAP_JIT pages stay RW-only; anon+mprotect is runnable.
+		void *P = ::mmap(nullptr, AppleJitMapBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if(P == MAP_FAILED) {
+			JitTracef("mmap anon failed");
+			return false;
 		}
+		AppleJitBase = P;
+		AppleMode = AppleJitMode::Mprotect;
 	}
 	AppleJitMapped = AppleJitMapBytes;
 	AppleJitUsed = 0;
@@ -105,10 +97,6 @@ bool ApplePublishBytes(void *Entry, const std::uint8_t *Code, std::size_t Size, 
 		std::memcpy(Entry, Code, Size);
 		FlushIcache(Entry, Size);
 		AppleJitEndWrite();
-		return true;
-	case AppleJitMode::MapJitRwx:
-		std::memcpy(Entry, Code, Size);
-		FlushIcache(Entry, Size);
 		return true;
 	case AppleJitMode::Mprotect:
 		if(!AppleMprotectWritable(Base, Mapped)) {

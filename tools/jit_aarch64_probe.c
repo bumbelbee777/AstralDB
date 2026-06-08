@@ -85,8 +85,8 @@ static void print_host(void) {
 }
 
 static void print_vm_prot(void *page) {
-	mach_vm_address_t addr = (mach_vm_address_t)page;
-	mach_vm_size_t region_size = 0;
+	vm_address_t addr = (vm_address_t)(uintptr_t)page;
+	vm_size_t region_size = 0;
 	natural_t depth = 0;
 	struct vm_region_submap_info_64 info;
 	mach_msg_type_number_t info_count = VM_REGION_SUBMAP_INFO_COUNT_64;
@@ -169,6 +169,47 @@ static int invoke_in_child(sum_fn fn, int64_t *out_got) {
 #endif
 }
 
+#if defined(__APPLE__)
+static int invoke_ret_in_child(const void *fn) {
+	fflush(NULL);
+	const pid_t pid = fork();
+	if(pid < 0) {
+		log_errno("fork");
+		return 10;
+	}
+	if(pid == 0) {
+#if defined(__aarch64__) || defined(__arm64__)
+		__asm__ volatile("blr %0" ::"r"(fn) : "x30", "memory");
+#else
+		((void (*)(void))fn)();
+#endif
+		_exit(0);
+	}
+	int status = 0;
+	if(waitpid(pid, &status, 0) < 0) {
+		log_errno("waitpid");
+		return 11;
+	}
+	if(WIFEXITED(status)) {
+		const int code = WEXITSTATUS(status);
+		if(code == 0)
+			return 0;
+		fprintf(stderr, "  ret-smoke child exit=%d (expected 0)\n", code);
+		fflush(stderr);
+		return 12;
+	}
+	if(WIFSIGNALED(status)) {
+		const int sig = WTERMSIG(status);
+		fprintf(stderr, "  ret-smoke child signal=%d (%s) at fn=%p\n", sig, strsignal(sig), fn);
+		fflush(stderr);
+		return 13;
+	}
+	fprintf(stderr, "  ret-smoke child unknown wait status=0x%x\n", status);
+	fflush(stderr);
+	return 14;
+}
+#endif
+
 typedef struct {
 	const char *name;
 	int (*publish)(void **page, size_t map_bytes, const uint8_t *code, size_t code_size, sum_fn *out_fn);
@@ -202,6 +243,12 @@ static int publish_mapjit_rwx(void **out_page, size_t map_bytes, const uint8_t *
 	}
 	memcpy(page, code, code_size);
 	flush_icache(page, code_size);
+	errno = 0;
+	if(mprotect(page, map_bytes, PROT_READ | PROT_EXEC) != 0) {
+		log_errno("mprotect(RX) after MAP_JIT|RW");
+		munmap(page, map_bytes);
+		return 4;
+	}
 	*out_page = page;
 	*out_fn = (sum_fn)page;
 	return 0;
@@ -241,9 +288,11 @@ static int try_ret_smoke(const strategy_t *st) {
 	}
 #if defined(__APPLE__)
 	print_vm_prot(page);
-#endif
+	const int irc = invoke_ret_in_child(fn);
+#else
 	int64_t got = 0;
 	const int irc = invoke_in_child(fn, &got);
+#endif
 	if(irc == 13)
 		fprintf(stderr, "  ret-smoke: execute fault before sum kernel (JIT pages not runnable)\n");
 	munmap(page, 4096);
@@ -298,29 +347,30 @@ int main(void) {
 	print_host();
 #endif
 
-	static const strategy_t kStrategies[] = {
+	strategy_t strategies[3];
+	size_t n = 0;
 #if defined(__APPLE__)
-	    {"MAP_JIT+pthread", publish_mapjit_toggle},
-	    {"MAP_JIT+RWX", publish_mapjit_rwx},
+	if(pthread_jit_write_protect_supported_np()) {
+		strategies[n++] = (strategy_t){"MAP_JIT+pthread", publish_mapjit_toggle};
+		strategies[n++] = (strategy_t){"MAP_JIT+RWX", publish_mapjit_rwx};
+		strategies[n++] = (strategy_t){"anon+mprotect", publish_mprotect};
+	} else {
+		fprintf(stderr, "[probe] supported_np=0: prefer anon+mprotect (VMAPPLE/CI)\n");
+		fflush(stderr);
+		strategies[n++] = (strategy_t){"anon+mprotect", publish_mprotect};
+		strategies[n++] = (strategy_t){"MAP_JIT+RWX", publish_mapjit_rwx};
+	}
+#else
+	strategies[n++] = (strategy_t){"anon+mprotect", publish_mprotect};
 #endif
-	    {"anon+mprotect", publish_mprotect},
-	};
-	const size_t n = sizeof kStrategies / sizeof kStrategies[0];
 
 	int last_rc = 1;
 	for(size_t I = 0; I < n; ++I) {
-#if defined(__APPLE__)
-		if(I == 0 && !pthread_jit_write_protect_supported_np()) {
-			fprintf(stderr, "[probe] skip MAP_JIT+pthread (supported_np=0)\n");
-			fflush(stderr);
-			continue;
-		}
-#endif
-		const int rc = try_strategy(&kStrategies[I]);
+		const int rc = try_strategy(&strategies[I]);
 		if(rc == 0)
 			return 0;
 		last_rc = rc;
-		fprintf(stderr, "[probe] strategy %s failed rc=%d\n", kStrategies[I].name, rc);
+		fprintf(stderr, "[probe] strategy %s failed rc=%d\n", strategies[I].name, rc);
 		fflush(stderr);
 	}
 

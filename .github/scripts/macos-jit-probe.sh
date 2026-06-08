@@ -56,7 +56,9 @@ if [[ "$RC" -ne 0 ]]; then
 	tail -n 40 "$LOG" >&2 || true
 	echo "[macos-jit-probe] hints:" >&2
 	echo "  - rc=13 + signal 11: execute fault (signing/entitlements/W^X)" >&2
-	echo "  - rc=12: ran but wrong sum (bytecode bug)" >&2
+	echo "  - rc=12 on ret-smoke: execute OK but wrong exit check (fixed in probe)" >&2
+	echo "  - rc=12 on sum test: ran but wrong sum (bytecode bug)" >&2
+	echo "  - supported_np=0: use anon+mprotect first (MAP_JIT stays RW-only on VMAPPLE)" >&2
 	echo "  - rc=1..4: publish failed (see errno in log)" >&2
 	echo "  - hardened_runtime=1 in log: codesign still has --options runtime" >&2
 	echo "  - export ASTRALDB_JIT_TRACE=1 and re-run ctest for in-app publish traces" >&2
