@@ -40,11 +40,12 @@ echo "=== sign run_tests ==="
 bash "$SIGN" "$ENT" "$RUN_TESTS"
 
 echo "=== build + sign jit_probe ==="
+INVOKE_ASM="${ROOT}/sources/SQL/JIT/JitInvokeAarch64.S"
 PROBE_CFLAGS=(-O0 -arch arm64 -Wall -Wextra)
 if clang "${PROBE_CFLAGS[@]}" -mbranch-protection=none -c -o /dev/null "${ROOT}/tools/jit_aarch64_probe.c" 2>/dev/null; then
 	PROBE_CFLAGS+=(-mbranch-protection=none)
 fi
-clang "${PROBE_CFLAGS[@]}" "${ROOT}/tools/jit_aarch64_probe.c" -o "$PROBE"
+clang "${PROBE_CFLAGS[@]}" "${ROOT}/tools/jit_aarch64_probe.c" "$INVOKE_ASM" -o "$PROBE"
 file "$PROBE" || true
 bash "$SIGN" "$ENT" "$PROBE"
 
@@ -59,7 +60,7 @@ if [[ "$RC" -ne 0 ]]; then
 	echo "[macos-jit-probe] FAILED — last 40 log lines:" >&2
 	tail -n 40 "$LOG" >&2 || true
 	echo "[macos-jit-probe] hints:" >&2
-	echo "  - exit 139: blr target not loaded (use mov x16,%N in asm, not register asm+clobber x16)" >&2
+	echo "  - exit 139: link JitInvokeAarch64.S (raw blr trampoline in .text, not inline asm/C call)" >&2
 	echo "  - rc=13 + signal 11: execute fault (signing/entitlements/W^X)" >&2
 	echo "  - rc=12 on ret-smoke: execute OK but wrong exit check (fixed in probe)" >&2
 	echo "  - rc=12 on sum test: ran but wrong sum (bytecode bug)" >&2

@@ -192,6 +192,11 @@ add_library(astraldb_core STATIC
     sources/IO/MmapBytecodeCache.cxx
 )
 
+if(APPLE)
+    enable_language(ASM)
+    target_sources(astraldb_core PRIVATE sources/SQL/JIT/JitInvokeAarch64.S)
+endif()
+
 target_include_directories(astraldb_core
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/sources>

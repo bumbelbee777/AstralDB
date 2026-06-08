@@ -108,26 +108,14 @@ static void print_vm_prot(void *page) {
 
 static const int64_t kProbeSample[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
 
-#if defined(__aarch64__) || defined(__arm64__)
-__attribute__((noinline)) static int64_t invoke_sum_unauth(const void *entry, const int64_t *values, size_t count) {
-	int64_t out = 0;
-	/* mov x16,%3 must run before mov x0,%1 (entry arrives in x0 under AAPCS64). */
-	__asm__ volatile("mov x16, %3\n"
-	                 "mov x0, %1\n"
-	                 "mov x1, %2\n"
-	                 "blr x16\n"
-	                 "mov %0, x0\n"
-	                 : "=r"(out)
-	                 : "r"(values), "r"(count), "r"(entry)
-	                 : "x0", "x1", "x16", "x30", "memory", "cc");
-	return out;
-}
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+extern int64_t astraldb_jit_invoke_i64(const void *entry, const int64_t *values, size_t count);
 #endif
 
 static int invoke_sum(sum_fn fn, int64_t *out_got) {
 	*out_got = -1;
-#if defined(__aarch64__) || defined(__arm64__)
-	const int64_t got = invoke_sum_unauth((const void *)fn, kProbeSample, 10);
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	const int64_t got = astraldb_jit_invoke_i64((const void *)fn, kProbeSample, 10);
 #else
 	const int64_t got = fn(kProbeSample, 10);
 #endif
