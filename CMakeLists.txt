@@ -226,13 +226,14 @@ if(ASTRALDB_IO_URING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 astraldb_apply_target_options(astraldb_core)
-if(APPLE AND ASTRALDB_LTO)
+if(ASTRALDB_LTO)
+    # Only JIT page publish/invoke must opt out of LTO; mixing -fno-lto JitCompiler
+    # with thin-LTO ColumnFilterSimd breaks arm64 macOS link (branch fixup error).
     set(_astraldb_jit_no_lto
-        sources/SQL/JIT/JitCompiler.cxx
         sources/SQL/JIT/JitInvoke.cxx
         sources/SQL/JIT/JitExecPage.cxx
-        sources/SQL/JIT/JitRuntime.cxx
         sources/SQL/JIT/Arm64Emitter.cxx
+        sources/SQL/JIT/X86_64Emitter.cxx
     )
     set_source_files_properties(${_astraldb_jit_no_lto} PROPERTIES SKIP_LTO TRUE)
     set_source_files_properties(${_astraldb_jit_no_lto} PROPERTIES

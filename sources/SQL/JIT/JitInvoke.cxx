@@ -3,8 +3,10 @@
 namespace AstralDB {
 namespace SQL {
 
-#if defined(__clang__) || defined(__GNUC__)
+#if defined(__clang__)
 #define ASTRALDB_JIT_INVOKE_ATTR __attribute__((noinline, optnone))
+#elif defined(__GNUC__)
+#define ASTRALDB_JIT_INVOKE_ATTR __attribute__((noinline))
 #else
 #define ASTRALDB_JIT_INVOKE_ATTR
 #endif
