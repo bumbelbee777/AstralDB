@@ -44,9 +44,9 @@ extern "C" int AstralDbJitMemcpyCallback(void *Arg) {
 #ifndef PTHREAD_JIT_WRITE_ALLOW_CALLBACKS_NP
 #define PTHREAD_JIT_WRITE_ALLOW_CALLBACKS_NP(name)                                                                     \
 	__attribute__((used)) static const char __astraldb_jit_write_cb_##name[] __attribute__((                             \
-	    section("__DATA,__jit_write_callback"))) = #name
+	    section("__DATA,__jit_write_callback"))) = #name;
 #endif
-PTHREAD_JIT_WRITE_ALLOW_CALLBACKS_NP(AstralDbJitMemcpyCallback)
+PTHREAD_JIT_WRITE_ALLOW_CALLBACKS_NP(AstralDbJitMemcpyCallback);
 #endif
 
 #endif
