@@ -107,66 +107,35 @@ static void print_vm_prot(void *page) {
 #endif
 
 #if defined(__aarch64__) || defined(__arm64__)
-static int64_t blr_sum(const void *target, const int64_t *values, size_t count) {
+__attribute__((noinline)) static int64_t blr_sum(const void *target, const int64_t *values, size_t count) {
 	int64_t out = 0;
-	__asm__ volatile("mov x0, %2\n"
-	                 "mov x1, %3\n"
-	                 "blr %1\n"
+	__asm__ volatile("mov x16, %3\n"
+	                 "mov x0, %1\n"
+	                 "mov x1, %2\n"
+	                 "blr x16\n"
 	                 "mov %0, x0\n"
 	                 : "=r"(out)
-	                 : "r"(target), "r"(values), "r"(count)
-	                 : "x0", "x1", "x30", "memory", "cc");
+	                 : "r"(values), "r"(count), "r"(target)
+	                 : "x0", "x1", "x2", "x3", "x16", "x30", "memory", "cc");
 	return out;
 }
 #endif
 
-static int invoke_in_child(sum_fn fn, int64_t *out_got) {
+static int invoke_sum(sum_fn fn, int64_t *out_got) {
 	*out_got = -1;
-#if defined(__APPLE__)
-	fflush(NULL);
-	const pid_t pid = fork();
-	if(pid < 0) {
-		log_errno("fork");
-		return 10;
-	}
-	if(pid == 0) {
-		const int64_t sample[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
-#if defined(__aarch64__) || defined(__arm64__)
-		const int64_t got = blr_sum((const void *)fn, sample, 10);
-#else
-		const int64_t got = fn(sample, 10);
-#endif
-		_exit(got == 55 ? 0 : 2);
-	}
-	int status = 0;
-	if(waitpid(pid, &status, 0) < 0) {
-		log_errno("waitpid");
-		return 11;
-	}
-	if(WIFEXITED(status)) {
-		const int code = WEXITSTATUS(status);
-		if(code == 0) {
-			*out_got = 55;
-			return 0;
-		}
-		fprintf(stderr, "  child exit=%d (expected 0 with sum=55, or 2 with wrong sum)\n", code);
-		fflush(stderr);
-		return 12;
-	}
-	if(WIFSIGNALED(status)) {
-		const int sig = WTERMSIG(status);
-		fprintf(stderr, "  child signal=%d (%s) at fn=%p\n", sig, strsignal(sig), (void *)fn);
-		fflush(stderr);
-		return 13;
-	}
-	fprintf(stderr, "  child unknown wait status=0x%x\n", status);
-	fflush(stderr);
-	return 14;
-#else
 	const int64_t sample[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
-	*out_got = fn(sample, 10);
-	return *out_got == 55 ? 0 : 15;
+#if defined(__aarch64__) || defined(__arm64__)
+	const int64_t got = blr_sum((const void *)fn, sample, 10);
+#else
+	const int64_t got = fn(sample, 10);
 #endif
+	*out_got = got;
+	if(got == 55)
+		return 0;
+	fprintf(stderr, "  sum invoke got=%lld (expected 55) sample=%p fn=%p\n", (long long)got, (void *)sample,
+	        (void *)fn);
+	fflush(stderr);
+	return 12;
 }
 
 #if defined(__APPLE__)
@@ -290,8 +259,8 @@ static int try_ret_smoke(const strategy_t *st) {
 	print_vm_prot(page);
 	const int irc = invoke_ret_in_child(fn);
 #else
-	int64_t got = 0;
-	const int irc = invoke_in_child(fn, &got);
+	((void (*)(void))fn)();
+	const int irc = 0;
 #endif
 	if(irc == 13)
 		fprintf(stderr, "  ret-smoke: execute fault before sum kernel (JIT pages not runnable)\n");
@@ -326,16 +295,14 @@ static int try_strategy(const strategy_t *st) {
 #endif
 
 	int64_t got = 0;
-	const int irc = invoke_in_child(fn, &got);
+	const int irc = invoke_sum(fn, &got);
 	if(irc == 0) {
 		printf("ok strategy=%s sum=%lld\n", st->name, (long long)got);
 		fflush(stdout);
 		munmap(page, 4096);
 		return 0;
 	}
-	if(irc == 13)
-		fprintf(stderr, "  sum invoke crashed (publish OK, execute blocked or bad code)\n");
-	else if(irc == 12)
+	if(irc == 12)
 		fprintf(stderr, "  sum invoke returned wrong value (execute OK, bytecode/logic issue)\n");
 	munmap(page, 4096);
 	fflush(stderr);

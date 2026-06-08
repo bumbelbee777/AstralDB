@@ -10,28 +10,31 @@ namespace {
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
 __attribute__((noinline)) int64_t AppleBlrI64(const void *Target, const int64_t *Values, std::size_t Count) {
 	int64_t Out = 0;
-	__asm__ volatile("mov x0, %2\n"
-	                 "mov x1, %3\n"
-	                 "blr %1\n"
+	/* x16 holds Target: AAPCS64 puts Target in x0, but we repurpose x0/x1 for the JIT ABI. */
+	__asm__ volatile("mov x16, %3\n"
+	                 "mov x0, %1\n"
+	                 "mov x1, %2\n"
+	                 "blr x16\n"
 	                 "mov %0, x0\n"
 	                 : "=r"(Out)
-	                 : "r"(Target), "r"(Values), "r"(Count)
-	                 : "x0", "x1", "x30", "memory", "cc");
+	                 : "r"(Values), "r"(Count), "r"(Target)
+	                 : "x0", "x1", "x2", "x3", "x16", "x30", "memory", "cc");
 	return Out;
 }
 
 __attribute__((noinline)) std::size_t AppleBlrFilter(const void *Target, const int64_t *Values, std::size_t Count,
                                                       int64_t Literal, std::size_t *Out) {
 	std::size_t Ret = 0;
-	__asm__ volatile("mov x0, %2\n"
+	__asm__ volatile("mov x16, %1\n"
+	                 "mov x0, %2\n"
 	                 "mov x1, %3\n"
 	                 "mov x2, %4\n"
 	                 "mov x3, %5\n"
-	                 "blr %1\n"
+	                 "blr x16\n"
 	                 "mov %0, x0\n"
 	                 : "=r"(Ret)
 	                 : "r"(Target), "r"(Values), "r"(Count), "r"(Literal), "r"(Out)
-	                 : "x0", "x1", "x2", "x3", "x30", "memory", "cc");
+	                 : "x0", "x1", "x2", "x3", "x16", "x30", "memory", "cc");
 	return Ret;
 }
 #endif
