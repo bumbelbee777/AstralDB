@@ -19,7 +19,10 @@ if (-not (Test-Path $Upx)) {
 }
 
 $Backup = "$InputPath.unpacked"
-Copy-Item -Force $InputPath $Backup
+if (-not (Test-Path $Backup)) {
+    Copy-Item -Force $InputPath $Backup
+}
+Copy-Item -Force $Backup $InputPath
 & $Upx --best --lzma --strip-relocs=0 --force-overwrite -q -o $InputPath $Backup
 & $Upx -t $InputPath
 $raw = (Get-Item $Backup).Length

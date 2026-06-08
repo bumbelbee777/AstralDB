@@ -254,7 +254,11 @@ target_include_directories(astraldb_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/te
 set_target_properties(astraldb_tests PROPERTIES OUTPUT_NAME run_tests)
 astraldb_apply_target_options(astraldb_tests)
 if(WIN32)
-	target_link_options(astraldb_tests PRIVATE "-Wl,--stack,8388608")
+	if(MSVC)
+		target_link_options(astraldb_tests PRIVATE "$<$<CONFIG:Release>:/STACK:8388608>")
+	else()
+		target_link_options(astraldb_tests PRIVATE "$<$<CONFIG:Release>:LINKER:/STACK:8388608>")
+	endif()
 endif()
 
 enable_testing()

@@ -80,7 +80,7 @@ std::uint32_t SkipCondForOp(FilterCompareOp Op) {
 
 	case FilterCompareOp::Gt:
 
-		return 0xBu; // LE
+		return 0xDu; // LE (skip when x <= literal)
 
 	case FilterCompareOp::Ge:
 

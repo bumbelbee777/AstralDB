@@ -12,6 +12,7 @@
 #endif
 #include <windows.h>
 #elif defined(__APPLE__)
+#include <libkern/OSCacheControl.h>
 #include <pthread.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -33,21 +34,21 @@ std::size_t AlignUp(std::size_t Value, std::size_t Align) {
 }
 
 void FlushIcache(void *Ptr, std::size_t Size) {
+	if(!Ptr || Size == 0)
+		return;
 #if defined(_WIN32)
 	FlushInstructionCache(GetCurrentProcess(), Ptr, Size);
-#elif defined(__APPLE__) || defined(__linux__)
-	__builtin___clear_cache(static_cast<char *>(Ptr), static_cast<char *>(Ptr) + Size);
+#elif defined(__APPLE__)
+	sys_icache_invalidate(Ptr, Size);
 #else
-	(void)Ptr;
-	(void)Size;
+	__builtin___clear_cache(static_cast<char *>(Ptr), static_cast<char *>(Ptr) + Size);
 #endif
 }
 
 void *MapFreshPage(std::size_t Size) {
 #if defined(_WIN32)
-	void *P = VirtualAlloc(nullptr, Size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-	return P;
-#elif defined(__APPLE__) && defined(__arm64__)
+	return VirtualAlloc(nullptr, Size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#elif defined(__APPLE__)
 	void *P = ::mmap(nullptr, Size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
 	if(P == MAP_FAILED)
 		return nullptr;
@@ -64,7 +65,7 @@ bool MakeExecutable(void *Base, std::size_t Size) {
 #if defined(_WIN32)
 	DWORD Old = 0;
 	return VirtualProtect(Base, Size, PAGE_EXECUTE_READ, &Old) != 0;
-#elif defined(__APPLE__) && defined(__arm64__)
+#elif defined(__APPLE__)
 	(void)Base;
 	(void)Size;
 	pthread_jit_write_protect_np(1);
@@ -78,7 +79,7 @@ bool MakeWritable(void *Base, std::size_t Size) {
 #if defined(_WIN32)
 	DWORD Old = 0;
 	return VirtualProtect(Base, Size, PAGE_READWRITE, &Old) != 0;
-#elif defined(__APPLE__) && defined(__arm64__)
+#elif defined(__APPLE__)
 	(void)Base;
 	(void)Size;
 	pthread_jit_write_protect_np(0);

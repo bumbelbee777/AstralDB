@@ -4083,8 +4083,10 @@ TEST_CASE("OlapAggregateMicrokernels: sum cells matches reference") {
 
 TEST_CASE("JIT: compiled sum matches reference") {
 	std::vector<int64_t> Values{1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
-	const auto Fn = AstralDB::SQL::JitCompiler::Instance().CompileSum();
+	auto &Jit = AstralDB::SQL::JitCompiler::Instance();
+	const auto Fn = Jit.CompileSum();
 	REQUIRE(Fn != nullptr);
+	REQUIRE(Jit.LastCompileWasNative());
 	const int64_t Got = Fn(Values.data(), Values.size());
 	REQUIRE(Got == 55);
 }
@@ -4092,8 +4094,10 @@ TEST_CASE("JIT: compiled sum matches reference") {
 TEST_CASE("JIT: dense filter all compare ops") {
 	const std::vector<int64_t> Values{1, 5, 3, 5, 9};
 	std::vector<std::size_t> Idx(Values.size());
-	const auto GtFn = AstralDB::SQL::JitCompiler::Instance().CompileFilterDense(AstralDB::FilterCompareOp::Gt, 3);
+	auto &Jit = AstralDB::SQL::JitCompiler::Instance();
+	const auto GtFn = Jit.CompileFilterDense(AstralDB::FilterCompareOp::Gt, 3);
 	REQUIRE(GtFn != nullptr);
+	REQUIRE(Jit.LastCompileWasNative());
 	const std::size_t N = GtFn(Values.data(), Values.size(), 3, Idx.data());
 	REQUIRE(N == 3);
 	REQUIRE(Idx[0] == 1);
@@ -4103,9 +4107,12 @@ TEST_CASE("JIT: dense filter all compare ops") {
 
 TEST_CASE("JIT: min and max kernels") {
 	const std::vector<int64_t> Values{4, -2, 9, 1};
-	const auto MinFn = AstralDB::SQL::JitCompiler::Instance().CompileMin();
-	const auto MaxFn = AstralDB::SQL::JitCompiler::Instance().CompileMax();
+	auto &Jit = AstralDB::SQL::JitCompiler::Instance();
+	const auto MinFn = Jit.CompileMin();
+	REQUIRE(Jit.LastCompileWasNative());
 	REQUIRE(MinFn(Values.data(), Values.size()) == -2);
+	const auto MaxFn = Jit.CompileMax();
+	REQUIRE(Jit.LastCompileWasNative());
 	REQUIRE(MaxFn(Values.data(), Values.size()) == 9);
 }
 

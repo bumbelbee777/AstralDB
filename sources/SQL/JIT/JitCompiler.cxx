@@ -157,6 +157,7 @@ JitFilterDenseFn JitCompiler::CompileFilterDense(FilterCompareOp Op, int64_t Lit
 	if(Fn && !VerifyFilterDense(Fn, Op, Literal))
 		Fn = nullptr;
 
+	LastCompileNative_ = Fn != nullptr;
 	if(!Fn)
 		Fn = SelectInterpretedFilter(Op);
 
@@ -180,6 +181,7 @@ JitSumFn JitCompiler::CompileSum() {
 	if(SumFn_ && !VerifySum(SumFn_))
 		SumFn_ = nullptr;
 
+	LastCompileNative_ = SumFn_ != nullptr;
 	if(!SumFn_)
 		SumFn_ = InterpretedSum;
 	return SumFn_;
@@ -201,6 +203,7 @@ JitMinFn JitCompiler::CompileMin() {
 	if(MinFn_ && !VerifyMin(MinFn_))
 		MinFn_ = nullptr;
 
+	LastCompileNative_ = MinFn_ != nullptr;
 	if(!MinFn_)
 		MinFn_ = InterpretedMin;
 	return MinFn_;
@@ -222,6 +225,7 @@ JitMaxFn JitCompiler::CompileMax() {
 	if(MaxFn_ && !VerifyMax(MaxFn_))
 		MaxFn_ = nullptr;
 
+	LastCompileNative_ = MaxFn_ != nullptr;
 	if(!MaxFn_)
 		MaxFn_ = InterpretedMax;
 	return MaxFn_;
@@ -233,6 +237,7 @@ void JitCompiler::InvalidateAll() {
 	MinFn_ = nullptr;
 	MaxFn_ = nullptr;
 	CodePage_.reset();
+	LastCompileNative_ = false;
 }
 
 } // namespace SQL

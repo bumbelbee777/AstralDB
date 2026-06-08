@@ -31,6 +31,7 @@ jobs:
               -DCMAKE_BUILD_TYPE=Release
               -DCMAKE_CXX_COMPILER=g++
               -DASTRALDB_RELEASE_PROFILE=size
+              -DASTRALDB_UPX=ON
             build: cmake --build build-ci
             test: ctest --test-dir build-ci -L fast --output-on-failure
             cli: build-ci/astraldb
@@ -111,6 +112,10 @@ jobs:
         if: runner.os == 'Windows'
         run: choco install llvm ninja -y --no-progress
 
+      - name: Setup UPX
+        if: matrix.size_check == true
+        uses: ./.github/actions/setup-upx
+
       - name: Configure
         run: ${{ matrix.configure }}
 
@@ -123,17 +128,17 @@ jobs:
         run: |
           set -euo pipefail
           CLI="${{ matrix.cli }}"
-          SIZE=$(stat -c%s "$CLI")
-          echo "Unpacked size: $SIZE bytes"
+          RAW="${CLI}.unpacked"
+          if [[ ! -f "$RAW" ]]; then
+            RAW="$CLI"
+          fi
+          SIZE=$(stat -c%s "$RAW")
+          echo "Unpacked size: $SIZE bytes ($RAW)"
           MAX=2900000
           if [ "$SIZE" -ge "$MAX" ]; then
             echo "Binary too large: $SIZE >= $MAX" >&2
             exit 1
           fi
-
-      - name: Setup UPX
-        if: matrix.size_check == true
-        uses: ./.github/actions/setup-upx
 
       - name: UPX packed size check
         if: matrix.size_check == true
@@ -141,14 +146,21 @@ jobs:
         run: |
           set -euo pipefail
           CLI="${{ matrix.cli }}"
+          if [[ -f "$CLI" ]]; then
+            "$UPX_BIN" -t "$CLI"
+            PACKED=$(stat -c%s "$CLI")
+            echo "UPX-packed CLI: $PACKED bytes"
+          else
+            echo "Packed binary missing: $CLI" >&2
+            exit 1
+          fi
           OUT=$(bash scripts/measure_binary_size.sh "$CLI")
           echo "$OUT"
-          PACKED=$(echo "$OUT" | awk -F= '/^upx_bytes=/{print $2}')
-          if [ -n "$PACKED" ]; then
-            echo "UPX packed size: $PACKED bytes"
+          MEASURED=$(echo "$OUT" | awk -F= '/^upx_bytes=/{print $2}')
+          if [ -n "$MEASURED" ]; then
             MAX_PACKED=1400000
-            if [ "$PACKED" -ge "$MAX_PACKED" ]; then
-              echo "UPX-packed binary too large: $PACKED >= $MAX_PACKED" >&2
+            if [ "$MEASURED" -ge "$MAX_PACKED" ]; then
+              echo "UPX-packed binary too large: $MEASURED >= $MAX_PACKED" >&2
               exit 1
             fi
           else
@@ -219,14 +231,13 @@ jobs:
       - name: Build
         run: cmake --build build-ci
 
-      - name: Run neutroniumbomb full benchmark (1B rows/table)
+      - name: Run neutroniumbomb full benchmark (1B rows/table, Q0–Q11)
         run: |
           set -euo pipefail
           python3 scripts/benchmark_neutroniumbomb_full.py \
             --astral build-ci/astraldb \
             --rows 1000000000 \
             --full-scale \
-            --queries 10,11 \
             | tee neutroniumbomb-ci.log
 
       - name: Upload benchmark log

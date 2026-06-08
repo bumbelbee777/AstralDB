@@ -77,7 +77,7 @@ function(astraldb_apply_release_profile target)
 		if(APPLE)
 			target_link_options(${target} PRIVATE
 				"$<$<CONFIG:Release>:-Wl,-dead_strip>")
-		else()
+		elseif(NOT WIN32)
 			target_link_options(${target} PRIVATE
 				"$<$<CONFIG:Release>:-Wl,--gc-sections>"
 				"$<$<CONFIG:Release>:-Wl,-O2>")
@@ -173,7 +173,7 @@ function(astraldb_apply_strip target)
 	if(NOT ASTRALDB_STRIP)
 		return()
 	endif()
-	if(MSVC)
+	if(MSVC OR WIN32)
 		return()
 	endif()
 	if(APPLE)

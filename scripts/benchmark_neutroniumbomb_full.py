@@ -28,8 +28,15 @@ MIN_SCANNED_ROWS: dict[str, int] = {
 }
 
 MIN_RESULT_ROWS: dict[str, int] = {
+    "Q0": 0,
     "Q1": 1,
+    "Q2": 1,
     "Q3": 1,
+    "Q4": 1,
+    "Q5": 1,
+    "Q6": 1,
+    "Q7": 1,
+    "Q8": 1,
     "Q9": 1,
     "Q10": 1,
     "Q11": 1,
@@ -45,12 +52,13 @@ SMOKE_ROWS_PER_SEC_FLOOR: dict[str, float] = {
     "Q11": 1e11,
 }
 
-SUITE_WALL_MS_BUDGET = 60_000.0
+SMOKE_SUITE_WALL_MS_BUDGET = 60_000.0
 
 BULK_RX = re.compile(r"BULK\s+\d+", re.IGNORECASE)
 QUERY_RX = re.compile(r"^-- Query (\d+):", re.MULTILINE)
 SUITE_TIME_RX = re.compile(
     r"\[time-sql\] query=(\S+)\s+parse\+compile_ms=([\d.]+)\s+(?:query_compile_ms=[\d.]+\s+)?"
+    r"(?:execute_median_ms=[\d.]+\s+execute_min_ms=[\d.]+\s+execute_max_ms=[\d.]+\s+)?"
     r"execute_ms=([\d.]+)\s+total_ms=([\d.]+)"
     r"(?:\s+scanned_rows=(\d+))?(?:\s+result_rows=(\d+))?"
 )
@@ -148,13 +156,67 @@ def run_suite(
     return proc.returncode, wall_ms, parse_suite_timings(blob), blob
 
 
+def print_summary(
+    selected: list[tuple[str, str]],
+    timings: dict[str, SqlTiming],
+    wall_ms: float,
+) -> None:
+    execute_ms: list[float] = []
+    rps_vals: list[float] = []
+    total_scanned = 0
+    total_result = 0
+    scanned_known = False
+    result_known = False
+
+    for name, _ in selected:
+        timing = timings.get(name)
+        if timing is None or timing.execute_ms is None:
+            continue
+        execute_ms.append(timing.execute_ms)
+        rps = rows_per_sec(timing)
+        if rps is not None:
+            rps_vals.append(rps)
+        if timing.scanned_rows is not None:
+            total_scanned += timing.scanned_rows
+            scanned_known = True
+        if timing.result_rows is not None:
+            total_result += timing.result_rows
+            result_known = True
+
+    total_execute_ms = sum(execute_ms)
+    median_execute_ms = statistics.median(execute_ms) if execute_ms else 0.0
+    median_rps = statistics.median(rps_vals) if rps_vals else None
+    aggregate_rps = None
+    if scanned_known and total_execute_ms > 0:
+        aggregate_rps = total_scanned / (total_execute_ms / 1000.0)
+
+    print("-" * 72)
+    print("summary:")
+    print(f"  queries_run={len(execute_ms)}/{len(selected)}")
+    print(f"  suite_wall_s={wall_ms / 1000.0:.3f}")
+    print(f"  total_execute_ms={total_execute_ms:.3f}")
+    print(f"  median_execute_ms={median_execute_ms:.3f}")
+    if scanned_known:
+        print(f"  total_scanned_rows={total_scanned:,}")
+    if result_known:
+        print(f"  total_result_rows={total_result:,}")
+    if aggregate_rps is not None:
+        print(f"  aggregate_rows_per_sec={aggregate_rps:,.0f}")
+    if median_rps is not None:
+        print(f"  median_rows_per_sec={median_rps:,.0f}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--astral", type=Path, default=None)
     ap.add_argument("--rows", type=int, default=100_000_000)
     ap.add_argument("--opt", default="-O4")
     ap.add_argument("--timeout-sec", type=int, default=7200)
-    ap.add_argument("--queries", default="10,11", help="Comma list or empty for all")
+    ap.add_argument(
+        "--queries",
+        default="",
+        help="Comma list (e.g. 10,11) or empty for all Q0–Q11",
+    )
     ap.add_argument("--full-scale", action="store_true", help="Use 1B/table spill-friendly env")
     ap.add_argument("--continue-on-error", action="store_true")
     args = ap.parse_args()
@@ -178,11 +240,13 @@ def main() -> int:
     print(f"opt: {args.opt}  full_scale={args.full_scale}")
     print("-" * 72)
 
-    wanted = {f"Q{x.strip()}" for x in args.queries.split(",") if x.strip()} if args.queries else None
+    wanted = {f"Q{x.strip()}" for x in args.queries.split(",") if x.strip()} if args.queries.strip() else None
     selected = [(n, b) for n, b in queries if wanted is None or n in wanted]
     if not selected:
         print("No queries selected.", file=sys.stderr)
         return 2
+
+    print(f"queries: {', '.join(n for n, _ in selected)}")
 
     suite_lines: list[str] = []
     for name, section in selected:
@@ -218,9 +282,11 @@ def main() -> int:
             return -1
         rps = rows_per_sec(timing)
         rps_s = f"{rps:,.0f}" if rps is not None else "?"
+        scanned_s = f"{timing.scanned_rows:,}" if timing.scanned_rows is not None else "?"
+        result_s = f"{timing.result_rows:,}" if timing.result_rows is not None else "?"
         print(
-            f"  {name}: execute={timing.execute_ms:.3f} ms  scanned={timing.scanned_rows}  "
-            f"rows_per_sec={rps_s}"
+            f"  {name}: execute={timing.execute_ms:.3f} ms  scanned={scanned_s}  "
+            f"result_rows={result_s}  rows_per_sec={rps_s}"
         )
         min_scan = MIN_SCANNED_ROWS.get(name)
         if min_scan is not None:
@@ -229,9 +295,14 @@ def main() -> int:
                 need = min_scan
             if timing.scanned_rows is None or timing.scanned_rows < need:
                 validation_errors.append(f"{name}: scanned_rows={timing.scanned_rows} expected>={need:,}")
-        min_result = MIN_RESULT_ROWS.get(name)
-        if min_result is not None and timing.result_rows is not None and timing.result_rows < min_result:
-            validation_errors.append(f"{name}: result_rows={timing.result_rows} expected>={min_result}")
+        elif timing.scanned_rows is not None and timing.scanned_rows == 0 and name != "Q0":
+            validation_errors.append(f"{name}: scanned_rows=0 (expected work on bulk tables)")
+        min_result = MIN_RESULT_ROWS.get(name, 1)
+        if min_result > 0:
+            if timing.result_rows is None:
+                validation_errors.append(f"{name}: result_rows missing (expected>={min_result})")
+            elif timing.result_rows < min_result:
+                validation_errors.append(f"{name}: result_rows={timing.result_rows} expected>={min_result}")
         floor = rps_floors.get(name)
         if floor is not None:
             scale = 1.0 if args.rows >= 1_000_000_000 else max(args.rows / 1_000_000_000.0, 1e-9)
@@ -239,15 +310,18 @@ def main() -> int:
             if rps is None or rps < scaled_floor:
                 validation_errors.append(f"{name}: rows_per_sec={rps} expected>={scaled_floor:.0e}")
 
-    if rc != 0:
-        return rc
+    print_summary(selected, timings, wall_ms)
+
     if validation_errors:
         for err in validation_errors:
             print(f"  {err}", file=sys.stderr)
         return 3
-    if wall_ms > SUITE_WALL_MS_BUDGET:
-        print(f"suite wall_ms={wall_ms:.1f} exceeds budget {SUITE_WALL_MS_BUDGET:.0f}", file=sys.stderr)
+
+    smoke_budget = wanted is not None and len(wanted) <= 2
+    if smoke_budget and wall_ms > SMOKE_SUITE_WALL_MS_BUDGET:
+        print(f"suite wall_ms={wall_ms:.1f} exceeds smoke budget {SMOKE_SUITE_WALL_MS_BUDGET:.0f}", file=sys.stderr)
         return 4
+
     print("All phases complete.")
     return 0
 

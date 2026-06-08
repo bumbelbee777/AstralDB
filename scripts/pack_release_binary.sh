@@ -10,7 +10,8 @@ if ! command -v "$UPX_BIN" >/dev/null 2>&1; then
   exit 1
 fi
 
-cp -f "$INPUT" "${INPUT}.unpacked"
-"$UPX_BIN" --best --lzma --strip-relocs=0 --force-overwrite -q -o "$INPUT" "${INPUT}.unpacked"
-"$UPX_BIN" -t "$INPUT"
+if [[ ! -f "${INPUT}.unpacked" ]]; then
+  cp -f "$INPUT" "${INPUT}.unpacked"
+fi
+bash "$(dirname "$0")/upx_pack_copy.sh" "${INPUT}.unpacked" "$INPUT" >/dev/null
 echo "Packed $(basename "$INPUT"): $(stat -c%s "${INPUT}.unpacked") -> $(stat -c%s "$INPUT") bytes"

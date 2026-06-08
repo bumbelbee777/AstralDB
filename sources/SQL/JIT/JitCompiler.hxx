@@ -58,6 +58,9 @@ public:
 	JitMaxFn CompileMax();
 	void InvalidateAll();
 
+	/** True when the most recent Compile* published native machine code (not interpreter fallback). */
+	bool LastCompileWasNative() const noexcept { return LastCompileNative_; }
+
 private:
 	JitCompiler() = default;
 
@@ -66,6 +69,7 @@ private:
 	JitMinFn MinFn_ = nullptr;
 	JitMaxFn MaxFn_ = nullptr;
 	std::unique_ptr<JitExecPage> CodePage_;
+	bool LastCompileNative_ = false;
 };
 
 bool EmitX86_64FilterDenseKernel(FilterCompareOp Op, int64_t Literal, std::vector<std::uint8_t> &Out);
