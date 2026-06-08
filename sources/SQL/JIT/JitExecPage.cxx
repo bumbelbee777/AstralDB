@@ -136,9 +136,9 @@ void *JitExecPage::BumpInCurrent(const std::uint8_t *Code, const std::size_t Siz
 	if(!MakeWritable(R.Base, R.Mapped))
 		return nullptr;
 	std::memcpy(Entry, Code, Size);
+	FlushIcache(Entry, Size);
 	if(!MakeExecutable(R.Base, R.Mapped))
 		return nullptr;
-	FlushIcache(Entry, Size);
 	R.Used = Need;
 	return Entry;
 }

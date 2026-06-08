@@ -99,7 +99,7 @@ bool EmitMin(std::vector<std::uint8_t> &Out) {
 	Emit(Out, {0x48, 0x83, 0xC1, 0x08}); // add rcx, 8
 	Emit(Out, {0x4C, 0x8B, 0x11});       // mov r10, [rcx]
 	Emit(Out, {0x4C, 0x39, 0xD0});       // cmp rax, r10
-	Emit(Out, {0x4C, 0x0F, 0x4F, 0xC2}); // cmovg rax, r10 (rax > r10)
+	Emit(Out, {0x49, 0x0F, 0x4F, 0xC2}); // cmovg rax, r10 (rax > r10)
 	Emit(Out, {0x48, 0xFF, 0xCA});       // dec rdx
 	Emit(Out, {0x75});
 	Out.push_back(static_cast<std::uint8_t>(static_cast<std::int8_t>(Loop - (Out.size() + 1))));
@@ -124,7 +124,7 @@ bool EmitMax(std::vector<std::uint8_t> &Out) {
 	Emit(Out, {0x48, 0x83, 0xC1, 0x08}); // add rcx, 8
 	Emit(Out, {0x4C, 0x8B, 0x11});       // mov r10, [rcx]
 	Emit(Out, {0x4C, 0x39, 0xD0});       // cmp rax, r10
-	Emit(Out, {0x4C, 0x0F, 0x4C, 0xC2}); // cmovl rax, r10 (rax < r10)
+	Emit(Out, {0x49, 0x0F, 0x4C, 0xC2}); // cmovl rax, r10 (rax < r10)
 	Emit(Out, {0x48, 0xFF, 0xCA});       // dec rdx
 	Emit(Out, {0x75});
 	Out.push_back(static_cast<std::uint8_t>(static_cast<std::int8_t>(Loop - (Out.size() + 1))));
@@ -200,7 +200,7 @@ bool EmitMin(std::vector<std::uint8_t> &Out) {
 	Emit(Out, {0x48, 0x83, 0xC7, 0x08}); // add rdi, 8
 	Emit(Out, {0x4C, 0x8B, 0x17});       // mov r10, [rdi]
 	Emit(Out, {0x4C, 0x39, 0xD0});       // cmp rax, r10
-	Emit(Out, {0x4C, 0x0F, 0x4F, 0xC2}); // cmovg rax, r10 (rax > r10)
+	Emit(Out, {0x49, 0x0F, 0x4F, 0xC2}); // cmovg rax, r10 (rax > r10)
 	Emit(Out, {0x48, 0xFF, 0xCE});       // dec rsi
 	Emit(Out, {0x75});
 	Out.push_back(static_cast<std::uint8_t>(static_cast<std::int8_t>(Loop - (Out.size() + 1))));
@@ -225,7 +225,7 @@ bool EmitMax(std::vector<std::uint8_t> &Out) {
 	Emit(Out, {0x48, 0x83, 0xC7, 0x08}); // add rdi, 8
 	Emit(Out, {0x4C, 0x8B, 0x17});       // mov r10, [rdi]
 	Emit(Out, {0x4C, 0x39, 0xD0});       // cmp rax, r10
-	Emit(Out, {0x4C, 0x0F, 0x4C, 0xC2}); // cmovl rax, r10 (rax < r10)
+	Emit(Out, {0x49, 0x0F, 0x4C, 0xC2}); // cmovl rax, r10 (rax < r10)
 	Emit(Out, {0x48, 0xFF, 0xCE});       // dec rsi
 	Emit(Out, {0x75});
 	Out.push_back(static_cast<std::uint8_t>(static_cast<std::int8_t>(Loop - (Out.size() + 1))));
