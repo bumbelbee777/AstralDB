@@ -112,14 +112,11 @@ void *MapFreshPage(std::size_t Size) {
 #endif
 }
 
+#if !defined(__APPLE__)
 bool MakeExecutable(void *Base, std::size_t Size) {
 #if defined(_WIN32)
 	DWORD Old = 0;
 	return VirtualProtect(Base, Size, PAGE_EXECUTE_READ, &Old) != 0;
-#elif defined(__APPLE__)
-	(void)Base;
-	(void)Size;
-	return true;
 #else
 	return ::mprotect(Base, Size, PROT_READ | PROT_EXEC) == 0;
 #endif
@@ -129,14 +126,11 @@ bool MakeWritable(void *Base, std::size_t Size) {
 #if defined(_WIN32)
 	DWORD Old = 0;
 	return VirtualProtect(Base, Size, PAGE_READWRITE, &Old) != 0;
-#elif defined(__APPLE__)
-	(void)Base;
-	(void)Size;
-	return true;
 #else
 	return ::mprotect(Base, Size, PROT_READ | PROT_WRITE) == 0;
 #endif
 }
+#endif
 
 void UnmapPage(void *Base, std::size_t Size) {
 	if(!Base || Size == 0)
