@@ -1558,6 +1558,29 @@ void Database::SyncToFile() {
 	SyncToFileUnlocked();
 }
 
+bool Database::PreferMemorySnapshots() const {
+	std::scoped_lock<SharedMutex> Guard(DbMutex_);
+	std::size_t Rows = 0;
+	for(const auto &Pair : Tables_)
+		Rows += Pair.second.RowStore.size();
+	return Rows <= 2'000'000;
+}
+
+Database::DatabaseWorkingSnapshot Database::CaptureWorkingSnapshot() const {
+	std::scoped_lock<SharedMutex> Guard(DbMutex_);
+	DatabaseWorkingSnapshot Snap;
+	Snap.Tables = Tables_;
+	Snap.TableSchemas = TableSchemas_;
+	return Snap;
+}
+
+void Database::RestoreWorkingSnapshot(DatabaseWorkingSnapshot Snap) {
+	std::scoped_lock<SharedMutex> Guard(DbMutex_);
+	Tables_ = std::move(Snap.Tables);
+	TableSchemas_ = std::move(Snap.TableSchemas);
+	Dirty_.store(true, std::memory_order_release);
+}
+
 namespace {
 
 constexpr std::streamoff kMaxDbSnapshotCopyBytes = 512LL * 1024 * 1024;

@@ -2284,6 +2284,10 @@ void BytecodeInterpreter::Execute(const CompiledBytecode &Compiled) {
 void BytecodeInterpreter::VmSavepoint(const std::string &Name) {
 	if(Databases_.empty())
 		Databases_.push_back(std::make_unique<Database>(DatabasePath_, Logger_));
+	if(Databases_[0]->PreferMemorySnapshots()) {
+		MemSavepoints_[Name] = Databases_[0]->CaptureWorkingSnapshot();
+		return;
+	}
 	const std::string Slug = SanitizeSavepointSlug(Name);
 	std::filesystem::path SnapshotPath = Databases_[0]->DbPath_;
 	SnapshotPath += std::string(".sp.") + Slug + ".snapshot";
@@ -2294,6 +2298,10 @@ void BytecodeInterpreter::VmSavepoint(const std::string &Name) {
 void BytecodeInterpreter::VmRollbackToSavepoint(const std::string &Name) {
 	if(Databases_.empty())
 		Databases_.push_back(std::make_unique<Database>(DatabasePath_, Logger_));
+	if(const auto Mem = MemSavepoints_.find(Name); Mem != MemSavepoints_.end()) {
+		Databases_[0]->RestoreWorkingSnapshot(Mem->second);
+		return;
+	}
 	if(const auto It = Savepoints_.find(Name); It != Savepoints_.end()) {
 		const std::filesystem::path SnapshotPath = It->second;
 		if(std::filesystem::exists(SnapshotPath))
@@ -2302,6 +2310,7 @@ void BytecodeInterpreter::VmRollbackToSavepoint(const std::string &Name) {
 }
 
 void BytecodeInterpreter::VmReleaseSavepoint(const std::string &Name) {
+	MemSavepoints_.erase(Name);
 	std::error_code Ec;
 	if(const auto It = Savepoints_.find(Name); It != Savepoints_.end()) {
 		std::filesystem::remove(std::filesystem::path(It->second), Ec);

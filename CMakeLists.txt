@@ -156,7 +156,6 @@ add_library(astraldb_core STATIC
     sources/SQL/NewVM/VliwExecutor.cxx
     sources/SQL/JIT/JitCompiler.cxx
     sources/SQL/JIT/JitInvoke.cxx
-    sources/SQL/JIT/JitDiagnostics.cxx
     sources/SQL/JIT/JitRuntime.cxx
     sources/SQL/JIT/JitExecPage.cxx
     sources/SQL/JIT/HotPathDetector.cxx
