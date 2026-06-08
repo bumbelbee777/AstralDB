@@ -299,10 +299,10 @@ function(astraldb_apply_macos_jit_entitlements target)
 	if(NOT EXISTS "${_ent}")
 		return()
 	endif()
+	set(_sign_sh "${CMAKE_SOURCE_DIR}/cmake/macos-sign-jit.sh")
 	add_custom_command(TARGET ${target} POST_BUILD
-		COMMAND codesign -s - --entitlements "${_ent}" --options runtime --generate-entitlement-der
-			--timestamp=none --force "$<TARGET_FILE:${target}>"
-		COMMAND codesign --verify --strict --deep "$<TARGET_FILE:${target}>"
+		COMMAND chmod +x "${_sign_sh}"
+		COMMAND bash "${_sign_sh}" "${_ent}" "$<TARGET_FILE:${target}>"
 		COMMENT "Ad-hoc sign ${target} (MAP_JIT + DER entitlements)"
 		VERBATIM)
 endfunction()

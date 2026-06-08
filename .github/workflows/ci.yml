@@ -170,14 +170,7 @@ jobs:
 
       - name: macOS JIT probe and entitlement check
         if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euo pipefail
-          codesign -d --entitlements - build-ci/run_tests | grep -q allow-jit
-          codesign -d --verbose=4 build-ci/run_tests 2>&1 | grep -qi 'entitlements.*DER'
-          clang -O0 tools/jit_aarch64_probe.c -o build-ci/jit_probe
-          codesign -s - --entitlements cmake/macos-jit.entitlements --options runtime --generate-entitlement-der --timestamp=none --force build-ci/jit_probe
-          build-ci/jit_probe
+        run: bash .github/scripts/macos-jit-probe.sh
 
       - name: Test
         run: ${{ matrix.test }}
