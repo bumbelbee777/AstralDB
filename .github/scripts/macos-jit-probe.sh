@@ -46,6 +46,7 @@ if clang "${PROBE_CFLAGS[@]}" -mbranch-protection=none -c -o /dev/null "${ROOT}/
 	PROBE_CFLAGS+=(-mbranch-protection=none)
 fi
 clang "${PROBE_CFLAGS[@]}" "${ROOT}/tools/jit_aarch64_probe.c" "$INVOKE_ASM" -o "$PROBE"
+nm "$PROBE" 2>/dev/null | grep -q astraldb_jit_invoke_i64 || fail "trampoline symbol missing from jit_probe (link ${INVOKE_ASM})"
 file "$PROBE" || true
 bash "$SIGN" "$ENT" "$PROBE"
 
@@ -60,7 +61,7 @@ if [[ "$RC" -ne 0 ]]; then
 	echo "[macos-jit-probe] FAILED — last 40 log lines:" >&2
 	tail -n 40 "$LOG" >&2 || true
 	echo "[macos-jit-probe] hints:" >&2
-	echo "  - exit 139: link JitInvokeAarch64.S (raw blr trampoline in .text, not inline asm/C call)" >&2
+	echo "  - exit 139 in parent: invoke in fork child; sample must live in JIT page on VMAPPLE" >&2
 	echo "  - rc=13 + signal 11: execute fault (signing/entitlements/W^X)" >&2
 	echo "  - rc=12 on ret-smoke: execute OK but wrong exit check (fixed in probe)" >&2
 	echo "  - rc=12 on sum test: ran but wrong sum (bytecode bug)" >&2

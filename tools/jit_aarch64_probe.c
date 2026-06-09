@@ -1,4 +1,4 @@
-/* macOS/arm64 JIT probe: tries publish strategies; verbose stderr on every failure. */
+/* macOS/arm64 JIT probe: publish strategies + trampoline invoke (JitInvokeAarch64.S). */
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -30,13 +30,23 @@ extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 #endif
 
 static const uint8_t kRetKernel[] = {0x5f, 0x24, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6};
+/* BTI c; movz x0,#55; ret */
+static const uint8_t kConst55Kernel[] = {0x5f, 0x24, 0x03, 0xd5, 0xe0, 0x06, 0x80, 0xd2, 0xc0, 0x03, 0x5f, 0xd6};
 static const uint8_t kSumKernel[] = {
 	0x5f, 0x24, 0x03, 0xd5, 0xe2, 0x03, 0x1f, 0xaa, 0xc1, 0x00, 0x00, 0xb4, 0x03, 0x00, 0x40, 0xf9,
 	0x42, 0x00, 0x03, 0x8b, 0x00, 0x20, 0x00, 0x91, 0x21, 0x04, 0x00, 0xd1, 0x81, 0xff, 0xff, 0x54,
 	0xe0, 0x03, 0x02, 0xaa, 0xc0, 0x03, 0x5f, 0xd6,
 };
 
+static const int64_t kProbeSample[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+
+enum { kMapBytes = 4096, kDataOff = 256 };
+
 typedef int64_t (*sum_fn)(const int64_t *, size_t);
+
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+int64_t astraldb_jit_invoke_i64(const void *entry, const int64_t *values, size_t count);
+#endif
 
 static void log_errno(const char *step) {
 	fprintf(stderr, "  FAIL %s: errno=%d (%s)\n", step, errno, strerror(errno));
@@ -81,6 +91,9 @@ static void print_host(void) {
 		fprintf(stderr, "[probe] csops_status=0x%x hardened_runtime=%d\n", flags, (flags & CS_RUNTIME) != 0);
 	else
 		log_errno("csops");
+#if defined(__aarch64__) || defined(__arm64__)
+	fprintf(stderr, "[probe] trampoline=%p\n", (void *)astraldb_jit_invoke_i64);
+#endif
 	fflush(stderr);
 }
 
@@ -106,30 +119,10 @@ static void print_vm_prot(void *page) {
 }
 #endif
 
-static const int64_t kProbeSample[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
-
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
-extern int64_t astraldb_jit_invoke_i64(const void *entry, const int64_t *values, size_t count);
-#endif
-
-static int invoke_sum(sum_fn fn, int64_t *out_got) {
+static int invoke_i64_in_child(const void *entry, const int64_t *values, size_t count, int64_t expect,
+                               int64_t *out_got) {
 	*out_got = -1;
-#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
-	const int64_t got = astraldb_jit_invoke_i64((const void *)fn, kProbeSample, 10);
-#else
-	const int64_t got = fn(kProbeSample, 10);
-#endif
-	*out_got = got;
-	if(got == 55)
-		return 0;
-	fprintf(stderr, "  sum invoke got=%lld (expected 55) sample=%p fn=%p\n", (long long)got, (void *)kProbeSample,
-	        (void *)fn);
-	fflush(stderr);
-	return 12;
-}
-
-#if defined(__APPLE__)
-static int invoke_ret_in_child(const void *fn) {
 	fflush(NULL);
 	const pid_t pid = fork();
 	if(pid < 0) {
@@ -137,12 +130,8 @@ static int invoke_ret_in_child(const void *fn) {
 		return 10;
 	}
 	if(pid == 0) {
-#if defined(__aarch64__) || defined(__arm64__)
-		__asm__ volatile("blr %0" ::"r"(fn) : "x30", "memory");
-#else
-		((void (*)(void))fn)();
-#endif
-		_exit(0);
+		const int64_t got = astraldb_jit_invoke_i64(entry, values, count);
+		_exit(got == expect ? 0 : 2);
 	}
 	int status = 0;
 	if(waitpid(pid, &status, 0) < 0) {
@@ -151,19 +140,23 @@ static int invoke_ret_in_child(const void *fn) {
 	}
 	if(WIFEXITED(status)) {
 		const int code = WEXITSTATUS(status);
-		if(code == 0)
+		if(code == 0) {
+			*out_got = expect;
 			return 0;
-		fprintf(stderr, "  ret-smoke child exit=%d (expected 0)\n", code);
+		}
+		fprintf(stderr, "  child exit=%d (expected 0, got=%lld expect=%lld) entry=%p values=%p\n", code,
+		        (long long)*out_got, (long long)expect, entry, (const void *)values);
 		fflush(stderr);
 		return 12;
 	}
 	if(WIFSIGNALED(status)) {
 		const int sig = WTERMSIG(status);
-		fprintf(stderr, "  ret-smoke child signal=%d (%s) at fn=%p\n", sig, strsignal(sig), fn);
+		fprintf(stderr, "  child signal=%d (%s) entry=%p values=%p\n", sig, strsignal(sig), entry,
+		        (const void *)values);
 		fflush(stderr);
 		return 13;
 	}
-	fprintf(stderr, "  ret-smoke child unknown wait status=0x%x\n", status);
+	fprintf(stderr, "  child unknown wait status=0x%x\n", status);
 	fflush(stderr);
 	return 14;
 }
@@ -217,25 +210,6 @@ static int publish_mapjit_rwx(void **out_page, size_t map_bytes, const uint8_t *
 }
 #endif
 
-static int republish_code(void *page, size_t map_bytes, const uint8_t *code, size_t code_size) {
-	errno = 0;
-	if(mprotect(page, map_bytes, PROT_READ | PROT_WRITE) != 0) {
-		log_errno("mprotect(RW) republish");
-		return 4;
-	}
-	memcpy(page, code, code_size);
-	flush_icache(page, code_size);
-	errno = 0;
-	if(mprotect(page, map_bytes, PROT_READ | PROT_EXEC) != 0) {
-		log_errno("mprotect(RX) republish");
-		return 4;
-	}
-#if defined(__aarch64__) || defined(__arm64__)
-	__asm__ __volatile__("isb" ::: "memory");
-#endif
-	return 0;
-}
-
 static int publish_mprotect(void **out_page, size_t map_bytes, const uint8_t *code, size_t code_size, sum_fn *out_fn) {
 	errno = 0;
 	void *page = mmap(NULL, map_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS
@@ -271,58 +245,145 @@ static int publish_mprotect(void **out_page, size_t map_bytes, const uint8_t *co
 	return 0;
 }
 
-static int try_strategy(const strategy_t *st) {
+static int publish_mprotect_with_sample(void **out_page, sum_fn *out_fn, const int64_t **out_values) {
+	errno = 0;
+	void *page = mmap(NULL, kMapBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS
+#if defined(__APPLE__)
+	                      | MAP_JIT
+#endif
+	                  ,
+	                  -1, 0);
+	if(page == MAP_FAILED) {
+#if defined(__APPLE__)
+		page = mmap(NULL, kMapBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if(page == MAP_FAILED) {
+#endif
+			log_errno("mmap(anon|RW)");
+			return 3;
+#if defined(__APPLE__)
+		}
+#endif
+	}
+	memcpy(page, kSumKernel, sizeof kSumKernel);
+	memcpy((uint8_t *)page + kDataOff, kProbeSample, sizeof kProbeSample);
+	flush_icache(page, sizeof kSumKernel);
+	errno = 0;
+	if(mprotect(page, kMapBytes, PROT_READ | PROT_EXEC) != 0) {
+		log_errno("mprotect(RX)");
+		munmap(page, kMapBytes);
+		return 4;
+	}
+#if defined(__aarch64__) || defined(__arm64__)
+	__asm__ __volatile__("isb" ::: "memory");
+#endif
+	*out_page = page;
+	*out_fn = (sum_fn)page;
+	*out_values = (const int64_t *)((uint8_t *)page + kDataOff);
+	return 0;
+}
+
+static int run_kernel_test(const strategy_t *st, const uint8_t *code, size_t code_size, const char *label,
+                           int64_t expect, const int64_t *values, size_t count) {
 	void *page = NULL;
 	sum_fn fn = NULL;
-	fprintf(stderr, "[probe] try strategy=%s\n", st->name);
+	fprintf(stderr, "[probe] %s strategy=%s\n", label, st->name);
 	fflush(stderr);
 
-	const int prc = st->publish(&page, 4096, kRetKernel, sizeof kRetKernel, &fn);
+	const int prc = st->publish(&page, kMapBytes, code, code_size, &fn);
 	if(prc != 0) {
-		fprintf(stderr, "  ret publish rc=%d\n", prc);
+		fprintf(stderr, "  publish rc=%d\n", prc);
 		fflush(stderr);
 		return prc;
 	}
-	fprintf(stderr, "[probe] ret-smoke strategy=%s\n", st->name);
 #if defined(__APPLE__)
 	print_vm_prot(page);
-	const int smoke = invoke_ret_in_child(fn);
-#else
-	((void (*)(void))fn)();
-	const int smoke = 0;
 #endif
-	if(smoke != 0) {
-		fprintf(stderr, "  skip sum kernel (ret-smoke failed rc=%d)\n", smoke);
-		munmap(page, 4096);
-		fflush(stderr);
-		return smoke;
-	}
+	fprintf(stderr, "  entry=%p values=%p count=%zu trampoline=%p\n", (void *)fn, (const void *)values, count,
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	        (void *)astraldb_jit_invoke_i64);
+#else
+	        (void *)0);
+#endif
+	fflush(stderr);
 
-	const int repub = republish_code(page, 4096, kSumKernel, sizeof kSumKernel);
-	if(repub != 0) {
-		fprintf(stderr, "  sum republish rc=%d\n", repub);
-		munmap(page, 4096);
+	int64_t got = 0;
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	const int irc = invoke_i64_in_child((const void *)fn, values, count, expect, &got);
+#else
+	got = fn(values, count);
+	const int irc = got == expect ? 0 : 12;
+#endif
+	if(irc == 0) {
+		fprintf(stderr, "  %s ok got=%lld\n", label, (long long)got);
 		fflush(stderr);
-		return repub;
+		munmap(page, kMapBytes);
+		return 0;
 	}
-	fn = (sum_fn)page;
-	fprintf(stderr, "  page=%p fn=%p code_size=%zu\n", page, (void *)fn, sizeof kSumKernel);
+	fprintf(stderr, "  %s failed rc=%d\n", label, irc);
+	munmap(page, kMapBytes);
+	fflush(stderr);
+	return irc;
+}
+
+static int try_strategy(const strategy_t *st) {
+	fprintf(stderr, "[probe] try strategy=%s\n", st->name);
+	fflush(stderr);
+
+	/* 1) Trampoline + execute path (no memory loads). */
+	const int c55 = run_kernel_test(st, kConst55Kernel, sizeof kConst55Kernel, "const55", 55, NULL, 0);
+	if(c55 != 0)
+		return c55;
+
+	/* 2) Sum kernel; sample in same JIT mapping (written before first mprotect RX). */
+	void *page = NULL;
+	sum_fn fn = NULL;
+	const int64_t *in_page = NULL;
+	int prc = 0;
+	if(st->publish == publish_mprotect)
+		prc = publish_mprotect_with_sample(&page, &fn, &in_page);
+	else {
+		prc = st->publish(&page, kMapBytes, kSumKernel, sizeof kSumKernel, &fn);
+		if(prc == 0) {
+			errno = 0;
+			if(mprotect(page, kMapBytes, PROT_READ | PROT_WRITE) != 0) {
+				log_errno("mprotect(RW) sample");
+				prc = 4;
+			} else {
+				memcpy((uint8_t *)page + kDataOff, kProbeSample, sizeof kProbeSample);
+				if(mprotect(page, kMapBytes, PROT_READ | PROT_EXEC) != 0) {
+					log_errno("mprotect(RX) sample");
+					prc = 4;
+				}
+				in_page = (const int64_t *)((uint8_t *)page + kDataOff);
+			}
+		}
+	}
+	if(prc != 0) {
+		fprintf(stderr, "  sum publish rc=%d\n", prc);
+		fflush(stderr);
+		if(page)
+			munmap(page, kMapBytes);
+		return prc;
+	}
 	hexdump("kernel", page, sizeof kSumKernel);
 #if defined(__APPLE__)
 	print_vm_prot(page);
 #endif
 
 	int64_t got = 0;
-	const int irc = invoke_sum(fn, &got);
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	const int irc = invoke_i64_in_child((const void *)fn, in_page, 10, 55, &got);
+#else
+	got = fn(in_page, 10);
+	const int irc = got == 55 ? 0 : 12;
+#endif
+	munmap(page, kMapBytes);
 	if(irc == 0) {
 		printf("ok strategy=%s sum=%lld\n", st->name, (long long)got);
 		fflush(stdout);
-		munmap(page, 4096);
 		return 0;
 	}
-	if(irc == 12)
-		fprintf(stderr, "  sum invoke returned wrong value (execute OK, bytecode/logic issue)\n");
-	munmap(page, 4096);
+	fprintf(stderr, "  sum failed rc=%d\n", irc);
 	fflush(stderr);
 	return irc;
 }
@@ -340,7 +401,7 @@ int main(void) {
 		strategies[n++] = (strategy_t){"MAP_JIT+RWX", publish_mapjit_rwx};
 		strategies[n++] = (strategy_t){"MAP_JIT+mprotect", publish_mprotect};
 	} else {
-		fprintf(stderr, "[probe] supported_np=0: prefer MAP_JIT+mprotect (VMAPPLE/CI)\n");
+		fprintf(stderr, "[probe] supported_np=0: MAP_JIT+mprotect (VMAPPLE/CI)\n");
 		fflush(stderr);
 		strategies[n++] = (strategy_t){"MAP_JIT+mprotect", publish_mprotect};
 		strategies[n++] = (strategy_t){"MAP_JIT+RWX", publish_mapjit_rwx};
@@ -362,10 +423,6 @@ int main(void) {
 	fprintf(stderr, "[probe] ALL STRATEGIES FAILED last_rc=%d\n", last_rc);
 	fprintf(stderr, "[probe] rc key: 1=mmap_MAP_JIT_RWE 2=mmap_MAP_JIT_RW 3=mmap_anon 4=mprotect "
 	                "10=fork 11=waitpid 12=wrong_sum 13=signal 14=wait_unknown\n");
-#if defined(__APPLE__)
-	fprintf(stderr, "[probe] if rc=13 and hardened_runtime=1: drop --options runtime from codesign\n");
-	fprintf(stderr, "[probe] if rc=13 and hardened_runtime=0: VM may block JIT; check entitlements DER\n");
-#endif
 	fflush(stderr);
 	return last_rc;
 }
