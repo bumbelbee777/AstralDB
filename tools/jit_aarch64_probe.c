@@ -10,7 +10,6 @@
 #include <pthread.h>
 #include <signal.h>
 #include <sys/mman.h>
-#include <sys/wait.h>
 #include <unistd.h>
 #ifndef MAP_JIT
 #define MAP_JIT 0x0800
@@ -29,7 +28,6 @@ extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 #include <unistd.h>
 #endif
 
-static const uint8_t kRetKernel[] = {0x5f, 0x24, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6};
 /* BTI c; movz x0,#55; ret */
 static const uint8_t kConst55Kernel[] = {0x5f, 0x24, 0x03, 0xd5, 0xe0, 0x06, 0x80, 0xd2, 0xc0, 0x03, 0x5f, 0xd6};
 static const uint8_t kSumKernel[] = {
@@ -119,48 +117,38 @@ static void print_vm_prot(void *page) {
 }
 #endif
 
-#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
-static int invoke_i64_in_child(const void *entry, const int64_t *values, size_t count, int64_t expect,
-                               int64_t *out_got) {
-	*out_got = -1;
-	fflush(NULL);
-	const pid_t pid = fork();
-	if(pid < 0) {
-		log_errno("fork");
-		return 10;
-	}
-	if(pid == 0) {
-		const int64_t got = astraldb_jit_invoke_i64(entry, values, count);
-		_exit(got == expect ? 0 : 2);
-	}
-	int status = 0;
-	if(waitpid(pid, &status, 0) < 0) {
-		log_errno("waitpid");
-		return 11;
-	}
-	if(WIFEXITED(status)) {
-		const int code = WEXITSTATUS(status);
-		if(code == 0) {
-			*out_got = expect;
-			return 0;
-		}
-		fprintf(stderr, "  child exit=%d (expected 0, got=%lld expect=%lld) entry=%p values=%p\n", code,
-		        (long long)*out_got, (long long)expect, entry, (const void *)values);
-		fflush(stderr);
-		return 12;
-	}
-	if(WIFSIGNALED(status)) {
-		const int sig = WTERMSIG(status);
-		fprintf(stderr, "  child signal=%d (%s) entry=%p values=%p\n", sig, strsignal(sig), entry,
-		        (const void *)values);
-		fflush(stderr);
-		return 13;
-	}
-	fprintf(stderr, "  child unknown wait status=0x%x\n", status);
-	fflush(stderr);
-	return 14;
+#if defined(__aarch64__) || defined(__arm64__)
+/* In-process only: fork()+libc in child deadlocks after parent fprintf/mmap (async-signal-unsafe). */
+__attribute__((noinline)) static int64_t invoke_i64_raw(const void *entry, const int64_t *values, size_t count) {
+	int64_t out = 0;
+	__asm__ volatile("mov x16, %3\n"
+	                 "mov x0, %1\n"
+	                 "mov x1, %2\n"
+	                 "blr x16\n"
+	                 "mov %0, x0\n"
+	                 : "=r"(out)
+	                 : "r"(values), "r"(count), "r"(entry)
+	                 : "x0", "x1", "x16", "x30", "memory", "cc");
+	return out;
 }
 #endif
+
+static int invoke_i64(const void *entry, const int64_t *values, size_t count, int64_t expect, int64_t *out_got) {
+	*out_got = -1;
+	fflush(NULL);
+#if defined(__aarch64__) || defined(__arm64__)
+	const int64_t got = invoke_i64_raw(entry, values, count);
+#else
+	const int64_t got = ((sum_fn)entry)(values, count);
+#endif
+	*out_got = got;
+	if(got == expect)
+		return 0;
+	fprintf(stderr, "  invoke got=%lld expect=%lld entry=%p values=%p\n", (long long)got, (long long)expect, entry,
+	        (const void *)values);
+	fflush(stderr);
+	return 12;
+}
 
 typedef struct {
 	const char *name;
@@ -307,12 +295,7 @@ static int run_kernel_test(const strategy_t *st, const uint8_t *code, size_t cod
 	fflush(stderr);
 
 	int64_t got = 0;
-#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
-	const int irc = invoke_i64_in_child((const void *)fn, values, count, expect, &got);
-#else
-	got = fn(values, count);
-	const int irc = got == expect ? 0 : 12;
-#endif
+	const int irc = invoke_i64((const void *)fn, values, count, expect, &got);
 	if(irc == 0) {
 		fprintf(stderr, "  %s ok got=%lld\n", label, (long long)got);
 		fflush(stderr);
@@ -371,12 +354,15 @@ static int try_strategy(const strategy_t *st) {
 #endif
 
 	int64_t got = 0;
-#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
-	const int irc = invoke_i64_in_child((const void *)fn, in_page, 10, 55, &got);
-#else
-	got = fn(in_page, 10);
-	const int irc = got == 55 ? 0 : 12;
-#endif
+	int irc = invoke_i64((const void *)fn, in_page, 10, 55, &got);
+	if(irc == 0) {
+		fprintf(stderr, "  sum(in-page) ok got=%lld\n", (long long)got);
+		fflush(stderr);
+		/* Also verify heap/.bss sample — same path as JitCompiler::VerifySum. */
+		irc = invoke_i64((const void *)fn, kProbeSample, 10, 55, &got);
+		if(irc != 0)
+			fprintf(stderr, "  sum(external sample) failed rc=%d\n", irc);
+	}
 	munmap(page, kMapBytes);
 	if(irc == 0) {
 		printf("ok strategy=%s sum=%lld\n", st->name, (long long)got);
@@ -388,8 +374,19 @@ static int try_strategy(const strategy_t *st) {
 	return irc;
 }
 
+#if defined(__APPLE__)
+static void probe_timeout_handler(int sig) {
+	(void)sig;
+	const char msg[] = "[probe] TIMEOUT — probe hung (check fork/invoke deadlock)\n";
+	(void)write(STDERR_FILENO, msg, sizeof msg - 1);
+	_exit(124);
+}
+#endif
+
 int main(void) {
 #if defined(__APPLE__)
+	signal(SIGALRM, probe_timeout_handler);
+	alarm(60);
 	print_host();
 #endif
 
@@ -413,8 +410,12 @@ int main(void) {
 	int last_rc = 1;
 	for(size_t I = 0; I < n; ++I) {
 		const int rc = try_strategy(&strategies[I]);
-		if(rc == 0)
+		if(rc == 0) {
+#if defined(__APPLE__)
+			alarm(0);
+#endif
 			return 0;
+		}
 		last_rc = rc;
 		fprintf(stderr, "[probe] strategy %s failed rc=%d\n", strategies[I].name, rc);
 		fflush(stderr);

@@ -61,7 +61,8 @@ if [[ "$RC" -ne 0 ]]; then
 	echo "[macos-jit-probe] FAILED — last 40 log lines:" >&2
 	tail -n 40 "$LOG" >&2 || true
 	echo "[macos-jit-probe] hints:" >&2
-	echo "  - exit 139 in parent: invoke in fork child; sample must live in JIT page on VMAPPLE" >&2
+	echo "  - hang at const55: never fork+libc in child after parent stdio (use in-process invoke)" >&2
+	echo "  - exit 124: probe alarm fired (60s)" >&2
 	echo "  - rc=13 + signal 11: execute fault (signing/entitlements/W^X)" >&2
 	echo "  - rc=12 on ret-smoke: execute OK but wrong exit check (fixed in probe)" >&2
 	echo "  - rc=12 on sum test: ran but wrong sum (bytecode bug)" >&2
